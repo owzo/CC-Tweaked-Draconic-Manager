@@ -1,5 +1,5 @@
 -- Reactor Utilities
--- Save as: lib/reac_utils.lua
+-- Save as: reac_utils.lua
 
 --[[
 README
@@ -35,54 +35,26 @@ function logError(err)
     logFile.close()
 end
 
--- Peripheral identification function
-function periphSearch(type)
-    local names = peripheral.getNames()
-    for _, name in pairs(names) do
-        if peripheral.getType(name) == type then
-            return peripheral.wrap(name)
-        end
-    end
-    return nil
+-- Function to validate peripherals (Newly Added)
+local function validatePeripherals()
+    reactor = peripheral.find("draconic_reactor")
+    gateIn = peripheral.find("flux_gate", function(name) return peripheral.getType(name) == "flux_gate" end)
+    gateOut = peripheral.find("flux_gate", function(name) return peripheral.getType(name) == "flux_gate" end)
+    mon = peripheral.find("monitor")
+
+    if not reactor then error("Reactor not found!") end
+    if not gateIn then error("Input flux gate not found!") end
+    if not gateOut then error("Output flux gate not found!") end
+    if not mon then error("Monitor not found!") end
 end
 
 -- Function to setup peripherals
 function setupPeripherals()
-    local peripherals = peripheral.getNames()
-    
-    for _, name in ipairs(peripherals) do
-        local type = peripheral.getType(name)
-        
-        if type == "monitor" and mon == nil then
-            mon = peripheral.wrap(name)
-            monX, monY = mon.getSize()
-            mon = { monitor = mon, X = monX, Y = monY }
-        elseif type == "draconic_reactor" and reactor == nil then
-            reactor = peripheral.wrap(name)
-        elseif type == "flux_gate" then
-            if gateIn == nil then
-                gateIn = peripheral.wrap(name)
-            elseif gateOut == nil then
-                gateOut = peripheral.wrap(name)
-            end
-        end
-    end
-
-    if reactor == nil then
-        error("No valid reactor was found!")
-    end
-    if gateIn == nil then
-        error("No valid input flux gate was found!")
-    end
-    if gateOut == nil then
-        error("No valid output flux gate was found!")
-    end
-
+    validatePeripherals() -- Updated to include validation
     gateIn.setOverrideEnabled(true)
     gateIn.setFlowOverride(0)
     gateOut.setOverrideEnabled(true)
     gateOut.setFlowOverride(0)
-
     print("Peripherals setup complete!")
 end
 
