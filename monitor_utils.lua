@@ -1,5 +1,5 @@
 -- Monitor Utilities
--- Save as: lib/monitor_utils.lua
+-- Save as: monitor_utils.lua
 
 --[[
 README
