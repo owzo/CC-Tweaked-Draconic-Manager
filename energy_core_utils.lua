@@ -1,5 +1,5 @@
 -- Energy Core Utilities
--- Save as: lib/energy_core_utils.lua
+-- Save as: energy_core_utils.lua
 
 --[[
 README
@@ -10,11 +10,27 @@ Includes setup, error handling, and energy core status checks.
 
 local config = require("config").energyCore
 
--- Peripheral and Configuration
-local monitor = peripheral.find("monitor")
-local energyCore = peripheral.find("draconic_rf_storage")
-local inputGate = peripheral.wrap("input_flux_gate")
-local outputGate = peripheral.wrap("output_flux_gate")
+-- Peripherals
+local monitor
+local energyCore
+local inputGate
+local outputGate
+
+-- Function to validate peripherals (Newly Added)
+local function validatePeripherals()
+    monitor = peripheral.find("monitor")
+    energyCore = peripheral.find("draconic_rf_storage")
+    inputGate = peripheral.wrap("input_flux_gate")
+    outputGate = peripheral.wrap("output_flux_gate")
+
+    if not monitor then error("Monitor not found!") end
+    if not energyCore then error("Energy Core not found!") end
+    if not inputGate then error("Input flux gate not found!") end
+    if not outputGate then error("Output flux gate not found!") end
+end
+
+-- Call to validate peripherals (Ensures everything is present before proceeding)
+validatePeripherals()
 
 -- Function to log errors
 function logError(err)
