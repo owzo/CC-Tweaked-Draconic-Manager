@@ -39,7 +39,7 @@ config.energyCore = {
     monitorScale = 1               -- Monitor text scale
 }
 
--- Ensure peripherals are found (Added error handling)
+-- Ensure peripherals are found (Added validation for peripherals)
 local function validatePeripherals()
     local monitor = peripheral.find("monitor")
     local energyCore = peripheral.find("draconic_rf_storage")
@@ -47,6 +47,7 @@ local function validatePeripherals()
     if not energyCore then error("Energy Core not found!") end
 end
 
-validatePeripherals() -- Added call to validation function.
+-- Call the validation function (Ensures peripherals are checked before usage)
+validatePeripherals()
 
 return config
