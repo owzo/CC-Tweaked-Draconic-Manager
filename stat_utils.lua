@@ -1,5 +1,5 @@
 -- Statistics Utilities
--- Save as: lib/stat_utils.lua
+-- Save as: stat_utils.lua
 
 --[[
 README
