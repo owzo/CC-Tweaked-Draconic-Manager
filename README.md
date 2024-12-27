@@ -53,6 +53,52 @@ CC:Tweaked-Draconic Manager is a comprehensive control and monitoring program de
    - Edit the `config.lua` file to adjust settings such as target field strength, max temperature, and other parameters.
    - Save the changes and restart the program.
 
+## Offline Installation Instructions
+
+If the server has the HTTP API disabled, you can install this software manually using a floppy disk.
+
+### Steps for Offline Installation
+
+1. **Prepare the Floppy Disk:**
+   - On a ComputerCraft computer with access to the required files, place all the necessary scripts into the `disk` directory of a floppy disk:
+     - `config.lua`
+     - `main_control.lua`
+     - `energy_core_utils.lua`
+     - `reac_utils.lua`
+     - `monitor_utils.lua`
+     - `stat_utils.lua`
+
+   - You can copy files to the disk with the following commands:
+     ```lua
+     fs.copy("path/to/file.lua", "disk/file.lua")
+     ```
+
+2. **Insert the Disk into the Target Computer:**
+   - Place the floppy disk into the ComputerCraft computer where the software needs to be installed.
+
+3. **Create the Offline Installer Script:**
+   - On the target computer, create a new file named `offline_install.lua` and paste the following script into it:
+     ```lua
+     shell.run("edit offline_install.lua")
+     ```
+   - Copy and paste the script from the `offline_install.lua` section in the project repository.
+
+4. **Run the Installer:**
+   - Execute the installer with the following command:
+     ```lua
+     offline_install
+     ```
+
+5. **Reboot the Computer:**
+   - After the installation is complete, reboot the computer. The software will start automatically.
+
+### Notes
+- Ensure that all required files are present on the floppy disk before running the installer.
+- If the startup script (`startup.lua`) is not created automatically, you can manually create it with the following command:
+  ```lua
+  shell.run("edit startup.lua")
+  ```
+
 ## Usage
 
 - **Start the program**:
