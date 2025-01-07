@@ -24,14 +24,14 @@ To save configuration changes, edit the `config.lua` file and then restart the s
 ]]
 
 -- Import required libraries and scripts
-os.loadAPI("reac_utils")
-os.loadAPI("monitor_utils")
-os.loadAPI("stat_utils")
-os.loadAPI("energy_core_utils")
+local reac_utils = require("reac_utils")
+local monitor_utils = require("monitor_utils")
+local stat_utils = require("stat_utils")
+local energy_core_utils = require("energy_core_utils")
 local config = require("config")
 
 -- Main loop
-function mainLoop()
+local function mainLoop()
     while true do
         reac_utils.checkReactorStatus()
 
@@ -78,7 +78,7 @@ function mainLoop()
 end
 
 -- Main entry point
-function main()
+local function main()
     reac_utils.setup()
     if reac_utils.mon == nil then
         mainLoop()

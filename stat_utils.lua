@@ -10,6 +10,8 @@ Includes logging reactor statistics and generating reports.
 
 local config = require("config").energyCore
 
+local stat_utils = {}
+
 -- Peripherals
 local energyCore
 
@@ -23,7 +25,7 @@ end
 validatePeripherals()
 
 -- Function to log errors
-function logError(err)
+function stat_utils.logError(err)
     local logFile = fs.open(config.logsFile, "a")
     if logFile then
         logFile.writeLine(os.date() .. ": " .. err)
@@ -34,7 +36,7 @@ function logError(err)
 end
 
 -- Function to log reactor statistics
-function logReactorStats(reactor)
+function stat_utils.logReactorStats(reactor)
     local logFile = fs.open("reactor_stats.log", "a")
     if logFile then
         local info = reactor.getReactorInfo()
@@ -46,7 +48,7 @@ function logReactorStats(reactor)
 end
 
 -- Function to log energy core statistics
-function logEnergyCoreStats(inputRate, outputRate)
+function stat_utils.logEnergyCoreStats(inputRate, outputRate)
     local logFile = fs.open("energy_core_stats.log", "a")
     if logFile then
         local energyStored = energyCore.getEnergyStored()
@@ -58,3 +60,5 @@ function logEnergyCoreStats(inputRate, outputRate)
         print("Failed to open energy core statistics log file.")
     end
 end
+
+return stat_utils

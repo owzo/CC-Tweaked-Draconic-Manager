@@ -10,13 +10,15 @@ Includes drawing elements on the monitor and handling click events.
 
 local config = require("config").energyCore
 
+local monitor_utils = {}
+
 -- Function to setup monitor
-function setupMonitor()
+function monitor_utils.setupMonitor()
     monitor.setTextScale(config.monitorScale)
 end
 
 -- Function to draw text on the monitor
-function drawText(x, y, text, textColor, bgColor)
+function monitor_utils.drawText(x, y, text, textColor, bgColor)
     monitor.setCursorPos(x, y)
     monitor.setTextColor(textColor)
     monitor.setBackgroundColor(bgColor)
@@ -24,14 +26,14 @@ function drawText(x, y, text, textColor, bgColor)
 end
 
 -- Function to clear the monitor
-function clearMonitor()
+function monitor_utils.clearMonitor()
     monitor.setBackgroundColor(colors.black)
     monitor.clear()
     monitor.setCursorPos(1, 1)
 end
 
 -- Function to draw a box on the monitor
-function drawBox(xMin, xMax, yMin, yMax, title)
+function monitor_utils.drawBox(xMin, xMax, yMin, yMax, title)
     monitor.setBackgroundColor(colors.gray)
     for xPos = xMin, xMax do
         monitor.setCursorPos(xPos, yMin)
@@ -53,7 +55,7 @@ function drawBox(xMin, xMax, yMin, yMax, title)
 end
 
 -- Function to draw a button on the monitor
-function drawButton(xMin, xMax, yMin, yMax, text1, text2, bColor)
+function monitor_utils.drawButton(xMin, xMax, yMin, yMax, text1, text2, bColor)
     monitor.setBackgroundColor(bColor)
     for yPos = yMin, yMax do
         for xPos = xMin, xMax do
@@ -70,7 +72,7 @@ function drawButton(xMin, xMax, yMin, yMax, text1, text2, bColor)
 end
 
 -- Function to handle click events on the monitor
-function clickListener()
+function monitor_utils.clickListener()
     while true do
         local event, side, xPos, yPos = os.pullEvent("monitor_touch")
         if xPos >= 2 and xPos <= 9 and yPos >= 16 and yPos <= 18 then
@@ -80,3 +82,5 @@ function clickListener()
         end
     end
 end
+
+return monitor_utils
