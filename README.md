@@ -4,6 +4,14 @@
 
 CC:Tweaked-Draconic Manager is a comprehensive control and monitoring program designed for ComputerCraft: Tweaked to manage Draconic Evolution reactors and energy cores. This system ensures the safe and efficient operation of your reactors and energy storage, leveraging wireless modem communication for a seamless and flexible setup.
 
+## Project Status: Proof of Concept
+
+This project was originally created as a **proof of concept** and is no longer under active development.  
+Due to limited time, I’m unable to continue maintaining or expanding it.  
+
+If anyone is interested in taking over development, **you are welcome to do so** — feel free to fork, modify, and build upon the existing work.  
+Credit is appreciated but not required. My goal was simply to demonstrate the core idea and provide a foundation for others to expand on.
+
 ## Features
 
 - **Advanced Computer Touchscreen Interface**: Dynamically adjusting interface for easy interaction with your reactor and energy core.
