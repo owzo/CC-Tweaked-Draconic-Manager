@@ -1,85 +1,56 @@
 --==============================================================
--- Statistics Utilities
+-- Statistics Utilities (Flux Gate Based)
 -- Save as: stat_utils.lua
 --==============================================================
 
 --[[
 README
 -------
-Handles logging of Draconic Reactor and Energy Core statistics.
+Logs reactor and flux gate statistics. This version no longer
+depends on draconic_rf_storage or Energy Core peripherals.
 
 Features:
-- Compatible with wired, wireless, or mixed modem networks
-- Automatically validates and reconnects to peripherals
-- Logs structured timestamped data for both reactor and core
-- Creates CSV-style logs for easy analysis
-- Safe, fault-tolerant file operations
+- Compatible with wired/wireless flux gates
+- Logs both reactor and flux gate flow rates
+- Timestamped structured logs
 ]]
 
 ------------------------------------------------------------
--- DEPENDENCIES AND CONFIG
+-- MODULE SETUP
 ------------------------------------------------------------
-local cfg = require("config")
-local energyCfg = cfg.energyCore
-local peripherals = cfg.peripherals
-
 local stat_utils = {}
 
 ------------------------------------------------------------
--- LOCAL PERIPHERALS
+-- FLUX GATE DISCOVERY
 ------------------------------------------------------------
-local energyCore
+local function findFluxGates()
+    local gates = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name):find("flux_gate") then
+            table.insert(gates, peripheral.wrap(name))
+        end
+    end
+    if #gates == 0 then
+        error("No flux gates detected! Attach modems to your gates.")
+    end
+    return gates
+end
+
+local fluxGates = findFluxGates()
 
 ------------------------------------------------------------
--- LOGGING HELPERS
+-- ERROR LOGGING
 ------------------------------------------------------------
-local function safeWriteLog(path, line)
-    local ok, err = pcall(function()
-        local f = fs.open(path, "a")
-        if not f then
-            print("Unable to open log file: " .. path)
-            return
-        end
-        f.writeLine(line)
+local function logError(msg)
+    local f = fs.open("logs.cfg", "a")
+    if f then
+        f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
         f.close()
-    end)
-    if not ok then
-        print("Logging error: " .. tostring(err))
-    end
-end
-
-local function logError(message)
-    safeWriteLog(energyCfg.logsFile or "logs.cfg",
-        string.format("%s | ERROR: %s", os.date("%Y-%m-%d %H:%M:%S"), message))
-end
-
-------------------------------------------------------------
--- PERIPHERAL VALIDATION AND RECOVERY
-------------------------------------------------------------
-local function findEnergyCore()
-    if peripherals.energyCore and peripherals.energyCore ~= "" then
-        if peripheral.isPresent(peripherals.energyCore) then
-            return peripheral.wrap(peripherals.energyCore)
-        end
-    end
-    return peripheral.find("draconic_rf_storage")
-end
-
-local function validatePeripherals()
-    energyCore = findEnergyCore()
-    if not energyCore then
-        logError("Energy Core peripheral not found.")
-        error("Energy Core not found. Attach a modem to an I/O crystal.")
     end
 end
 
 ------------------------------------------------------------
--- INITIALIZE ON LOAD
-------------------------------------------------------------
-validatePeripherals()
-
-------------------------------------------------------------
--- LOG REACTOR STATISTICS
+-- REACTOR STATS LOGGING
 ------------------------------------------------------------
 function stat_utils.logReactorStats(reactor)
     if not reactor or not reactor.getReactorInfo then
@@ -89,81 +60,52 @@ function stat_utils.logReactorStats(reactor)
 
     local ok, info = pcall(reactor.getReactorInfo)
     if not ok or not info then
-        logError("Failed to fetch reactor information for statistics.")
+        logError("Failed to read reactor data: " .. tostring(info))
         return
     end
 
-    -- Flatten data for log output
+    local f = fs.open("reactor_stats.log", "a")
+    if not f then return end
+
     local line = string.format(
-        "%s | Status=%s | Temp=%.2f | Field=%.2f | Fuel=%.2f | Sat=%.2f | Gen=%.2f",
+        "%s | Status=%s | Temp=%.1f | Field=%.1f | Fuel=%.2f | Saturation=%.1f",
         os.date("%Y-%m-%d %H:%M:%S"),
         tostring(info.status or "unknown"),
         tonumber(info.temperature or 0),
         tonumber(info.fieldStrength or 0),
         tonumber(info.fuelConversion or 0),
-        tonumber(info.energySaturation or 0),
-        tonumber(info.generationRate or 0)
+        tonumber(info.energySaturation or 0)
     )
 
-    safeWriteLog("reactor_stats.log", line)
+    f.writeLine(line)
+    f.close()
 end
 
 ------------------------------------------------------------
--- LOG ENERGY CORE STATISTICS
+-- FLUX GATE FLOW LOGGING
 ------------------------------------------------------------
-function stat_utils.logEnergyCoreStats(inputRate, outputRate)
-    if not energyCore then
-        validatePeripherals()
+function stat_utils.logEnergyCoreStats()
+    local f = fs.open("energy_core_stats.log", "a")
+    if not f then return end
+
+    local inFlow, outFlow = 0, 0
+    for _, gate in ipairs(fluxGates) do
+        local ok, flow = pcall(gate.getFlow)
+        if ok and type(flow) == "number" then
+            if flow < 0 then
+                inFlow = inFlow + flow
+            else
+                outFlow = outFlow + flow
+            end
+        end
     end
 
-    local ok, data = pcall(function()
-        return {
-            stored = energyCore.getEnergyStored(),
-            max = energyCore.getMaxEnergyStored(),
-            transfer = energyCore.getTransferPerTick()
-        }
-    end)
-
-    if not ok or not data then
-        logError("Failed to read energy core statistics.")
-        return
-    end
-
-    local line = string.format(
-        "%s | Stored=%d | Max=%d | Transfer=%d | In=%d | Out=%d",
+    f.writeLine(string.format(
+        "%s | In: %.0f RF/t | Out: %.0f RF/t",
         os.date("%Y-%m-%d %H:%M:%S"),
-        data.stored or 0,
-        data.max or 0,
-        data.transfer or 0,
-        inputRate or 0,
-        outputRate or 0
-    )
-
-    safeWriteLog("energy_core_stats.log", line)
-end
-
-------------------------------------------------------------
--- CSV-STYLE EXPORT (OPTIONAL)
-------------------------------------------------------------
-function stat_utils.exportCSV()
-    local ok, data = pcall(function()
-        local s = energyCore.getEnergyStored()
-        local m = energyCore.getMaxEnergyStored()
-        local t = energyCore.getTransferPerTick()
-        return string.format("%s,%d,%d,%d", os.date("%Y-%m-%d %H:%M:%S"), s, m, t)
-    end)
-    if ok and data then
-        safeWriteLog("energy_core_summary.csv", data)
-    else
-        logError("Failed to write CSV energy summary.")
-    end
-end
-
-------------------------------------------------------------
--- EXPORTED ERROR LOGGER (for external modules)
-------------------------------------------------------------
-function stat_utils.logError(err)
-    logError(err)
+        inFlow, outFlow
+    ))
+    f.close()
 end
 
 return stat_utils
