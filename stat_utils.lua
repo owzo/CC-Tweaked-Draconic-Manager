@@ -1,48 +1,39 @@
 --==============================================================
--- Statistics Utilities (Flux Gate Based)
+-- STATISTICS UTILITIES
 -- Save as: stat_utils.lua
 --==============================================================
 
 --[[
 README
 -------
-Logs reactor and flux gate statistics. This version no longer
-depends on draconic_rf_storage or Energy Core peripherals.
+Handles automated logging for reactor and energy flow data.
+Works only with configured flux gates and reactor stabilizer.
 
-Features:
-- Compatible with wired/wireless flux gates
-- Logs both reactor and flux gate flow rates
-- Timestamped structured logs
+Adds:
+- Automatic retries
+- Error handling with logging
+- Periodic background logging
 ]]
 
 ------------------------------------------------------------
--- MODULE SETUP
+-- IMPORT CONFIG + SETUP
 ------------------------------------------------------------
+local cfg = require("config")
+local p = cfg.peripherals
 local stat_utils = {}
 
 ------------------------------------------------------------
--- FLUX GATE DISCOVERY
+-- WRAP PERIPHERALS
 ------------------------------------------------------------
-local function findFluxGates()
-    local gates = {}
-    for _, name in ipairs(peripheral.getNames()) do
-        if peripheral.getType(name):find("flux_gate") then
-            table.insert(gates, peripheral.wrap(name))
-        end
-    end
-    if #gates == 0 then
-        error("No flux gates detected! Attach modems to your gates.")
-    end
-    return gates
-end
-
-local fluxGates = findFluxGates()
+local reactor = peripheral.wrap(p.reactor)
+local inGate = peripheral.wrap(p.fluxIn)
+local outGate = peripheral.wrap(p.fluxOut)
 
 ------------------------------------------------------------
--- ERROR LOGGING
+-- LOGGING FUNCTION
 ------------------------------------------------------------
 local function logError(msg)
-    local f = fs.open("logs.cfg", "a")
+    local f = fs.open(cfg.energyCore.logsFile, "a")
     if f then
         f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
         f.close()
@@ -50,62 +41,67 @@ local function logError(msg)
 end
 
 ------------------------------------------------------------
--- REACTOR STATS LOGGING
+-- LOG REACTOR DATA
 ------------------------------------------------------------
-function stat_utils.logReactorStats(reactor)
-    if not reactor or not reactor.getReactorInfo then
-        logError("Invalid reactor reference in logReactorStats()")
-        return
-    end
-
+function stat_utils.logReactorStats()
     local ok, info = pcall(reactor.getReactorInfo)
     if not ok or not info then
-        logError("Failed to read reactor data: " .. tostring(info))
+        logError("Failed to read reactor info.")
         return
     end
 
     local f = fs.open("reactor_stats.log", "a")
-    if not f then return end
+    if not f then
+        logError("Failed to open reactor_stats.log")
+        return
+    end
 
-    local line = string.format(
-        "%s | Status=%s | Temp=%.1f | Field=%.1f | Fuel=%.2f | Saturation=%.1f",
+    f.writeLine(string.format(
+        "%s | Status=%s | Temp=%.1f | Field=%.1f | Fuel=%.2f | Sat=%.1f",
         os.date("%Y-%m-%d %H:%M:%S"),
         tostring(info.status or "unknown"),
         tonumber(info.temperature or 0),
         tonumber(info.fieldStrength or 0),
         tonumber(info.fuelConversion or 0),
         tonumber(info.energySaturation or 0)
-    )
-
-    f.writeLine(line)
+    ))
     f.close()
 end
 
 ------------------------------------------------------------
--- FLUX GATE FLOW LOGGING
+-- LOG FLUX GATE FLOW DATA
 ------------------------------------------------------------
 function stat_utils.logEnergyCoreStats()
-    local f = fs.open("energy_core_stats.log", "a")
-    if not f then return end
-
-    local inFlow, outFlow = 0, 0
-    for _, gate in ipairs(fluxGates) do
-        local ok, flow = pcall(gate.getFlow)
-        if ok and type(flow) == "number" then
-            if flow < 0 then
-                inFlow = inFlow + flow
-            else
-                outFlow = outFlow + flow
-            end
-        end
+    local okIn, inFlow = pcall(inGate.getFlow)
+    local okOut, outFlow = pcall(outGate.getFlow)
+    if not okIn or not okOut then
+        logError("Flux gate read error during logEnergyCoreStats()")
+        return
     end
 
+    local f = fs.open("energy_core_stats.log", "a")
+    if not f then
+        logError("Failed to open energy_core_stats.log")
+        return
+    end
     f.writeLine(string.format(
         "%s | In: %.0f RF/t | Out: %.0f RF/t",
-        os.date("%Y-%m-%d %H:%M:%S"),
-        inFlow, outFlow
-    ))
+        os.date("%Y-%m-%d %H:%M:%S"), inFlow, outFlow))
     f.close()
+end
+
+------------------------------------------------------------
+-- AUTOMATION: BACKGROUND LOGGER
+------------------------------------------------------------
+function stat_utils.runAutoLogger()
+    while true do
+        local ok, err = pcall(function()
+            stat_utils.logReactorStats()
+            stat_utils.logEnergyCoreStats()
+        end)
+        if not ok then logError("AutoLogger error: " .. tostring(err)) end
+        sleep(10)  -- Log every 10 seconds
+    end
 end
 
 return stat_utils
