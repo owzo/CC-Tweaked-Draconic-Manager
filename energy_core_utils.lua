@@ -1,197 +1,131 @@
 --==============================================================
--- Energy Core Utilities
+-- Energy Core Utilities (Flux Gate Based)
 -- Save as: energy_core_utils.lua
 --==============================================================
 
 --[[
 README
 -------
-Functions for monitoring and controlling a Draconic Energy Core
-through CC:Tweaked. Supports both wired and wireless modem
-connections (or a hybrid of both).
+Monitors energy flow via Draconic Evolution Flux Gates.
+No longer connects directly to the Energy Core or I/O Crystals.
 
-Handles:
-- Energy Core detection and status retrieval
-- Monitor display updates
-- Logging of statistics and errors
-- Flux gate rate adjustments (if present)
+Features:
+- Detects all flux gates dynamically
+- Determines which gate is Input vs Output based on energy flow
+- Displays live input/output rates on monitor
+- Safe for wired, wireless, or hybrid modem setups
 ]]
 
 ------------------------------------------------------------
--- DEPENDENCIES AND CONFIG
+-- MODULE SETUP
 ------------------------------------------------------------
-local cfg = require("config")
-local energyCfg = cfg.energyCore
-local peripherals = cfg.peripherals
-
 local energy_core_utils = {}
 
-------------------------------------------------------------
--- PERIPHERAL REFERENCES
-------------------------------------------------------------
 local monitor
-local energyCore
 local inputGate
 local outputGate
+local gatesDetected = false
 
 ------------------------------------------------------------
--- HELPER: FIND PERIPHERAL BY TYPE
+-- FLUX GATE DETECTION
 ------------------------------------------------------------
-local function findPeripheralByType(expectedType)
-    local names = peripheral.getNames()
-    for _, name in ipairs(names) do
-        local pType = peripheral.getType(name)
-        if pType == expectedType then
-            return name
+local function detectFluxGates()
+    local gates = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name):find("flux_gate") then
+            table.insert(gates, peripheral.wrap(name))
         end
     end
-    return nil
-end
 
-------------------------------------------------------------
--- VALIDATE AND INITIALIZE PERIPHERALS
-------------------------------------------------------------
-local function validatePeripherals()
-    -- Monitors
-    if peripherals.monitors and #peripherals.monitors > 0 then
-        for _, side in ipairs(peripherals.monitors) do
-            if peripheral.getType(side) == "monitor" then
-                monitor = peripheral.wrap(side)
-                break
+    if #gates == 0 then
+        error("No flux gates found! Attach modems to your input/output gates.")
+    end
+
+    print("Detecting flux gate directions...")
+    for _, gate in ipairs(gates) do
+        local ok, flow = pcall(gate.getFlow)
+        if ok and type(flow) == "number" then
+            if flow < 0 then
+                inputGate = gate
+            else
+                outputGate = gate
             end
         end
     end
-    if not monitor then
-        monitor = peripheral.find("monitor")
-    end
-    if not monitor then
-        error("Monitor not found. Attach or define a valid monitor in config.peripherals.monitors.")
-    end
 
-    -- Energy Core
-    if peripherals.energyCore and peripherals.energyCore ~= "" then
-        if not peripheral.isPresent(peripherals.energyCore) then
-            error("Configured Energy Core peripheral not found: " .. peripherals.energyCore)
-        end
-        energyCore = peripheral.wrap(peripherals.energyCore)
-    else
-        energyCore = peripheral.find("draconic_rf_storage")
-    end
-    if not energyCore then
-        error("Draconic Energy Core not found. Attach a modem to an I/O Crystal.")
-    end
-
-    -- Flux Gates (Input and Output)
-    if peripherals.fluxIn and peripherals.fluxIn ~= "" then
-        inputGate = peripheral.wrap(peripherals.fluxIn)
-    else
-        inputGate = peripheral.find("draconic_flux_gate")
-    end
-    if not inputGate then
-        error("Input Flux Gate not found.")
-    end
-
-    if peripherals.fluxOut and peripherals.fluxOut ~= "" then
-        outputGate = peripheral.wrap(peripherals.fluxOut)
-    else
-        outputGate = peripheral.find("draconic_flux_gate")
-    end
+    if not inputGate then inputGate = gates[1] end
     if not outputGate then
-        error("Output Flux Gate not found.")
+        for _, g in ipairs(gates) do
+            if g ~= inputGate then outputGate = g end
+        end
     end
+
+    print("Input Gate:  " .. peripheral.getName(inputGate))
+    print("Output Gate: " .. peripheral.getName(outputGate))
+    gatesDetected = true
 end
 
--- Run validation on load
-validatePeripherals()
-
 ------------------------------------------------------------
--- LOGGING FUNCTIONS
+-- MONITOR SETUP
 ------------------------------------------------------------
-function energy_core_utils.logError(err)
-    local logFile = fs.open(energyCfg.logsFile or "logs.cfg", "a")
-    if logFile then
-        logFile.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " ERROR: " .. tostring(err))
-        logFile.close()
+function energy_core_utils.setup()
+    detectFluxGates()
+    monitor = peripheral.find("monitor")
+    if not monitor then
+        print("No monitor detected; running headless.")
+        return
     end
-end
-
-function energy_core_utils.logEnergyCoreStats()
-    local logFile = fs.open("energy_core_stats.log", "a")
-    if not logFile then return end
-
-    local energyStored = energyCore.getEnergyStored()
-    local maxEnergyStored = energyCore.getMaxEnergyStored()
-    local transferRate = energyCore.getTransferPerTick()
-    logFile.writeLine(
-        string.format(
-            "%s | Stored=%d | Max=%d | Transfer=%d RF/t",
-            os.date("%Y-%m-%d %H:%M:%S"),
-            energyStored, maxEnergyStored, transferRate
-        )
-    )
-    logFile.close()
-end
-
-------------------------------------------------------------
--- MONITOR OUTPUT
-------------------------------------------------------------
-local function drawText(x, y, text, textColor, bgColor)
-    monitor.setCursorPos(x, y)
-    monitor.setTextColor(textColor or colors.white)
-    monitor.setBackgroundColor(bgColor or colors.black)
-    monitor.write(text)
-end
-
-function energy_core_utils.updateMonitor()
-    monitor.setTextScale(energyCfg.monitorScale or 1)
+    monitor.setTextScale(1)
     monitor.setBackgroundColor(colors.black)
     monitor.clear()
-
-    local energyStored = energyCore.getEnergyStored()
-    local maxEnergyStored = energyCore.getMaxEnergyStored()
-    local transferRate = energyCore.getTransferPerTick()
-
-    drawText(2, 2, "Energy Core Status", colors.white, colors.black)
-    drawText(2, 4, string.format("Stored: %d RF", energyStored), colors.white)
-    drawText(2, 5, string.format("Capacity: %d RF", maxEnergyStored), colors.white)
-    drawText(2, 6, string.format("Transfer: %d RF/t", transferRate), colors.white)
 end
 
 ------------------------------------------------------------
--- FLUX GATE RATE CONTROL
+-- DISPLAY UPDATE
 ------------------------------------------------------------
-function energy_core_utils.setInputRate(rate)
-    if inputGate and inputGate.setFlow then
-        inputGate.setFlow(rate)
-    elseif inputGate and inputGate.setFlowrate then
-        inputGate.setFlowrate(rate)
-    else
-        energy_core_utils.logError("Input flux gate does not support setFlow/setFlowrate.")
+function energy_core_utils.updateMonitor()
+    if not monitor then return end
+    monitor.clear()
+    monitor.setCursorPos(2, 2)
+    monitor.setTextColor(colors.white)
+    monitor.write("Energy Flow Monitor")
+
+    local inFlow, outFlow = 0, 0
+    if inputGate then
+        local ok, f = pcall(inputGate.getFlow)
+        if ok then inFlow = f end
     end
+    if outputGate then
+        local ok, f = pcall(outputGate.getFlow)
+        if ok then outFlow = f end
+    end
+
+    monitor.setCursorPos(2, 4)
+    monitor.write(string.format("Input Rate:  %.0f RF/t", inFlow))
+    monitor.setCursorPos(2, 5)
+    monitor.write(string.format("Output Rate: %.0f RF/t", outFlow))
 end
 
-function energy_core_utils.setOutputRate(rate)
-    if outputGate and outputGate.setFlow then
-        outputGate.setFlow(rate)
-    elseif outputGate and outputGate.setFlowrate then
-        outputGate.setFlowrate(rate)
-    else
-        energy_core_utils.logError("Output flux gate does not support setFlow/setFlowrate.")
-    end
-end
+------------------------------------------------------------
+-- LOGGING
+------------------------------------------------------------
+function energy_core_utils.logEnergyCoreStats()
+    local f = fs.open("energy_core_stats.log", "a")
+    if not f then return end
 
-------------------------------------------------------------
--- CLICK LISTENER (FOR TOUCH MONITORS)
-------------------------------------------------------------
-function energy_core_utils.clickListener()
-    while true do
-        local event, side, xPos, yPos = os.pullEvent("monitor_touch")
-        if xPos >= 2 and xPos <= 9 and yPos >= 16 and yPos <= 18 then
-            energy_core_utils.setInputRate(10000000)  -- Example static input rate
-        elseif xPos >= 11 and xPos <= 18 and yPos >= 16 and yPos <= 18 then
-            energy_core_utils.setOutputRate(20000000) -- Example static output rate
-        end
+    local inFlow, outFlow = 0, 0
+    if inputGate then
+        local ok, fIn = pcall(inputGate.getFlow)
+        if ok then inFlow = fIn end
     end
+    if outputGate then
+        local ok, fOut = pcall(outputGate.getFlow)
+        if ok then outFlow = fOut end
+    end
+
+    f.writeLine(os.date("%Y-%m-%d %H:%M:%S") ..
+        string.format(" | In: %.0f RF/t | Out: %.0f RF/t", inFlow, outFlow))
+    f.close()
 end
 
 return energy_core_utils
