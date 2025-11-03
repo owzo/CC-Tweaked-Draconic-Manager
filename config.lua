@@ -6,92 +6,87 @@
 --[[
 README
 -------
-Configuration file for CC:Tweaked Draconic Reactor + Energy Core Manager.
+Configuration file for CC:Tweaked Draconic Reactor + Flux-Gate Manager.
 
-This file centralizes all user-editable settings, including safety thresholds,
-device names, and modem configuration. It supports both wired and wireless
-networks, or any combination of the two.
+This system no longer connects directly to a Draconic Energy Core or I/O Crystal.
+Instead, it uses Flux Gates to read and control energy flow.
 
-You can connect devices (Reactor Stabilizer, Flux Gates, Energy Core, Monitors)
-through either:
-    - Wired modems and cable
-    - Wireless modems (paired via right-click)
-    - A hybrid of both
-
-The computer only needs a modem that can reach all devices in the same
-network or paired group.
+Supports:
+- Wired modems
+- Wireless modems (paired)
+- Hybrid of both
 ]]
 
---==============================================================
+------------------------------------------------------------
 -- CONFIG TABLE
---==============================================================
+------------------------------------------------------------
 local config = {}
 
 ------------------------------------------------------------
 -- DRACONIC REACTOR CONFIGURATION
 ------------------------------------------------------------
 config.reactor = {
-    id                = "1",              -- Reactor ID (for multiple reactors)
-    outputMultiplier  = 1.0,              -- Output multiplier from modpack
+    id                = "1",              -- Reactor ID (for multi-reactor setups)
+    outputMultiplier  = 1.0,              -- Output multiplier set by modpack
     tempPinpoint      = 0,                -- Temperature adjustment sensitivity
 
     -- Safety thresholds
-    maxOvershoot      = 200.0,            -- Max temperature increase before emergency shutdown
-    minFuel           = 0.05,             -- Minimum fuel level before auto-shutdown
+    maxOvershoot      = 200.0,            -- Max °C above target before shutdown
+    minFuel           = 0.05,             -- Minimum fuel ratio before shutdown
 
     -- Target operation values
-    defaultTemp       = 8000.0,           -- Default target temperature (°C)
-    defaultField      = 0.50,             -- Default target field strength (50%)
-    safeTemperature   = 3000.0,           -- Temperature below which the reactor can safely restart
+    defaultTemp       = 8000.0,           -- Target temperature (°C)
+    defaultField      = 0.50,             -- Target field strength (50 %)
+    safeTemperature   = 3000.0,           -- Safe restart temperature (°C)
 
     -- Flow control
-    maxOutflow        = 30000000.0,       -- Max energy outflow (RF/t)
-    chargeInflow      = 20000000.0,       -- Max inflow during charging (RF/t)
+    maxOutflow        = 30000000.0,       -- Max output (RF/t)
+    chargeInflow      = 20000000.0,       -- Input rate while charging (RF/t)
 
     -- Field thresholds
-    shutDownField     = 0.20,             -- Shutdown if field strength drops below 20%
-    restartFix        = 100,              -- Restart delay ticks after field recharge
+    shutDownField     = 0.20,             -- Auto-shutdown below 20 % field
+    restartFix        = 100,              -- Restart delay (ticks)
 
     -- Options
-    safeMode          = true,             -- If true, disables dangerous operations automatically
-    maxTempInc        = 400.0             -- Maximum allowed temperature increase per tick
+    safeMode          = true,             -- Auto-shutdown on dangerous states
+    maxTempInc        = 400.0             -- Max allowed temperature change per tick
 }
 
 ------------------------------------------------------------
--- ENERGY CORE CONFIGURATION
+-- ENERGY / MONITOR CONFIGURATION
 ------------------------------------------------------------
 config.energyCore = {
-    logsFile          = "logs.cfg",       -- Log file path for event logging
-    monitorScale      = 1,                -- Text scaling for monitor display
+    logsFile     = "logs.cfg",            -- General log file
+    monitorScale = 1                      -- Text scale for monitors
 }
 
 ------------------------------------------------------------
 -- PERIPHERAL MAPPINGS
 ------------------------------------------------------------
--- Update these values if you want to manually specify exact peripheral names.
--- If left blank, automatic detection will attempt to find devices by type.
+-- Leave blank to let the system auto-detect by type.
+-- Specify exact names (e.g., "flow_gate_0") if you want to hard-code them.
 config.peripherals = {
-    reactor     = "",                     -- Reactor stabilizer modem name
-    energyCore  = "",                     -- Energy Core I/O Crystal modem name
-    fluxIn      = "",                     -- Flux Gate controlling power INTO reactor
-    fluxOut     = "",                     -- Flux Gate controlling power OUT to core
-    monitors    = {"top"}                 -- One or more monitor sides/names
+    reactor  = "",                        -- Reactor stabilizer modem name
+    fluxIn   = "",                        -- Flux Gate feeding INTO reactor
+    fluxOut  = "",                        -- Flux Gate pulling OUT to storage/core
+    monitors = {"top"}                    -- One or more monitor sides/names
 }
 
 ------------------------------------------------------------
--- PERIPHERAL DETECTION AND VALIDATION
+-- PERIPHERAL DETECTION UTILITIES
 ------------------------------------------------------------
 local function findPeripheralByType(expectedType)
-    local names = peripheral.getNames()
-    for _, name in ipairs(names) do
-        local pType = peripheral.getType(name)
-        if pType == expectedType then
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == expectedType then
             return name
         end
     end
     return nil
 end
 
+------------------------------------------------------------
+-- VALIDATION (LIGHTWEIGHT)
+------------------------------------------------------------
 local function validatePeripherals()
     -- Reactor Stabilizer
     if config.peripherals.reactor == "" then
@@ -101,27 +96,19 @@ local function validatePeripherals()
         error("Reactor Stabilizer not found. Attach a modem to one stabilizer.")
     end
 
-    -- Energy Core I/O Crystal
-    if config.peripherals.energyCore == "" then
-        config.peripherals.energyCore = findPeripheralByType("draconic_rf_storage")
-    end
-    if not config.peripherals.energyCore or not peripheral.isPresent(config.peripherals.energyCore) then
-        error("Energy Core not found. Attach a modem to an I/O crystal.")
-    end
-
-    -- Flux Gates
-    if config.peripherals.fluxIn == "" then
-        config.peripherals.fluxIn = findPeripheralByType("draconic_flux_gate")
-    end
-    if not config.peripherals.fluxIn or not peripheral.isPresent(config.peripherals.fluxIn) then
-        error("Input Flux Gate not found.")
-    end
-
-    if config.peripherals.fluxOut == "" then
-        config.peripherals.fluxOut = findPeripheralByType("draconic_flux_gate")
-    end
-    if not config.peripherals.fluxOut or not peripheral.isPresent(config.peripherals.fluxOut) then
-        error("Output Flux Gate not found.")
+    -- Flux Gates (Energy Core handled via these)
+    if config.peripherals.fluxIn == "" or config.peripherals.fluxOut == "" then
+        local found = {}
+        for _, name in ipairs(peripheral.getNames()) do
+            if peripheral.getType(name):find("flux_gate") then
+                table.insert(found, name)
+            end
+        end
+        if #found < 2 then
+            error("At least two flux gates are required (input + output).")
+        end
+        if config.peripherals.fluxIn == "" then config.peripherals.fluxIn = found[1] end
+        if config.peripherals.fluxOut == "" then config.peripherals.fluxOut = found[2] end
     end
 
     -- Monitor(s)
@@ -132,7 +119,7 @@ local function validatePeripherals()
         end
     end
     if not monitorFound then
-        error("No valid monitor found. Check 'config.peripherals.monitors' or attach a monitor.")
+        error("No valid monitor found. Check config.peripherals.monitors or attach one.")
     end
 end
 
