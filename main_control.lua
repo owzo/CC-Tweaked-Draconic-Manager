@@ -35,23 +35,20 @@ local energy_core_utils = require("energy_core_utils")   -- Flux-gate energy mon
 ------------------------------------------------------------
 -- LOGGING UTILITIES
 ------------------------------------------------------------
-
--- Writes a timestamped event to the system log
 local function logEvent(msg)
-    local f = fs.open("draconic_manager.log", "a")
+    local f = fs.open("draconic_manager.log", "a")       -- Open/create main log
     if f then
         f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
         f.close()
     end
 end
 
--- Wraps a function in error handling, logs any thrown error
 local function safeRun(func, label)
     local ok, err = pcall(func)
     if not ok then
-        local msg = "Error in " .. label .. ": " .. tostring(err)
-        logEvent(msg)
-        print(msg)
+        local message = "Error in " .. label .. ": " .. tostring(err)
+        logEvent(message)
+        print(message)
     end
 end
 
@@ -79,12 +76,12 @@ local function mainLoop()
         ----------------------------------------------------
         -- SAFETY CHECKS: Fuel & Chaos Storage
         ----------------------------------------------------
-        -- These checks are performed before normal control logic
-        local fuelChaosOK = reac_utils.checkFuelAndChaos()
-        if not fuelChaosOK then
+        local fuelChaosOK = safeRun(reac_utils.checkFuelAndChaos, "checkFuelAndChaos")
+        if fuelChaosOK == false then
             logEvent("Fuel or chaos condition triggered safety halt.")
-            -- Allow time for cooling before retrying
             sleep(5)
+            -- Skip further control logic this cycle
+            goto continue
         end
 
         ----------------------------------------------------
@@ -95,7 +92,7 @@ local function mainLoop()
             logEvent("Emergency shutdown: unsafe temperature or field detected.")
             print("[!] Emergency shutdown executed.")
         ----------------------------------------------------
-        -- COLD OR OFFLINE STATE (Can charge)
+        -- COLD / OFFLINE STATE (Can charge)
         ----------------------------------------------------
         elseif status == "cold" or status == "offline" or status == "cooling" then
             if reac_utils.manualCharge then
@@ -104,25 +101,27 @@ local function mainLoop()
                 logEvent("Manual charge initiated.")
             end
         ----------------------------------------------------
-        -- CHARGING STATE (Reactor absorbing energy)
+        -- CHARGING STATE
         ----------------------------------------------------
         elseif status == "charging" then
-            reac_utils.setFluxGateFlowRate(reac_utils.gateIn, config.reactor.chargeInflow)
-            reac_utils.setFluxGateFlowRate(reac_utils.gateOut, 0)
+            safeRun(function()
+                reac_utils.gateIn.setFlowOverride(config.reactor.chargeInflow)
+                reac_utils.gateOut.setFlowOverride(0)
+            end, "setChargeFlows")
         ----------------------------------------------------
-        -- WARMUP OR CHARGED STATE (Ready to start)
-        ----------------------------------------------------
+        -- WARMUP OR CHARGED STATE
         elseif status == "warming_up" or status == "charged" then
-            reac_utils.setFluxGateFlowRate(reac_utils.gateIn, config.reactor.chargeInflow)
-            reac_utils.setFluxGateFlowRate(reac_utils.gateOut, 0)
+            safeRun(function()
+                reac_utils.gateIn.setFlowOverride(config.reactor.chargeInflow)
+                reac_utils.gateOut.setFlowOverride(0)
+            end, "setWarmupFlows")
             if reac_utils.manualStart then
                 reac_utils.manualStart = false
                 safeRun(reac_utils.reactor.activateReactor, "activateReactor")
                 logEvent("Manual reactor start requested.")
             end
         ----------------------------------------------------
-        -- ACTIVE RUNNING STATE
-        ----------------------------------------------------
+        -- RUNNING / ONLINE STATE
         elseif status == "running" or status == "online" then
             if reac_utils.manualStop then
                 reac_utils.manualStop = false
@@ -132,7 +131,6 @@ local function mainLoop()
             safeRun(reac_utils.adjustReactorTempAndField, "adjustReactorTempAndField")
         ----------------------------------------------------
         -- STOPPING / COOLING DOWN
-        ----------------------------------------------------
         elseif status == "stopping" then
             safeRun(reac_utils.handleReactorStopping, "handleReactorStopping")
         else
@@ -142,7 +140,6 @@ local function mainLoop()
         ----------------------------------------------------
         -- MONITOR + FLUX GATE DISPLAY UPDATES
         ----------------------------------------------------
-        safeRun(reac_utils.updateFluxGates, "updateFluxGates")
         if reac_utils.mon then
             safeRun(energy_core_utils.updateMonitor, "energy_core_utils.updateMonitor")
         end
@@ -154,7 +151,8 @@ local function mainLoop()
         safeRun(function() stat_utils.logReactorStats(reac_utils.reactor) end,
                 "stat_utils.logReactorStats")
 
-        sleep(0.2) -- Main tick rate (5 loops/sec = smoother display)
+        ::continue::
+        sleep(0.2) -- Main tick rate (~5 cycles/sec)
     end
 end
 
@@ -169,25 +167,17 @@ local function main()
     print("===================================================")
     print("Initializing peripherals and safety systems...")
 
-    --------------------------------------------------------
-    -- INITIALIZATION: Load all utilities and setup
-    --------------------------------------------------------
     safeRun(reac_utils.setup, "reac_utils.setup")
     safeRun(energy_core_utils.setup, "energy_core_utils.setup")
     logEvent("Initialization complete; starting main control loop.")
 
-    --------------------------------------------------------
-    -- MULTITHREADED EXECUTION
-    --------------------------------------------------------
     if reac_utils.mon == nil then
-        -- No monitor attached → just run logic
         safeRun(mainLoop, "mainLoop")
     else
-        -- Run logic and monitor input concurrently
         parallel.waitForAll(mainLoop, monitor_utils.clickListener)
         reac_utils.mon.setBackgroundColor(colors.black)
         reac_utils.mon.clear()
-        reac_utils.mon.setCursorPos(2, 2)
+        reac_utils.mon.setCursorPos(2,2)
         reac_utils.mon.setTextColor(colors.white)
         reac_utils.mon.write("Program stopped.")
         logEvent("Program terminated by user.")
@@ -195,7 +185,7 @@ local function main()
 end
 
 ------------------------------------------------------------
--- FAILSAFE STARTUP WRAPPER
+-- SAFE STARTUP WRAPPER
 ------------------------------------------------------------
 local ok, err = pcall(main)
 if not ok then
