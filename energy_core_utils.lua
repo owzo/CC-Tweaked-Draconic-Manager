@@ -3,36 +3,15 @@
 -- Save as: energy_core_utils.lua
 --==============================================================
 
---[[
-README
--------
-This module reads and displays power flow through Flux Gates.
-Replaces any dependency on the Draconic Energy Core directly.
+local cfg = require("config")
+local p = cfg.peripherals
+local energy_core_utils = {}
 
-Features:
-- Uses hardcoded gate names from config.lua
-- Provides automatic logging, error handling, and retry logic
-- Displays real-time input/output rates on monitor
-]]
+local inGate  = peripheral.wrap(p.fluxIn)
+local outGate = peripheral.wrap(p.fluxOut)
+local mon     = peripheral.wrap(p.monitors[1])
 
-------------------------------------------------------------
--- IMPORT CONFIG
-------------------------------------------------------------
-local cfg = require("config")                 -- Load config file
-local p = cfg.peripherals                     -- Shortcut to peripheral map
-local energy_core_utils = {}                  -- Create a module table
-
-------------------------------------------------------------
--- INITIALIZE WRAPPED PERIPHERALS
-------------------------------------------------------------
-local inputGate = peripheral.wrap(p.fluxIn)   -- Input Flux Gate
-local outputGate = peripheral.wrap(p.fluxOut) -- Output Flux Gate
-local monitor = peripheral.wrap(p.monitors[1])-- Main Monitor
-
-------------------------------------------------------------
--- INTERNAL LOGGING FUNCTION
-------------------------------------------------------------
-local function logError(msg)
+local function log(msg)
     local f = fs.open(cfg.energyCore.logsFile, "a")
     if f then
         f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
@@ -40,82 +19,39 @@ local function logError(msg)
     end
 end
 
-------------------------------------------------------------
--- MONITOR SETUP AND AUTO-RECOVERY
-------------------------------------------------------------
-function energy_core_utils.setup()
-    if not monitor then
-        logError("Monitor not found, running headless mode.")
-        return
-    end
-
-    monitor.setTextScale(cfg.energyCore.monitorScale) -- Set scale from config
-    monitor.setBackgroundColor(colors.black)          -- Set background
-    monitor.clear()                                   -- Clear monitor text
-    monitor.setCursorPos(1, 1)
-    monitor.setTextColor(colors.white)
-    monitor.write("Energy Flow Monitor Initialized")
-    logError("Monitor setup successful.")
-end
-
-------------------------------------------------------------
--- AUTOMATED DISPLAY UPDATE LOOP
-------------------------------------------------------------
 function energy_core_utils.updateMonitor()
-    if not monitor then return end
+    if not mon then return end
+    mon.setTextScale(cfg.energyCore.monitorScale)
+    mon.setBackgroundColor(colors.black)
+    mon.clear()
+    mon.setTextColor(colors.white)
 
-    local okIn, inFlow = pcall(inputGate.getFlow)     -- Safely read input gate
-    local okOut, outFlow = pcall(outputGate.getFlow)  -- Safely read output gate
+    local okIn, inFlow = pcall(inGate.getFlow)
+    local okOut, outFlow = pcall(outGate.getFlow)
     if not okIn or not okOut then
-        logError("Failed to read from one or more flux gates.")
+        mon.setCursorPos(2, 2)
+        mon.write("Flux Gate Error")
+        log("Flux gate communication failed.")
         return
     end
 
-    monitor.setBackgroundColor(colors.black)
-    monitor.clear()
-    monitor.setTextColor(colors.white)
-    monitor.setCursorPos(2, 2)
-    monitor.write("Energy Flow Monitor")
-    monitor.setCursorPos(2, 4)
-    monitor.write(string.format("Input Rate : %.0f RF/t", inFlow))
-    monitor.setCursorPos(2, 5)
-    monitor.write(string.format("Output Rate: %.0f RF/t", outFlow))
+    mon.setCursorPos(2, 2)
+    mon.write("Energy Flow Monitor")
+    mon.setCursorPos(2, 4)
+    mon.write(string.format("Input:  %.0f RF/t", inFlow))
+    mon.setCursorPos(2, 5)
+    mon.write(string.format("Output: %.0f RF/t", outFlow))
 end
 
-------------------------------------------------------------
--- AUTOMATED LOGGING FUNCTION
-------------------------------------------------------------
 function energy_core_utils.logEnergyCoreStats()
-    local okIn, inFlow = pcall(inputGate.getFlow)
-    local okOut, outFlow = pcall(outputGate.getFlow)
-
-    if not okIn or not okOut then
-        logError("Flux gate data unavailable for logging.")
-        return
-    end
-
+    local okIn, inFlow = pcall(inGate.getFlow)
+    local okOut, outFlow = pcall(outGate.getFlow)
+    if not okIn or not okOut then return end
     local f = fs.open("energy_core_stats.log", "a")
-    if not f then
-        logError("Failed to open log file.")
-        return
-    end
-
-    f.writeLine(string.format("%s | In: %.0f RF/t | Out: %.0f RF/t",
-        os.date("%Y-%m-%d %H:%M:%S"), inFlow, outFlow))
-    f.close()
-end
-
-------------------------------------------------------------
--- AUTOMATION: PERIODIC REFRESH THREAD
-------------------------------------------------------------
-function energy_core_utils.runAutoLoop()
-    while true do
-        local ok, err = pcall(function()
-            energy_core_utils.updateMonitor()
-            energy_core_utils.logEnergyCoreStats()
-        end)
-        if not ok then logError("AutoLoop error: " .. tostring(err)) end
-        sleep(5)  -- Refresh every 5 seconds
+    if f then
+        f.writeLine(string.format("%s | In: %.0f RF/t | Out: %.0f RF/t",
+            os.date("%Y-%m-%d %H:%M:%S"), inFlow, outFlow))
+        f.close()
     end
 end
 
