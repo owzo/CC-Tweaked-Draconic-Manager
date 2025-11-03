@@ -3,51 +3,40 @@
 -- Save as: stat_utils.lua
 --==============================================================
 
-local cfg = require("config")
-local p = cfg.peripherals
 local stat_utils = {}
 
-local reactor = peripheral.wrap(p.reactor)
-local inGate  = peripheral.wrap(p.fluxIn)
-local outGate = peripheral.wrap(p.fluxOut)
-
-------------------------------------------------------------
--- GENERIC LOGGING
-------------------------------------------------------------
-local function log(msg)
-    local f = fs.open(cfg.energyCore.logsFile, "a")
+local function logError(msg)
+    local f = fs.open("stats_error.log", "a")
     if f then
         f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
         f.close()
     end
 end
 
-------------------------------------------------------------
--- LOG REACTOR STATS (INCL. FUEL + CHAOS)
-------------------------------------------------------------
-function stat_utils.logReactorStats()
-    local ok, info = pcall(reactor.getReactorInfo)
-    if not ok or not info then
-        log("Reactor data unavailable for stat logging.")
+function stat_utils.logReactorStats(reactor)
+    if not reactor or not reactor.getReactorInfo then
+        logError("Reactor unavailable during stats logging.")
         return
     end
 
-    local fuelPct = 100 * (1.0 - info.fuelConversion / info.maxFuelConversion)
-    local chaosPct = 100 * (info.energySaturation / info.maxEnergySaturation)
+    local ok, info = pcall(reactor.getReactorInfo)
+    if not ok or not info then
+        logError("Failed to get reactor info: " .. tostring(info))
+        return
+    end
 
     local f = fs.open("reactor_stats.log", "a")
-    if f then
-        f.writeLine(string.format(
-            "%s | Status=%s | Temp=%.0f°C | Field=%.2f%% | Fuel=%.2f%% | Chaos=%.2f%%",
-            os.date("%Y-%m-%d %H:%M:%S"),
-            info.status or "unknown",
-            info.temperature or 0,
-            100 * (info.fieldStrength / info.maxFieldStrength),
-            fuelPct,
-            chaosPct
-        ))
-        f.close()
-    end
+    if not f then return end
+    f.writeLine(string.format(
+        "%s | Temp=%.1f | Field=%.2f | Fuel=%.2f | Sat=%.2f | Status=%s",
+        os.date("%Y-%m-%d %H:%M:%S"),
+        info.temperature or 0,
+        info.fieldStrength or 0,
+        info.fuelConversion or 0,
+        info.energySaturation or 0,
+        info.status or "unknown"
+    ))
+    f.close()
 end
 
 return stat_utils
