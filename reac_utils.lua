@@ -1,324 +1,172 @@
 --==============================================================
--- Reactor Utilities
+-- REACTOR UTILITIES
 -- Save as: reac_utils.lua
 --==============================================================
 
 --[[
 README
 -------
-Functions to manage Draconic Reactor control and monitoring.
+Handles all direct interactions with the Draconic Reactor stabilizer.
 
 Features:
-- Compatible with wired, wireless, or mixed modem setups
-- Auto-discovers peripherals if names are not defined in config.lua
-- Provides complete reactor data tracking and safety automation
-- Handles emergency shutdown and recovery logic
-- Safely regulates reactor temperature, field strength, and flow rates
+- Detects and reports "No Fuel" conditions.
+- Detects near/full energy saturation (chaos output full).
+- Performs automatic emergency shutdown when energy has nowhere to go.
+- Provides field and temperature regulation logic.
 ]]
 
 ------------------------------------------------------------
--- DEPENDENCIES AND CONFIG
+-- MODULE IMPORTS & SETUP
 ------------------------------------------------------------
 local cfg = require("config")
-local reactorCfg = cfg.reactor
-local peripherals = cfg.peripherals
-
+local p = cfg.peripherals
 local reac_utils = {}
 
 ------------------------------------------------------------
--- LOCAL STATE
+-- GLOBAL VARIABLES
 ------------------------------------------------------------
-local reactor
-local gateIn
-local gateOut
-local mon
-local info = {}
-local currentEmergency = false
-local currentField = 0
-local currentFuel = 0
-local manualStart = false
-local manualCharge = false
-local manualStop = false
+reac_utils.reactor = peripheral.wrap(p.reactor)
+reac_utils.gateIn  = peripheral.wrap(p.fluxIn)
+reac_utils.gateOut = peripheral.wrap(p.fluxOut)
+reac_utils.mon     = peripheral.wrap(p.monitors[1])
+reac_utils.info    = {}
+reac_utils.lastCheck = os.clock()
 
 ------------------------------------------------------------
--- LOGGING
+-- LOGGING FUNCTION
 ------------------------------------------------------------
-local function logError(err)
-    local f = fs.open("reactor_error.log", "a")
+local function log(msg)
+    local f = fs.open(cfg.energyCore.logsFile, "a")
     if f then
-        f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. tostring(err))
+        f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
         f.close()
     end
 end
 
 ------------------------------------------------------------
--- HELPER: FIND PERIPHERAL BY TYPE
-------------------------------------------------------------
-local function findPeripheralByType(expectedType)
-    local names = peripheral.getNames()
-    for _, name in ipairs(names) do
-        local pType = peripheral.getType(name)
-        if pType == expectedType then
-            return name
-        end
-    end
-    return nil
-end
-
-------------------------------------------------------------
--- VALIDATION / INITIALIZATION
-------------------------------------------------------------
-local function validatePeripherals()
-    -- Reactor
-    if peripherals.reactor and peripherals.reactor ~= "" then
-        if not peripheral.isPresent(peripherals.reactor) then
-            error("Configured reactor peripheral not found: " .. peripherals.reactor)
-        end
-        reactor = peripheral.wrap(peripherals.reactor)
-    else
-        local name = findPeripheralByType("draconic_reactor")
-        if not name then error("Reactor not found.") end
-        reactor = peripheral.wrap(name)
-    end
-
-    -- Input Flux Gate
-    if peripherals.fluxIn and peripherals.fluxIn ~= "" then
-        gateIn = peripheral.wrap(peripherals.fluxIn)
-    else
-        gateIn = peripheral.find("draconic_flux_gate")
-    end
-    if not gateIn then error("Input flux gate not found.") end
-
-    -- Output Flux Gate
-    if peripherals.fluxOut and peripherals.fluxOut ~= "" then
-        gateOut = peripheral.wrap(peripherals.fluxOut)
-    else
-        gateOut = peripheral.find("draconic_flux_gate")
-    end
-    if not gateOut then error("Output flux gate not found.") end
-
-    -- Monitor (optional)
-    if peripherals.monitors and #peripherals.monitors > 0 then
-        for _, side in ipairs(peripherals.monitors) do
-            if peripheral.getType(side) == "monitor" then
-                mon = peripheral.wrap(side)
-                break
-            end
-        end
-    end
-    if not mon then
-        mon = peripheral.find("monitor")
-    end
-end
-
-------------------------------------------------------------
--- SETUP
+-- INITIALIZATION
 ------------------------------------------------------------
 function reac_utils.setup()
-    term.clear()
-    term.setCursorPos(1,1)
-    print("Initializing reactor control...")
-    validatePeripherals()
-
-    -- Initialize flux gates safely
-    if gateIn.setOverrideEnabled then
-        gateIn.setOverrideEnabled(true)
-        gateIn.setFlowOverride(0)
-    elseif gateIn.setFlow then
-        gateIn.setFlow(0)
-    end
-    if gateOut.setOverrideEnabled then
-        gateOut.setOverrideEnabled(true)
-        gateOut.setFlowOverride(0)
-    elseif gateOut.setFlow then
-        gateOut.setFlow(0)
-    end
-    print("Reactor peripherals initialized successfully.")
+    reac_utils.reactor = peripheral.wrap(p.reactor)
+    reac_utils.gateIn  = peripheral.wrap(p.fluxIn)
+    reac_utils.gateOut = peripheral.wrap(p.fluxOut)
+    reac_utils.mon     = peripheral.wrap(p.monitors[1])
+    reac_utils.gateIn.setOverrideEnabled(true)
+    reac_utils.gateOut.setOverrideEnabled(true)
+    log("Reactor peripherals initialized successfully.")
 end
 
 ------------------------------------------------------------
--- PERIPHERAL GETTERS
-------------------------------------------------------------
-function reac_utils.getReactorInfo()
-    local ok, data = pcall(reactor.getReactorInfo)
-    if not ok or not data then
-        logError("Failed to get reactor info: " .. tostring(data))
-        return nil
-    end
-    info = data
-    currentField = info.fieldStrength / info.maxFieldStrength
-    currentFuel = 1.0 - (info.fuelConversion / info.maxFuelConversion)
-    return info
-end
-
-------------------------------------------------------------
--- STATUS / READOUT FUNCTIONS
-------------------------------------------------------------
-function reac_utils.getStatus()
-    local i = reac_utils.getReactorInfo()
-    if not i then return "unknown" end
-    return i.status
-end
-
-function reac_utils.getTemperature()
-    local i = reac_utils.getReactorInfo()
-    return (i and i.temperature) or 0
-end
-
-function reac_utils.getFieldStrength()
-    local i = reac_utils.getReactorInfo()
-    return (i and i.fieldStrength) or 0
-end
-
-------------------------------------------------------------
--- CONTROL: FLUX GATE MANAGEMENT
-------------------------------------------------------------
-function reac_utils.setFluxGateFlowRate(gate, flowRate)
-    if not gate or not flowRate then return end
-    local ok, err = pcall(function()
-        if gate.setFlowrate then
-            gate.setFlowrate(flowRate)
-        elseif gate.setSignalLowFlow then
-            gate.setSignalLowFlow(flowRate)
-        elseif gate.setFlow then
-            gate.setFlow(flowRate)
-        else
-            logError("Unknown flux gate interface.")
-        end
-    end)
-    if not ok then
-        logError("Failed to set flux gate flow rate: " .. tostring(err))
-    end
-end
-
-------------------------------------------------------------
--- CONTROL: FAIL-SAFE SHUTDOWN
-------------------------------------------------------------
-function reac_utils.failSafeShutdown()
-    logError("Initiating emergency shutdown...")
-    pcall(function()
-        if reactor.stopReactor then reactor.stopReactor() end
-        reac_utils.setFluxGateFlowRate(gateIn, reactorCfg.shutDownField * 1.2)
-        reac_utils.setFluxGateFlowRate(gateOut, 0)
-    end)
-end
-
-------------------------------------------------------------
--- CHECK + EMERGENCY STATE
+-- STATUS RETRIEVAL
 ------------------------------------------------------------
 function reac_utils.checkReactorStatus()
-    local i = reac_utils.getReactorInfo()
-    if not i then return end
-    info = i
-    currentField = info.fieldStrength / info.maxFieldStrength
-    currentFuel = 1.0 - (info.fuelConversion / info.maxFuelConversion)
+    local ok, info = pcall(reac_utils.reactor.getReactorInfo)
+    if not ok or not info then
+        log("Failed to fetch reactor info.")
+        return
+    end
+    reac_utils.info = info
 end
 
-function reac_utils.isEmergency()
-    if not info or not reactorCfg.safeMode then return false end
-    currentEmergency =
-        (info.temperature > reactorCfg.defaultTemp + reactorCfg.maxOvershoot)
-        or (currentField < 0.004)
-        or (currentFuel < reactorCfg.minFuel)
-    return currentEmergency
+------------------------------------------------------------
+-- FUEL & CHAOS MONITORING
+------------------------------------------------------------
+function reac_utils.checkFuelAndChaos()
+    local i = reac_utils.info
+    if not i or not i.fuelConversion then
+        log("Reactor info unavailable during fuel check.")
+        return false
+    end
+
+    -- Fuel ratio = 1.0 means full, 0.0 means empty
+    local fuelRemaining = 1.0 - (i.fuelConversion / i.maxFuelConversion)
+    local energySaturation = i.energySaturation / i.maxEnergySaturation
+
+    -- No fuel left -> stop reactor immediately
+    if fuelRemaining <= cfg.reactor.minFuel then
+        log("ERROR: Reactor out of fuel! Emergency shutdown triggered.")
+        reac_utils.failSafeShutdown()
+        if reac_utils.mon then
+            reac_utils.mon.setTextColor(colors.red)
+            reac_utils.mon.setCursorPos(2, 8)
+            reac_utils.mon.write("NO FUEL - Reactor Stopped!")
+        end
+        return false
+    end
+
+    -- Chaos output (energy storage) full -> warn or stop
+    if energySaturation >= cfg.reactor.maxSaturation then
+        log("WARNING: Energy storage full (" ..
+            math.floor(energySaturation * 100) .. "%).")
+        if reac_utils.mon then
+            reac_utils.mon.setTextColor(colors.yellow)
+            reac_utils.mon.setCursorPos(2, 9)
+            reac_utils.mon.write("⚠ CHAOS STORAGE FULL ⚠")
+        end
+        -- Auto-stop reactor if completely full
+        if energySaturation >= 1.0 then
+            log("Energy saturation 100% - reactor shutting down.")
+            reac_utils.failSafeShutdown()
+            return false
+        end
+    end
+
+    return true
+end
+
+------------------------------------------------------------
+-- FAILSAFE SHUTDOWN
+------------------------------------------------------------
+function reac_utils.failSafeShutdown()
+    pcall(function()
+        reac_utils.reactor.stopReactor()
+        reac_utils.gateIn.setFlowOverride(0)
+        reac_utils.gateOut.setFlowOverride(0)
+    end)
+    log("Failsafe shutdown executed.")
 end
 
 ------------------------------------------------------------
 -- REACTOR CONTROL LOGIC
 ------------------------------------------------------------
-local function calcInflow(targetField, drain)
-    return math.max(0, (targetField * drain) * 1.2)
-end
-
 function reac_utils.adjustReactorTempAndField()
-    local temp = reac_utils.getTemperature()
-    if not info then return end
+    local i = reac_utils.info
+    if not i or not i.temperature then return end
 
-    local tempDelta = math.max(0, reactorCfg.defaultTemp - temp)
-    local tempInc = math.sqrt(tempDelta) / 2.0
-    local newOutflow = math.min(
-        reactorCfg.maxOutflow,
-        (info.maxEnergySaturation or 1) * tempInc / 100
-    )
+    -- Check for dangerous conditions
+    reac_utils.checkFuelAndChaos()
 
-    -- Field control
-    if currentField > reactorCfg.defaultField * 1.05 then
-        reac_utils.setFluxGateFlowRate(gateIn, 0)
-    elseif currentField > reactorCfg.defaultField * 0.95 then
-        reac_utils.setFluxGateFlowRate(gateIn, calcInflow(reactorCfg.defaultField, info.fieldDrainRate))
+    local currentField = i.fieldStrength / i.maxFieldStrength
+    local temp = i.temperature
+
+    -- Input control
+    if currentField < cfg.reactor.defaultField then
+        reac_utils.gateIn.setFlowOverride(cfg.reactor.chargeInflow)
     else
-        reac_utils.setFluxGateFlowRate(gateIn, calcInflow(reactorCfg.defaultField * 1.5, info.fieldDrainRate))
+        reac_utils.gateIn.setFlowOverride(0)
     end
 
-    reac_utils.setFluxGateFlowRate(gateOut, math.floor(newOutflow * reactorCfg.outputMultiplier))
+    -- Output control (energy drain)
+    local tempDelta = math.max(0, temp - cfg.reactor.safeTemperature)
+    local outRate = math.min(cfg.reactor.maxOutflow, tempDelta * 2000)
+    reac_utils.gateOut.setFlowOverride(outRate)
 end
 
 ------------------------------------------------------------
--- HANDLE REACTOR STOPPING
+-- EMERGENCY DETECTION
 ------------------------------------------------------------
-function reac_utils.handleReactorStopping()
-    if not info then return end
-    local inflow
-    if currentField > reactorCfg.shutDownField then
-        inflow = calcInflow(reactorCfg.shutDownField, info.fieldDrainRate)
-    else
-        inflow = calcInflow(reactorCfg.shutDownField * 1.2, info.fieldDrainRate)
+function reac_utils.isEmergency()
+    local i = reac_utils.info
+    if not i or not i.temperature then return false end
+    if i.temperature >= cfg.reactor.defaultTemp + cfg.reactor.maxOvershoot then
+        log("Emergency: Reactor temperature overshoot detected.")
+        return true
     end
-    reac_utils.setFluxGateFlowRate(gateIn, inflow)
-    reac_utils.setFluxGateFlowRate(gateOut, 0)
-
-    if manualStart and reactor.activateReactor then
-        manualStart = false
-        reactor.activateReactor()
+    if (i.fieldStrength / i.maxFieldStrength) < cfg.reactor.shutDownField then
+        log("Emergency: Field collapse detected.")
+        return true
     end
+    return false
 end
-
-------------------------------------------------------------
--- UPDATE FLUX GATES (LOOP-TIME)
-------------------------------------------------------------
-function reac_utils.updateFluxGates()
-    if not info then return end
-
-    local newInflow = 0
-    local newOutflow = 0
-
-    local status = reac_utils.getStatus()
-    if status == "running" or status == "online" then
-        local temp = reac_utils.getTemperature()
-        if temp < reactorCfg.defaultTemp then
-            local tempInc = math.sqrt(reactorCfg.defaultTemp - temp) / 2.0
-            newOutflow = math.min(
-                reactorCfg.maxOutflow,
-                info.maxEnergySaturation * tempInc / 100
-            )
-        end
-
-        if currentField > reactorCfg.defaultField * 1.05 then
-            newInflow = 0
-        elseif currentField > reactorCfg.defaultField * 0.95 then
-            newInflow = calcInflow(reactorCfg.defaultField, info.fieldDrainRate)
-        else
-            newInflow = calcInflow(reactorCfg.defaultField * 1.5, info.fieldDrainRate)
-        end
-    elseif status == "stopping" then
-        newInflow = calcInflow(reactorCfg.shutDownField, info.fieldDrainRate)
-        newOutflow = 0
-    end
-
-    reac_utils.setFluxGateFlowRate(gateIn, math.floor(newInflow))
-    reac_utils.setFluxGateFlowRate(gateOut, math.floor(newOutflow * reactorCfg.outputMultiplier))
-end
-
-------------------------------------------------------------
--- EXPOSE INTERNAL STATE
-------------------------------------------------------------
-reac_utils.info = info
-reac_utils.reactor = reactor
-reac_utils.gateIn = gateIn
-reac_utils.gateOut = gateOut
-reac_utils.mon = mon
-reac_utils.manualStart = manualStart
-reac_utils.manualCharge = manualCharge
-reac_utils.manualStop = manualStop
 
 return reac_utils
