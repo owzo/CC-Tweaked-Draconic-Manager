@@ -6,53 +6,52 @@
 --[[
 README
 -------
-Central automation and supervision program for your
-Draconic Reactor + Flux Gate energy system.
+Central automation controller for your Draconic Reactor + Flux Gate system.
 
-Wiring layout (modem labels):
+Wiring layout (fixed modem labels):
   draconic_reactor_0 → Reactor Stabilizer
   flow_gate_0        → Input Flux Gate (into reactor)
-  flow_gate_1        → Output Flux Gate (to storage)
-  monitor_1          → Status monitor
+  flow_gate_1        → Output Flux Gate (to storage/core)
+  monitor_1          → Primary monitor
   computer_1         → Controller computer
 
-Functions:
-- Automatically manages temperature, field strength, and power flow.
-- Performs safe start, charge, and stop cycles.
-- Detects unsafe conditions and initiates emergency shutdowns.
-- Logs every operational event with timestamps.
-- Displays real-time system info on the monitor.
+Key Features:
+- Full temperature + field + fuel regulation
+- Detects and reacts to "No Fuel" or "Chaos Full" states
+- Performs automatic safe shutdowns
+- Logs every operational event with timestamps
+- Displays real-time warnings and readings on the monitor
 ]]
 
 ------------------------------------------------------------
 -- IMPORT MODULES
 ------------------------------------------------------------
-local config            = require("config")              -- User-editable configuration
-local reac_utils        = require("reac_utils")          -- Reactor operations module
-local monitor_utils     = require("monitor_utils")       -- On-screen drawing utilities
-local stat_utils        = require("stat_utils")          -- Periodic logging subsystem
+local config            = require("config")              -- Configuration & safety thresholds
+local reac_utils        = require("reac_utils")          -- Reactor control logic
+local monitor_utils     = require("monitor_utils")       -- Monitor UI rendering
+local stat_utils        = require("stat_utils")          -- Logging subsystem
 local energy_core_utils = require("energy_core_utils")   -- Flux-gate energy monitoring
 
 ------------------------------------------------------------
 -- LOGGING UTILITIES
 ------------------------------------------------------------
 
--- Writes a timestamped line to the global log file.
+-- Writes a timestamped event to the system log
 local function logEvent(msg)
-    local f = fs.open("draconic_manager.log", "a")       -- Open/create main log
+    local f = fs.open("draconic_manager.log", "a")
     if f then
         f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
         f.close()
     end
 end
 
--- Safely executes any function and logs if it errors.
+-- Wraps a function in error handling, logs any thrown error
 local function safeRun(func, label)
     local ok, err = pcall(func)
     if not ok then
-        local message = "Error in " .. label .. ": " .. tostring(err)
-        logEvent(message)
-        print(message)
+        local msg = "Error in " .. label .. ": " .. tostring(err)
+        logEvent(msg)
+        print(msg)
     end
 end
 
@@ -63,7 +62,7 @@ local function mainLoop()
     logEvent("Main control loop started.")
     while true do
         ----------------------------------------------------
-        -- Verify the reactor peripheral is still present
+        -- Check reactor peripheral connection
         ----------------------------------------------------
         if not reac_utils.reactor then
             logEvent("Reactor peripheral lost; reinitializing...")
@@ -72,20 +71,31 @@ local function mainLoop()
         end
 
         ----------------------------------------------------
-        -- Update reactor telemetry and status
+        -- Retrieve reactor status information
         ----------------------------------------------------
         safeRun(reac_utils.checkReactorStatus, "checkReactorStatus")
         local status = reac_utils.info.status or "unknown"
 
         ----------------------------------------------------
-        -- EMERGENCY FAILSAFE
+        -- SAFETY CHECKS: Fuel & Chaos Storage
+        ----------------------------------------------------
+        -- These checks are performed before normal control logic
+        local fuelChaosOK = reac_utils.checkFuelAndChaos()
+        if not fuelChaosOK then
+            logEvent("Fuel or chaos condition triggered safety halt.")
+            -- Allow time for cooling before retrying
+            sleep(5)
+        end
+
+        ----------------------------------------------------
+        -- EMERGENCY: Temperature or Field Safety Breach
         ----------------------------------------------------
         if reac_utils.isEmergency() then
             safeRun(reac_utils.failSafeShutdown, "failSafeShutdown")
             logEvent("Emergency shutdown: unsafe temperature or field detected.")
-            print("⚠️ Emergency shutdown executed.")
+            print("[!] Emergency shutdown executed.")
         ----------------------------------------------------
-        -- IDLE / COLD STATES
+        -- COLD OR OFFLINE STATE (Can charge)
         ----------------------------------------------------
         elseif status == "cold" or status == "offline" or status == "cooling" then
             if reac_utils.manualCharge then
@@ -94,13 +104,13 @@ local function mainLoop()
                 logEvent("Manual charge initiated.")
             end
         ----------------------------------------------------
-        -- CHARGING STATE
+        -- CHARGING STATE (Reactor absorbing energy)
         ----------------------------------------------------
         elseif status == "charging" then
             reac_utils.setFluxGateFlowRate(reac_utils.gateIn, config.reactor.chargeInflow)
             reac_utils.setFluxGateFlowRate(reac_utils.gateOut, 0)
         ----------------------------------------------------
-        -- WARMING / CHARGED STATES
+        -- WARMUP OR CHARGED STATE (Ready to start)
         ----------------------------------------------------
         elseif status == "warming_up" or status == "charged" then
             reac_utils.setFluxGateFlowRate(reac_utils.gateIn, config.reactor.chargeInflow)
@@ -111,7 +121,7 @@ local function mainLoop()
                 logEvent("Manual reactor start requested.")
             end
         ----------------------------------------------------
-        -- RUNNING / ONLINE STATES
+        -- ACTIVE RUNNING STATE
         ----------------------------------------------------
         elseif status == "running" or status == "online" then
             if reac_utils.manualStop then
@@ -121,7 +131,7 @@ local function mainLoop()
             end
             safeRun(reac_utils.adjustReactorTempAndField, "adjustReactorTempAndField")
         ----------------------------------------------------
-        -- STOPPING SEQUENCE
+        -- STOPPING / COOLING DOWN
         ----------------------------------------------------
         elseif status == "stopping" then
             safeRun(reac_utils.handleReactorStopping, "handleReactorStopping")
@@ -130,63 +140,66 @@ local function mainLoop()
         end
 
         ----------------------------------------------------
-        -- UPDATE FLUX GATE CONTROL + MONITOR OUTPUT
+        -- MONITOR + FLUX GATE DISPLAY UPDATES
         ----------------------------------------------------
         safeRun(reac_utils.updateFluxGates, "updateFluxGates")
         if reac_utils.mon then
-            safeRun(monitor_utils.updateMonitor, "monitor_utils.updateMonitor")
+            safeRun(energy_core_utils.updateMonitor, "energy_core_utils.updateMonitor")
         end
 
         ----------------------------------------------------
-        -- PERIODIC STAT LOGGING
+        -- PERIODIC LOGGING
         ----------------------------------------------------
         safeRun(energy_core_utils.logEnergyCoreStats, "energy_core_utils.logEnergyCoreStats")
         safeRun(function() stat_utils.logReactorStats(reac_utils.reactor) end,
                 "stat_utils.logReactorStats")
 
-        sleep(0.05)   -- 20 iterations per second (tick speed)
+        sleep(0.2) -- Main tick rate (5 loops/sec = smoother display)
     end
 end
 
 ------------------------------------------------------------
--- ENTRY POINT (SETUP + THREAD LAUNCH)
+-- PROGRAM ENTRY POINT
 ------------------------------------------------------------
 local function main()
     term.clear()
     term.setCursorPos(1, 1)
     print("===================================================")
-    print("   CC:Tweaked Draconic Reactor Manager  v2.0")
+    print("   CC:Tweaked Draconic Reactor Manager  v2.1")
     print("===================================================")
-    print("Initializing peripherals and configuration...")
+    print("Initializing peripherals and safety systems...")
 
     --------------------------------------------------------
-    -- Initialize subsystems (reactor / monitor / logging)
+    -- INITIALIZATION: Load all utilities and setup
     --------------------------------------------------------
     safeRun(reac_utils.setup, "reac_utils.setup")
     safeRun(energy_core_utils.setup, "energy_core_utils.setup")
-    logEvent("Initialization complete; entering main loop.")
+    logEvent("Initialization complete; starting main control loop.")
 
     --------------------------------------------------------
-    -- Run main loop + interactive monitor in parallel
+    -- MULTITHREADED EXECUTION
     --------------------------------------------------------
     if reac_utils.mon == nil then
-        -- No monitor found, just run the loop
+        -- No monitor attached → just run logic
         safeRun(mainLoop, "mainLoop")
     else
-        -- Run both logic and touch handler concurrently
+        -- Run logic and monitor input concurrently
         parallel.waitForAll(mainLoop, monitor_utils.clickListener)
-        reac_utils.clearMonitor()
-        reac_utils.drawText("Program stopped.", 1, 1, colors.white, colors.black)
-        logEvent("Program terminated by user interaction.")
+        reac_utils.mon.setBackgroundColor(colors.black)
+        reac_utils.mon.clear()
+        reac_utils.mon.setCursorPos(2, 2)
+        reac_utils.mon.setTextColor(colors.white)
+        reac_utils.mon.write("Program stopped.")
+        logEvent("Program terminated by user.")
     end
 end
 
 ------------------------------------------------------------
--- SAFE STARTUP WRAPPER (CRASH-RESILIENT)
+-- FAILSAFE STARTUP WRAPPER
 ------------------------------------------------------------
 local ok, err = pcall(main)
 if not ok then
-    logEvent("Fatal crash in main(): " .. tostring(err))
+    logEvent("Fatal error: " .. tostring(err))
     print("Fatal error: " .. tostring(err))
     print("See draconic_manager.log for details.")
 end
