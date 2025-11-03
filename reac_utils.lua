@@ -6,167 +6,188 @@
 --[[
 README
 -------
-Handles all direct interactions with the Draconic Reactor stabilizer.
+Manages all Draconic Reactor operations and peripheral handling.
 
-Features:
-- Detects and reports "No Fuel" conditions.
-- Detects near/full energy saturation (chaos output full).
-- Performs automatic emergency shutdown when energy has nowhere to go.
-- Provides field and temperature regulation logic.
+Expected modem labels:
+  draconic_reactor_0  → Reactor stabilizer
+  flow_gate_0         → Input flux gate (into reactor)
+  flow_gate_1         → Output flux gate (to storage/core)
+  monitor_1           → Status display monitor
 ]]
 
 ------------------------------------------------------------
--- MODULE IMPORTS & SETUP
+-- IMPORT CONFIG
 ------------------------------------------------------------
 local cfg = require("config")
 local p = cfg.peripherals
 local reac_utils = {}
 
 ------------------------------------------------------------
--- GLOBAL VARIABLES
+-- PERIPHERAL OBJECTS (declared global to module)
 ------------------------------------------------------------
-reac_utils.reactor = peripheral.wrap(p.reactor)
-reac_utils.gateIn  = peripheral.wrap(p.fluxIn)
-reac_utils.gateOut = peripheral.wrap(p.fluxOut)
-reac_utils.mon     = peripheral.wrap(p.monitors[1])
-reac_utils.info    = {}
-reac_utils.lastCheck = os.clock()
+reac_utils.reactor  = nil
+reac_utils.gateIn   = nil
+reac_utils.gateOut  = nil
+reac_utils.mon      = nil
+reac_utils.info     = {}
 
 ------------------------------------------------------------
--- LOGGING FUNCTION
+-- INTERNAL LOGGER
 ------------------------------------------------------------
-local function log(msg)
-    local f = fs.open(cfg.energyCore.logsFile, "a")
+local function logError(msg)
+    local f = fs.open("reactor_error.log", "a")
     if f then
         f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
         f.close()
     end
+    print("[!] " .. msg)
 end
 
 ------------------------------------------------------------
--- INITIALIZATION
+-- SAFE WRAPPER FUNCTION
+------------------------------------------------------------
+local function safeWrap(name)
+    if not name or name == "" then return nil end
+    if peripheral.isPresent(name) then
+        return peripheral.wrap(name)
+    end
+    return nil
+end
+
+------------------------------------------------------------
+-- SETUP FUNCTION
 ------------------------------------------------------------
 function reac_utils.setup()
-    reac_utils.reactor = peripheral.wrap(p.reactor)
-    reac_utils.gateIn  = peripheral.wrap(p.fluxIn)
-    reac_utils.gateOut = peripheral.wrap(p.fluxOut)
-    reac_utils.mon     = peripheral.wrap(p.monitors[1])
-    reac_utils.gateIn.setOverrideEnabled(true)
-    reac_utils.gateOut.setOverrideEnabled(true)
-    log("Reactor peripherals initialized successfully.")
+    print("[INFO] Initializing reactor peripherals...")
+
+    -- Attempt to find or wrap peripherals by label
+    reac_utils.reactor = safeWrap(p.reactor) or safeWrap("draconic_reactor_0")
+    reac_utils.gateIn  = safeWrap(p.fluxIn)  or safeWrap("flow_gate_0")
+    reac_utils.gateOut = safeWrap(p.fluxOut) or safeWrap("flow_gate_1")
+    reac_utils.mon     = safeWrap(p.monitors and p.monitors[1]) or safeWrap("monitor_1")
+
+    -- Validation
+    if not reac_utils.reactor then error("Reactor stabilizer not found!") end
+    if not reac_utils.gateIn then  error("Input flux gate not found!") end
+    if not reac_utils.gateOut then error("Output flux gate not found!") end
+
+    -- Set gates into manual control mode
+    if reac_utils.gateIn.setOverrideEnabled then
+        reac_utils.gateIn.setOverrideEnabled(true)
+        reac_utils.gateIn.setFlowOverride(0)
+    end
+    if reac_utils.gateOut.setOverrideEnabled then
+        reac_utils.gateOut.setOverrideEnabled(true)
+        reac_utils.gateOut.setFlowOverride(0)
+    end
+
+    print("[SUCCESS] Reactor peripherals initialized successfully.")
 end
 
 ------------------------------------------------------------
--- STATUS RETRIEVAL
+-- REACTOR STATUS
 ------------------------------------------------------------
 function reac_utils.checkReactorStatus()
-    local ok, info = pcall(reac_utils.reactor.getReactorInfo)
-    if not ok or not info then
-        log("Failed to fetch reactor info.")
+    if not reac_utils.reactor then
+        logError("Reactor not initialized.")
         return
     end
-    reac_utils.info = info
+
+    local ok, data = pcall(reac_utils.reactor.getReactorInfo)
+    if not ok or not data then
+        logError("Failed to read reactor info.")
+        return
+    end
+    reac_utils.info = data
 end
 
 ------------------------------------------------------------
--- FUEL & CHAOS MONITORING
+-- EMERGENCY CHECK
 ------------------------------------------------------------
-function reac_utils.checkFuelAndChaos()
+function reac_utils.isEmergency()
     local i = reac_utils.info
-    if not i or not i.fuelConversion then
-        log("Reactor info unavailable during fuel check.")
-        return false
-    end
+    if not i or not i.temperature then return false end
+    local fieldPct = (i.fieldStrength / i.maxFieldStrength)
+    local fuelPct  = 1.0 - (i.fuelConversion / i.maxFuelConversion)
 
-    -- Fuel ratio = 1.0 means full, 0.0 means empty
-    local fuelRemaining = 1.0 - (i.fuelConversion / i.maxFuelConversion)
-    local energySaturation = i.energySaturation / i.maxEnergySaturation
-
-    -- No fuel left -> stop reactor immediately
-    if fuelRemaining <= cfg.reactor.minFuel then
-        log("ERROR: Reactor out of fuel! Emergency shutdown triggered.")
-        reac_utils.failSafeShutdown()
-        if reac_utils.mon then
-            reac_utils.mon.setTextColor(colors.red)
-            reac_utils.mon.setCursorPos(2, 8)
-            reac_utils.mon.write("NO FUEL - Reactor Stopped!")
-        end
-        return false
-    end
-
-    -- Chaos output (energy storage) full -> warn or stop
-    if energySaturation >= cfg.reactor.maxSaturation then
-        log("WARNING: Energy storage full (" ..
-            math.floor(energySaturation * 100) .. "%).")
-        if reac_utils.mon then
-            reac_utils.mon.setTextColor(colors.yellow)
-            reac_utils.mon.setCursorPos(2, 9)
-            reac_utils.mon.write("⚠ CHAOS STORAGE FULL ⚠")
-        end
-        -- Auto-stop reactor if completely full
-        if energySaturation >= 1.0 then
-            log("Energy saturation 100% - reactor shutting down.")
-            reac_utils.failSafeShutdown()
-            return false
-        end
-    end
-
-    return true
+    return (i.temperature > cfg.reactor.defaultTemp + cfg.reactor.maxOvershoot)
+        or (fieldPct < cfg.reactor.shutDownField)
+        or (fuelPct < cfg.reactor.minFuel)
 end
 
 ------------------------------------------------------------
 -- FAILSAFE SHUTDOWN
 ------------------------------------------------------------
 function reac_utils.failSafeShutdown()
-    pcall(function()
+    if reac_utils.reactor and reac_utils.reactor.stopReactor then
         reac_utils.reactor.stopReactor()
-        reac_utils.gateIn.setFlowOverride(0)
-        reac_utils.gateOut.setFlowOverride(0)
-    end)
-    log("Failsafe shutdown executed.")
+    end
+    if reac_utils.gateIn then reac_utils.gateIn.setFlowOverride(0) end
+    if reac_utils.gateOut then reac_utils.gateOut.setFlowOverride(0) end
+    logError("Emergency reactor shutdown executed.")
 end
 
 ------------------------------------------------------------
--- REACTOR CONTROL LOGIC
+-- FUEL AND CHAOS CHECK
+------------------------------------------------------------
+function reac_utils.checkFuelAndChaos()
+    if not reac_utils.reactor then return false end
+
+    local info = reac_utils.reactor.getReactorInfo()
+    if not info then return false end
+
+    local fuelLeft = 1.0 - (info.fuelConversion / info.maxFuelConversion)
+    if fuelLeft <= 0 then
+        logError("Reactor has no fuel! Insert fuel before startup.")
+        reac_utils.failSafeShutdown()
+        return false
+    end
+
+    if info.energySaturation >= info.maxEnergySaturation then
+        logError("Chaos energy buffer full — shutting down to prevent overload.")
+        reac_utils.failSafeShutdown()
+        return false
+    elseif info.energySaturation >= info.maxEnergySaturation * 0.95 then
+        logError("Warning: Chaos storage nearing full capacity.")
+    end
+
+    return true
+end
+
+------------------------------------------------------------
+-- TEMPERATURE / FIELD MANAGEMENT
 ------------------------------------------------------------
 function reac_utils.adjustReactorTempAndField()
     local i = reac_utils.info
     if not i or not i.temperature then return end
 
-    -- Check for dangerous conditions
-    reac_utils.checkFuelAndChaos()
+    local fieldPct = (i.fieldStrength / i.maxFieldStrength)
+    local targetField = cfg.reactor.defaultField
+    local inflow = 0
+    local outflow = 0
 
-    local currentField = i.fieldStrength / i.maxFieldStrength
-    local temp = i.temperature
-
-    -- Input control
-    if currentField < cfg.reactor.defaultField then
-        reac_utils.gateIn.setFlowOverride(cfg.reactor.chargeInflow)
+    -- Maintain field
+    if fieldPct < targetField then
+        inflow = cfg.reactor.chargeInflow
     else
-        reac_utils.gateIn.setFlowOverride(0)
+        inflow = 0
     end
 
-    -- Output control (energy drain)
-    local tempDelta = math.max(0, temp - cfg.reactor.safeTemperature)
-    local outRate = math.min(cfg.reactor.maxOutflow, tempDelta * 2000)
-    reac_utils.gateOut.setFlowOverride(outRate)
+    -- Manage heat
+    if i.temperature > cfg.reactor.defaultTemp then
+        outflow = math.min(cfg.reactor.maxOutflow, (i.temperature - cfg.reactor.defaultTemp) * 2000)
+    end
+
+    if reac_utils.gateIn then reac_utils.gateIn.setFlowOverride(inflow) end
+    if reac_utils.gateOut then reac_utils.gateOut.setFlowOverride(outflow) end
 end
 
 ------------------------------------------------------------
--- EMERGENCY DETECTION
+-- HANDLE STOPPING
 ------------------------------------------------------------
-function reac_utils.isEmergency()
-    local i = reac_utils.info
-    if not i or not i.temperature then return false end
-    if i.temperature >= cfg.reactor.defaultTemp + cfg.reactor.maxOvershoot then
-        log("Emergency: Reactor temperature overshoot detected.")
-        return true
-    end
-    if (i.fieldStrength / i.maxFieldStrength) < cfg.reactor.shutDownField then
-        log("Emergency: Field collapse detected.")
-        return true
-    end
-    return false
+function reac_utils.handleReactorStopping()
+    reac_utils.gateIn.setFlowOverride(0)
+    reac_utils.gateOut.setFlowOverride(0)
 end
 
 return reac_utils
