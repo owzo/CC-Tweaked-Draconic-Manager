@@ -6,140 +6,100 @@
 --[[
 README
 -------
-Offline installer for the CC:Tweaked Draconic Manager system.
+Installs the CC:Tweaked Draconic Manager from a floppy disk, for servers
+where the HTTP API is disabled.
 
-Intended for servers or modpacks where the HTTP API is disabled.
-Copies the required scripts from a floppy disk (or any mounted
-drive) directly to the computer.
+1. Copy every .lua file from this repository onto a floppy disk
+   (in single player you can paste them into
+   saves/<world>/computercraft/disk/<id>/).
+2. Put the disk in a disk drive next to the reactor computer.
+3. Run:  disk/offline_install
 
-Features:
-- Automatically detects the floppy disk mount point
-- Validates each file before copying
-- Creates missing directories automatically
-- Generates a startup.lua file to auto-launch the controller
-- Provides clear installation logs and status messages
+Usage:  offline_install           auto-detect the disk
+        offline_install <path>    install from a specific folder
 ]]
 
-------------------------------------------------------------
--- FILE LIST
-------------------------------------------------------------
+local args = {...}
+
 local requiredFiles = {
-    "config.lua",
     "main_control.lua",
-    "energy_core_utils.lua",
     "reac_utils.lua",
     "monitor_utils.lua",
-    "stat_utils.lua"
+    "stat_utils.lua",
+    "energy_core_utils.lua",
+    "config.lua"
 }
+local preserve = {["config.lua"] = true}
+local STARTUP = 'shell.run("main_control.lua")\n'
 
 ------------------------------------------------------------
--- HELPER FUNCTIONS
+-- HELPERS
 ------------------------------------------------------------
-local function findDiskMount()
-    local mounts = peripheral.getNames()
-    for _, name in ipairs(mounts) do
-        if name:lower():find("disk") then
-            return peripheral.getMountPath(name)
+local function hasAllFiles(dir)
+    for _, name in ipairs(requiredFiles) do
+        if not fs.exists(fs.combine(dir, name)) then
+            return false
         end
     end
-    -- Fallback if not detected via peripheral
-    if fs.exists("disk") then return "disk" end
-    return nil
-end
-
-local function copyFile(sourcePath, destPath)
-    if not fs.exists(sourcePath) then
-        print("Missing: " .. sourcePath)
-        return false
-    end
-
-    local src = fs.open(sourcePath, "r")
-    if not src then
-        print("Failed to open: " .. sourcePath)
-        return false
-    end
-
-    local data = src.readAll()
-    src.close()
-
-    local dir = fs.getDir(destPath)
-    if dir ~= "" and not fs.exists(dir) then
-        fs.makeDir(dir)
-    end
-
-    local dest = fs.open(destPath, "w")
-    if not dest then
-        print("Failed to write: " .. destPath)
-        return false
-    end
-
-    dest.write(data)
-    dest.close()
-    print("Installed: " .. destPath)
     return true
 end
 
-------------------------------------------------------------
--- MAIN INSTALLATION FUNCTION
-------------------------------------------------------------
-local function installFromDisk(diskPath)
-    print("Installing from disk at: " .. diskPath)
-    local successCount = 0
-    for _, filename in ipairs(requiredFiles) do
-        local src = fs.combine(diskPath, filename)
-        local dest = fs.combine("/", filename)
-        if copyFile(src, dest) then
-            successCount = successCount + 1
-        else
-            print("Warning: Could not copy " .. filename)
+-- Finds a mounted disk that contains the program files.
+local function findSource()
+    if args[1] then
+        return hasAllFiles(args[1]) and args[1] or nil
+    end
+    -- The folder this script was run from (e.g. "disk").
+    local here = shell and fs.getDir(shell.getRunningProgram())
+    if here and here ~= "" and hasAllFiles(here) then
+        return here
+    end
+    for _, name in ipairs(peripheral.getNames()) do
+        if peripheral.getType(name) == "drive" and disk.hasData(name) then
+            local mount = disk.getMountPath(name)
+            if mount and hasAllFiles(mount) then
+                return mount
+            end
         end
     end
-    print(string.format("Installation complete. %d/%d files installed.", successCount, #requiredFiles))
+    return nil
 end
 
 ------------------------------------------------------------
--- STARTUP SCRIPT CREATION
+-- MAIN
 ------------------------------------------------------------
-local function createStartup()
-    if fs.exists("startup.lua") then
-        print("startup.lua already exists, skipping creation.")
-        return
-    end
+term.clear()
+term.setCursorPos(1, 1)
+print("CC:Tweaked Draconic Manager offline installer")
+print("")
 
-    print("Creating startup.lua to auto-run main_control.lua...")
-    local f = fs.open("startup.lua", "w")
-    if not f then
-        print("Failed to create startup.lua!")
-        return
+local source = findSource()
+if not source then
+    printError("No disk with all program files found.")
+    print("The disk must contain:")
+    for _, name in ipairs(requiredFiles) do print("  " .. name) end
+    return
+end
+print("Installing from /" .. source)
+
+for _, name in ipairs(requiredFiles) do
+    local dest = "/" .. name
+    if preserve[name] and fs.exists(dest) then
+        print("Keeping existing " .. name)
+    else
+        if fs.exists(dest) then fs.delete(dest) end
+        fs.copy(fs.combine(source, name), dest)
+        print("Installed " .. name)
     end
-    f.write('shell.run("main_control.lua")')
-    f.close()
-    print("startup.lua created successfully.")
 end
 
-------------------------------------------------------------
--- MAIN EXECUTION
-------------------------------------------------------------
-local function main()
-    term.clear()
-    term.setCursorPos(1, 1)
-    print("==========================================")
-    print("  CC-Tweaked Draconic Manager (Offline)  ")
-    print("==========================================")
-
-    local diskPath = findDiskMount()
-    if not diskPath then
-        print("Error: No disk drive detected! Please insert a floppy disk.")
-        return
-    end
-
-    installFromDisk(diskPath)
-    createStartup()
-
-    print("------------------------------------------")
-    print("Installation complete.")
-    print("Reboot your computer to start the manager.")
-    print("------------------------------------------")
+if not fs.exists("/startup.lua") then
+    local handle = fs.open("/startup.lua", "w")
+    handle.write(STARTUP)
+    handle.close()
+    print("Created startup.lua")
 end
 
-main()
+print("")
+print("Done. Remove the disk (a disk startup file would run first),")
+print("review config.lua, then run: main_control")

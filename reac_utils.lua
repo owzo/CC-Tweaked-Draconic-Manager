@@ -6,188 +6,545 @@
 --[[
 README
 -------
-Manages all Draconic Reactor operations and peripheral handling.
+Hardware access and the control law for a Draconic Evolution reactor.
 
-Expected modem labels:
-  draconic_reactor_0  → Reactor stabilizer
-  flow_gate_0         → Input flux gate (into reactor)
-  flow_gate_1         → Output flux gate (to storage/core)
-  monitor_1           → Status display monitor
+Hardware layer
+  reac_utils.discover(cfg, chooseGates)  Find reactor + both flux gates
+  reac_utils.readInfo(reactor)            Normalised reactor snapshot
+  reac_utils.wrapGate(name, peripheral)   Version-independent gate API
+
+Control layer (pure; no peripheral calls, so it can be unit tested)
+  local ctl = reac_utils.newController(reactorCfg, info)
+  local actions = ctl:step(info)
+      actions.input    RF/t for the input (field) gate
+      actions.output   RF/t for the output gate
+      actions.command  nil | "charge" | "activate" | "stop"
+      actions.events   list of {level, message} to log
+
+Regulation strategy
+  Field : input = fieldDrainRate / (1 - targetField). At equilibrium the
+          injector adds exactly what the field loses, and the formula is
+          self-correcting: a weaker field absorbs a larger share of input.
+  Heat  : output = generationRate + k * (targetTemperature - temperature).
+          Draining exactly the generation rate holds saturation (and so
+          temperature) constant; the correction term walks it to target.
+          It is stateless apart from a rate limiter, so it cannot wind up
+          when the energy core is full and stops accepting power.
+
+Safety model (fail-safe = field input HIGH, output ZERO)
+  - A stopping reactor still needs its containment field until it is
+    cold, so the field gate is NEVER zeroed while the reactor is hot.
+  - Temperature > maxTemperature, field < minField or fuel < minFuel
+    trips the reactor into a controlled stop.
 ]]
 
-------------------------------------------------------------
--- IMPORT CONFIG
-------------------------------------------------------------
-local cfg = require("config")
-local p = cfg.peripherals
 local reac_utils = {}
 
 ------------------------------------------------------------
--- PERIPHERAL OBJECTS (declared global to module)
+-- PERIPHERAL CLASSIFICATION
 ------------------------------------------------------------
-reac_utils.reactor  = nil
-reac_utils.gateIn   = nil
-reac_utils.gateOut  = nil
-reac_utils.mon      = nil
-reac_utils.info     = {}
+local function hasMethod(dev, name)
+    return type(dev) == "table" and type(dev[name]) == "function"
+end
 
-------------------------------------------------------------
--- INTERNAL LOGGER
-------------------------------------------------------------
-local function logError(msg)
-    local f = fs.open("reactor_error.log", "a")
-    if f then
-        f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
-        f.close()
+function reac_utils.isReactor(dev)
+    return hasMethod(dev, "getReactorInfo")
+end
+
+function reac_utils.isGate(dev)
+    return hasMethod(dev, "getFlow")
+        and (hasMethod(dev, "setFlowOverride")
+             or hasMethod(dev, "setSignalLowFlow"))
+end
+
+-- Lists "name (type)" for every attached peripheral; used to explain
+-- detection failures to the player.
+function reac_utils.describePeripherals()
+    local lines = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        table.insert(lines, name .. " (" .. tostring(peripheral.getType(name)) .. ")")
     end
-    print("[!] " .. msg)
+    return lines
+end
+
+local function findAll(predicate)
+    local found = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        local dev = peripheral.wrap(name)
+        if predicate(dev) then
+            table.insert(found, name)
+        end
+    end
+    table.sort(found)
+    return found
 end
 
 ------------------------------------------------------------
--- SAFE WRAPPER FUNCTION
+-- FLUX GATE ADAPTER
 ------------------------------------------------------------
-local function safeWrap(name)
-    if not name or name == "" then return nil end
-    if peripheral.isPresent(name) then
-        return peripheral.wrap(name)
+-- DE 1.12+ gates expose an override; very old versions only have the
+-- redstone-signal flow limits, which we drive to the same value.
+function reac_utils.wrapGate(name, dev)
+    local gate = {name = name, dev = dev, lastSet = nil}
+
+    function gate.set(rate)
+        rate = math.max(0, math.floor(rate + 0.5))
+        if hasMethod(dev, "setFlowOverride") then
+            if hasMethod(dev, "getOverrideEnabled") and not dev.getOverrideEnabled() then
+                dev.setOverrideEnabled(true)
+            elseif not hasMethod(dev, "getOverrideEnabled")
+                    and hasMethod(dev, "setOverrideEnabled")
+                    and gate.lastSet == nil then
+                dev.setOverrideEnabled(true)
+            end
+            dev.setFlowOverride(rate)
+        else
+            dev.setSignalLowFlow(rate)
+            if hasMethod(dev, "setSignalHighFlow") then
+                dev.setSignalHighFlow(rate)
+            end
+        end
+        gate.lastSet = rate
+    end
+
+    function gate.get()
+        return dev.getFlow()
+    end
+
+    return gate
+end
+
+------------------------------------------------------------
+-- DISCOVERY
+------------------------------------------------------------
+local function resolve(configured, predicate, label)
+    if configured then
+        if not peripheral.isPresent(configured) then
+            return nil, label .. " '" .. configured .. "' (from config.lua) is not attached"
+        end
+        local dev = peripheral.wrap(configured)
+        if not predicate(dev) then
+            return nil, label .. " '" .. configured .. "' is a "
+                .. tostring(peripheral.getType(configured)) .. ", not a " .. label
+        end
+        return configured
     end
     return nil
 end
 
-------------------------------------------------------------
--- SETUP FUNCTION
-------------------------------------------------------------
-function reac_utils.setup()
-    print("[INFO] Initializing reactor peripherals...")
+--[[
+Finds the reactor and both flux gates.
 
-    -- Attempt to find or wrap peripherals by label
-    reac_utils.reactor = safeWrap(p.reactor) or safeWrap("draconic_reactor_0")
-    reac_utils.gateIn  = safeWrap(p.fluxIn)  or safeWrap("flow_gate_0")
-    reac_utils.gateOut = safeWrap(p.fluxOut) or safeWrap("flow_gate_1")
-    reac_utils.mon     = safeWrap(p.monitors and p.monitors[1]) or safeWrap("monitor_1")
+chooseGates(gateNames) is called only when two or more gates exist and
+neither config.lua nor saved settings say which is which; it must return
+inputName, outputName (or nil to abort).
 
-    -- Validation
-    if not reac_utils.reactor then error("Reactor stabilizer not found!") end
-    if not reac_utils.gateIn then  error("Input flux gate not found!") end
-    if not reac_utils.gateOut then error("Output flux gate not found!") end
+Returns a hardware table {reactor, reactorName, input, output} or
+nil plus an error message.
+]]
+function reac_utils.discover(peripheralsCfg, chooseGates)
+    peripheralsCfg = peripheralsCfg or {}
 
-    -- Set gates into manual control mode
-    if reac_utils.gateIn.setOverrideEnabled then
-        reac_utils.gateIn.setOverrideEnabled(true)
-        reac_utils.gateIn.setFlowOverride(0)
+    -- Reactor
+    local reactorName, err = resolve(peripheralsCfg.reactor, reac_utils.isReactor, "reactor")
+    if err then return nil, err end
+    if not reactorName then
+        local reactors = findAll(reac_utils.isReactor)
+        if #reactors == 0 then
+            return nil, "No reactor found. Connect a wired modem to a reactor stabilizer."
+        elseif #reactors > 1 then
+            return nil, "Several reactors found (" .. table.concat(reactors, ", ")
+                .. "). Set config.peripherals.reactor."
+        end
+        reactorName = reactors[1]
     end
-    if reac_utils.gateOut.setOverrideEnabled then
-        reac_utils.gateOut.setOverrideEnabled(true)
-        reac_utils.gateOut.setFlowOverride(0)
+
+    -- Gates: config.lua > saved settings > single prompt
+    local inName, inErr = resolve(peripheralsCfg.inputGate, reac_utils.isGate, "flux gate")
+    if inErr then return nil, "Input gate: " .. inErr end
+    local outName, outErr = resolve(peripheralsCfg.outputGate, reac_utils.isGate, "flux gate")
+    if outErr then return nil, "Output gate: " .. outErr end
+
+    local gates = findAll(reac_utils.isGate)
+    if not inName or not outName then
+        local savedIn = settings and settings.get("draconic.inputGate")
+        local savedOut = settings and settings.get("draconic.outputGate")
+        local function present(n)
+            return n and peripheral.isPresent(n) and reac_utils.isGate(peripheral.wrap(n))
+        end
+        if not inName and present(savedIn) and savedIn ~= outName then inName = savedIn end
+        if not outName and present(savedOut) and savedOut ~= inName then outName = savedOut end
     end
 
-    print("[SUCCESS] Reactor peripherals initialized successfully.")
+    if not inName or not outName then
+        if #gates < 2 then
+            return nil, "Need two flux gates, found " .. #gates
+                .. ". Connect wired modems to both gates and right-click them (red ring)."
+        end
+        if inName and #gates == 2 then
+            outName = gates[1] == inName and gates[2] or gates[1]
+        elseif outName and #gates == 2 then
+            inName = gates[1] == outName and gates[2] or gates[1]
+        else
+            if not chooseGates then
+                return nil, "Cannot tell which flux gate is input. Set inputGate/outputGate in config.lua."
+            end
+            inName, outName = chooseGates(gates)
+            if not inName or not outName or inName == outName then
+                return nil, "Flux gate selection cancelled."
+            end
+        end
+        if settings then
+            settings.set("draconic.inputGate", inName)
+            settings.set("draconic.outputGate", outName)
+            settings.save()
+        end
+    end
+
+    if inName == outName then
+        return nil, "Input and output gate are the same peripheral (" .. inName .. ")."
+    end
+
+    return {
+        reactorName = reactorName,
+        reactor     = peripheral.wrap(reactorName),
+        input       = reac_utils.wrapGate(inName, peripheral.wrap(inName)),
+        output      = reac_utils.wrapGate(outName, peripheral.wrap(outName))
+    }
 end
 
 ------------------------------------------------------------
--- REACTOR STATUS
+-- REACTOR INFO
 ------------------------------------------------------------
-function reac_utils.checkReactorStatus()
-    if not reac_utils.reactor then
-        logError("Reactor not initialized.")
-        return
+-- Older Draconic Evolution versions used different status strings.
+local STATUS_ALIASES = {
+    offline  = "cold",
+    charging = "warming_up",
+    charged  = "warming_up",
+    online   = "running"
+}
+
+local function ratio(value, max)
+    if type(value) ~= "number" or type(max) ~= "number" or max <= 0 then
+        return 0
+    end
+    return value / max
+end
+
+-- Returns a normalised copy of getReactorInfo() with derived ratios,
+-- or nil plus an error message.
+function reac_utils.readInfo(reactor)
+    if not reactor then
+        return nil, "reactor not connected"
+    end
+    local ok, raw = pcall(reactor.getReactorInfo)
+    if not ok then
+        return nil, tostring(raw)
+    end
+    if type(raw) ~= "table" then
+        return nil, "getReactorInfo returned no data (is the reactor built?)"
     end
 
-    local ok, data = pcall(reac_utils.reactor.getReactorInfo)
-    if not ok or not data then
-        logError("Failed to read reactor info.")
-        return
+    local info = {}
+    for k, v in pairs(raw) do info[k] = v end
+
+    local status = string.lower(tostring(raw.status or "unknown"))
+    info.rawStatus     = status
+    info.status        = STATUS_ALIASES[status] or status
+    info.temperature   = tonumber(raw.temperature) or 0
+    info.fieldPct      = ratio(raw.fieldStrength, raw.maxFieldStrength)
+    info.satPct        = ratio(raw.energySaturation, raw.maxEnergySaturation)
+    info.fuelRemaining = 1 - ratio(raw.fuelConversion, raw.maxFuelConversion)
+    if (tonumber(raw.maxFuelConversion) or 0) <= 0 then
+        info.fuelRemaining = 0
     end
-    reac_utils.info = data
+    info.generationRate = tonumber(raw.generationRate) or 0
+    info.fieldDrainRate = tonumber(raw.fieldDrainRate) or 0
+    info.maxEnergySaturation = tonumber(raw.maxEnergySaturation) or 0
+    return info
 end
 
 ------------------------------------------------------------
--- EMERGENCY CHECK
+-- CONTROLLER
 ------------------------------------------------------------
-function reac_utils.isEmergency()
-    local i = reac_utils.info
-    if not i or not i.temperature then return false end
-    local fieldPct = (i.fieldStrength / i.maxFieldStrength)
-    local fuelPct  = 1.0 - (i.fuelConversion / i.maxFuelConversion)
+-- Output correction in RF/t per degree of error, per RF of saturation
+-- capacity. Larger reactors have proportionally slower thermal response,
+-- so scaling by capacity keeps the loop time constant at ~10 seconds.
+local OUTPUT_GAIN = 2.5e-7
+-- Max output change per cycle, as a fraction of generation (+ floor).
+local OUTPUT_SLEW_FRACTION = 0.05
+local OUTPUT_SLEW_FLOOR = 20000
+-- Warm-up completion thresholds used by Draconic Evolution.
+local WARM_TEMPERATURE = 2000
+local WARM_FIELD = 0.499
+local WARM_SATURATION = 0.499
+-- Seconds between repeated charge/activate commands.
+local COMMAND_COOLDOWN = 5
+-- Auto-restart budget: a reactor that keeps tripping needs a human.
+local MAX_AUTO_RESTARTS = 3
+local AUTO_RESTART_WINDOW = 3600
 
-    return (i.temperature > cfg.reactor.defaultTemp + cfg.reactor.maxOvershoot)
-        or (fieldPct < cfg.reactor.shutDownField)
-        or (fuelPct < cfg.reactor.minFuel)
-end
+local Controller = {}
+Controller.__index = Controller
 
-------------------------------------------------------------
--- FAILSAFE SHUTDOWN
-------------------------------------------------------------
-function reac_utils.failSafeShutdown()
-    if reac_utils.reactor and reac_utils.reactor.stopReactor then
-        reac_utils.reactor.stopReactor()
+function reac_utils.newController(reactorCfg, info)
+    local self = setmetatable({}, Controller)
+    self.cfg = reactorCfg
+    self.autoOutput = true
+    self.manualOutput = 0
+    self.outputRate = 0
+    self.inputRate = 0
+    self.trip = nil              -- {reason = "...", restartable = bool}
+    self.alarms = {}
+    self.lastCommandAt = {}
+    self.autoRestarts = {}       -- timestamps of recent auto-restarts
+
+    -- Keep a running reactor running across computer restarts; only
+    -- charge a cold reactor on boot when explicitly configured.
+    local status = info and info.status
+    if status == "running" or status == "warming_up" or reactorCfg.autoStartOnBoot then
+        self.desired = "run"
+    else
+        self.desired = "stop"
     end
-    if reac_utils.gateIn then reac_utils.gateIn.setFlowOverride(0) end
-    if reac_utils.gateOut then reac_utils.gateOut.setFlowOverride(0) end
-    logError("Emergency reactor shutdown executed.")
+    return self
 end
 
-------------------------------------------------------------
--- FUEL AND CHAOS CHECK
-------------------------------------------------------------
-function reac_utils.checkFuelAndChaos()
-    if not reac_utils.reactor then return false end
+local function clamp(value, low, high)
+    if value < low then return low end
+    if value > high then return high end
+    return value
+end
 
-    local info = reac_utils.reactor.getReactorInfo()
-    if not info then return false end
+local function emit(actions, level, message)
+    table.insert(actions.events, {level = level, message = message})
+end
 
-    local fuelLeft = 1.0 - (info.fuelConversion / info.maxFuelConversion)
-    if fuelLeft <= 0 then
-        logError("Reactor has no fuel! Insert fuel before startup.")
-        reac_utils.failSafeShutdown()
+-- Player requests -------------------------------------------------------
+function Controller:requestStart()
+    self.desired = "run"
+    self.trip = nil
+    self.autoRestarts = {}
+end
+
+function Controller:requestStop()
+    self.desired = "stop"
+end
+
+function Controller:setAutoOutput(enabled)
+    self.autoOutput = enabled
+    if not enabled then
+        self.manualOutput = self.outputRate
+    end
+end
+
+function Controller:adjustManualOutput(delta)
+    if self.autoOutput then
+        self.autoOutput = false
+        self.manualOutput = self.outputRate
+    end
+    self.manualOutput = clamp(self.manualOutput + delta, 0, self.cfg.maxOutflow)
+end
+
+-- Regulation laws -------------------------------------------------------
+function Controller:fieldInput(info)
+    local c = self.cfg
+    if info.fieldPct < c.minField then
+        return c.maxInflow
+    end
+    local rate = info.fieldDrainRate / (1 - c.targetField)
+    return clamp(rate, 0, c.maxInflow)
+end
+
+function Controller:regulatedOutput(info)
+    local c = self.cfg
+    local gain = OUTPUT_GAIN * info.maxEnergySaturation * (c.outputAggressiveness or 1)
+    local err = c.targetTemperature - info.temperature
+    local target = info.generationRate + gain * err
+
+    local slew = math.max(OUTPUT_SLEW_FLOOR, info.generationRate * OUTPUT_SLEW_FRACTION)
+    target = clamp(target, self.outputRate - slew, self.outputRate + slew)
+    return clamp(target, 0, c.maxOutflow)
+end
+
+function Controller:commandReady(name, now)
+    local last = self.lastCommandAt[name]
+    if last and now - last < COMMAND_COOLDOWN then
         return false
     end
-
-    if info.energySaturation >= info.maxEnergySaturation then
-        logError("Chaos energy buffer full — shutting down to prevent overload.")
-        reac_utils.failSafeShutdown()
-        return false
-    elseif info.energySaturation >= info.maxEnergySaturation * 0.95 then
-        logError("Warning: Chaos storage nearing full capacity.")
-    end
-
+    self.lastCommandAt[name] = now
     return true
 end
 
-------------------------------------------------------------
--- TEMPERATURE / FIELD MANAGEMENT
-------------------------------------------------------------
-function reac_utils.adjustReactorTempAndField()
-    local i = reac_utils.info
-    if not i or not i.temperature then return end
+function Controller:restartBudgetLeft(now)
+    local recent = {}
+    for _, t in ipairs(self.autoRestarts) do
+        if now - t < AUTO_RESTART_WINDOW then table.insert(recent, t) end
+    end
+    self.autoRestarts = recent
+    return #recent < MAX_AUTO_RESTARTS
+end
 
-    local fieldPct = (i.fieldStrength / i.maxFieldStrength)
-    local targetField = cfg.reactor.defaultField
-    local inflow = 0
-    local outflow = 0
+function Controller:setTrip(actions, reason, restartable)
+    self.trip = {reason = reason, restartable = restartable}
+    if not restartable or not self.cfg.autoRestart then
+        self.desired = "stop"
+    end
+    emit(actions, "CRIT", "TRIP: " .. reason .. " - stopping reactor")
+end
 
-    -- Maintain field
-    if fieldPct < targetField then
-        inflow = cfg.reactor.chargeInflow
+--[[
+One control cycle. `info` comes from reac_utils.readInfo (nil when the
+reactor could not be read). `now` is a monotonic time in seconds.
+]]
+function Controller:step(info, now)
+    local c = self.cfg
+    local actions = {input = 0, output = 0, command = nil, events = {}}
+    self.alarms = {}
+    now = now or 0
+
+    if not info then
+        -- Blind: keep the field fed and stop extracting heat-driving power.
+        table.insert(self.alarms, "REACTOR LINK LOST")
+        actions.input = c.maxInflow
+        actions.output = 0
+        self.inputRate, self.outputRate = actions.input, actions.output
+        return actions
+    end
+
+    local status = info.status
+    local lowFuel = info.fuelRemaining < c.minFuel
+
+    if info.fuelRemaining < c.minFuel * 2 then
+        table.insert(self.alarms, string.format("LOW FUEL %.0f%%", info.fuelRemaining * 100))
+    end
+
+    -- Trip detection ------------------------------------------------
+    local stopNow = false
+    if status == "running" then
+        if info.temperature > c.maxTemperature then
+            self:setTrip(actions, string.format("temperature %.0fC > %.0fC",
+                info.temperature, c.maxTemperature), true)
+            stopNow = true
+        elseif info.fieldPct < c.minField then
+            self:setTrip(actions, string.format("field %.1f%% < %.1f%%",
+                info.fieldPct * 100, c.minField * 100), true)
+            stopNow = true
+        elseif lowFuel then
+            self:setTrip(actions, string.format("fuel %.1f%% < %.1f%%",
+                info.fuelRemaining * 100, c.minFuel * 100), false)
+            stopNow = true
+        end
+    end
+
+    -- Manual mode interlock: hand control back to the regulator well
+    -- before the hard trip limit is reached.
+    local guard = c.targetTemperature + (c.maxTemperature - c.targetTemperature) * 0.5
+    if not self.autoOutput and status == "running" and info.temperature > guard then
+        self.autoOutput = true
+        emit(actions, "WARN", string.format(
+            "Manual output overheated reactor (%.0fC); auto regulation re-enabled",
+            info.temperature))
+    end
+
+    -- State machine -------------------------------------------------
+    if status == "running" then
+        actions.input = self:fieldInput(info)
+        if stopNow or self.desired == "stop" then
+            actions.output = 0
+            if self:commandReady("stop", now) or stopNow then
+                actions.command = "stop"
+            end
+        elseif self.autoOutput then
+            actions.output = self:regulatedOutput(info)
+        else
+            actions.output = clamp(self.manualOutput, 0, c.maxOutflow)
+        end
+
+    elseif status == "stopping" then
+        actions.input = self:fieldInput(info)
+        actions.output = 0
+
+    elseif status == "warming_up" then
+        actions.input = clamp(c.chargeInflow, 0, c.maxInflow)
+        actions.output = 0
+        if self.desired == "stop" then
+            if self:commandReady("stop", now) then actions.command = "stop" end
+        elseif info.temperature >= WARM_TEMPERATURE
+                and info.fieldPct >= WARM_FIELD
+                and info.satPct >= WARM_SATURATION then
+            if self:commandReady("activate", now) then
+                actions.command = "activate"
+                emit(actions, "INFO", "Reactor charged; activating")
+            end
+        end
+
+    elseif status == "cold" or status == "cooling" then
+        actions.input = 0
+        actions.output = 0
+        local tripAllows = (self.trip == nil)
+            or (self.trip.restartable and c.autoRestart and self:restartBudgetLeft(now))
+        if self.desired == "run" and tripAllows and not lowFuel
+                and info.temperature <= c.safeTemperature then
+            if self:commandReady("charge", now) then
+                actions.command = "charge"
+                if self.trip then
+                    table.insert(self.autoRestarts, now)
+                    emit(actions, "WARN", "Auto-restart after trip: " .. self.trip.reason)
+                else
+                    emit(actions, "INFO", "Charging reactor")
+                end
+                self.trip = nil
+            end
+        elseif self.desired == "run" and self.trip and not tripAllows then
+            table.insert(self.alarms, "AUTO-RESTART LIMIT - PRESS START")
+        elseif self.desired == "run" and lowFuel then
+            table.insert(self.alarms, "REFUEL REACTOR")
+        end
+
+    elseif status == "beyond_hope" then
+        table.insert(self.alarms, "REACTOR CRITICAL - EVACUATE")
+        actions.input = c.maxInflow
+        actions.output = 0
+
     else
-        inflow = 0
+        -- "invalid" (structure incomplete) or an unknown future status.
+        -- Feed the field whenever the core is still hot.
+        table.insert(self.alarms, "STATUS " .. string.upper(tostring(status)))
+        if info.temperature > WARM_TEMPERATURE then
+            actions.input = self:fieldInput(info)
+        end
+        actions.output = 0
     end
 
-    -- Manage heat
-    if i.temperature > cfg.reactor.defaultTemp then
-        outflow = math.min(cfg.reactor.maxOutflow, (i.temperature - cfg.reactor.defaultTemp) * 2000)
+    if self.trip then
+        table.insert(self.alarms, "TRIP: " .. self.trip.reason)
     end
 
-    if reac_utils.gateIn then reac_utils.gateIn.setFlowOverride(inflow) end
-    if reac_utils.gateOut then reac_utils.gateOut.setFlowOverride(outflow) end
+    self.inputRate, self.outputRate = actions.input, actions.output
+    return actions
 end
 
 ------------------------------------------------------------
--- HANDLE STOPPING
+-- APPLY ACTIONS TO HARDWARE
 ------------------------------------------------------------
-function reac_utils.handleReactorStopping()
-    reac_utils.gateIn.setFlowOverride(0)
-    reac_utils.gateOut.setFlowOverride(0)
+-- Returns a list of error strings (empty on success).
+function reac_utils.apply(hw, actions)
+    local errors = {}
+    local function try(label, fn, ...)
+        local ok, err = pcall(fn, ...)
+        if not ok then table.insert(errors, label .. ": " .. tostring(err)) end
+    end
+    try("input gate " .. hw.input.name, hw.input.set, actions.input)
+    try("output gate " .. hw.output.name, hw.output.set, actions.output)
+    if actions.command == "charge" then
+        try("chargeReactor", hw.reactor.chargeReactor)
+    elseif actions.command == "activate" then
+        try("activateReactor", hw.reactor.activateReactor)
+    elseif actions.command == "stop" then
+        try("stopReactor", hw.reactor.stopReactor)
+    end
+    return errors
 end
 
 return reac_utils
