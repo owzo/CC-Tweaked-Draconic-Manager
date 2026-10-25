@@ -11,14 +11,15 @@ local cc = require("mock_cc")
 local Sim = require("reactor_sim")
 
 local MODULES = {"config", "reac_utils", "monitor_utils", "stat_utils",
-                 "storage_utils", "drivers.storage"}
+                 "storage_utils", "drivers.storage", "log_shipper"}
 local TICK = 0.05
 
 -- Everything the installers must ship; MODULE_FILES are loaded by
 -- main_control and must never call require themselves.
 PROGRAM_FILES = {"main_control.lua", "config.lua", "reac_utils.lua", "monitor_utils.lua",
-                 "stat_utils.lua", "storage_utils.lua", "er_utils.lua", "persist.lua",
-                 "drivers/draconic.lua", "drivers/extreme.lua", "drivers/storage.lua"}
+                 "stat_utils.lua", "storage_utils.lua", "er_utils.lua", "mek_utils.lua", "persist.lua",
+                 "alarms.lua", "totals.lua", "updater.lua", "log_shipper.lua",
+                 "drivers/draconic.lua", "drivers/extreme.lua", "drivers/mekanism.lua", "drivers/storage.lua"}
 MODULE_FILES = {}
 for _, f in ipairs(PROGRAM_FILES) do
     if f ~= "main_control.lua" then table.insert(MODULE_FILES, f) end
@@ -967,6 +968,389 @@ test("overview pages through many units", function()
 end)
 
 ------------------------------------------------------------
+-- BACKLOG: RESUME, STALL DETECTION, MODES, HOT-PLUG, STEAM GROUPS
+------------------------------------------------------------
+test("temperature trip resumes from 'stopping' without a full cooldown", function()
+    local sim = Sim.new({version = "1.20", state = "running", temperature = 7000, sat = 0.2})
+    local ctl = newCtl(sim)
+    closedLoop(sim, ctl, 60)
+    sim.temperature = 8100                    -- force a trip
+    local states, resumed = {}, false
+    closedLoop(sim, ctl, 900, function(_, info, a)
+        if info then states[info.status] = true end
+        if a.command == "activate" and info and info.status == "stopping" then resumed = true end
+    end)
+    check(states.stopping, "never tripped")
+    check(resumed, "never resumed from stopping")
+    check(not states.cooling and not states.cold, "went through a full cooldown anyway")
+    check(sim.state == "running" and not sim.exploded, "state %s", sim.state)
+end)
+
+test("charging that makes no progress raises a wiring alarm", function()
+    local sim = Sim.new({version = "1.20"})
+    local ctl = newCtl(sim)
+    ctl:requestStart()
+    local reac = require("reac_utils")
+    -- The "input gate" goes nowhere: like a fluid gate or the wrong gate.
+    local dead = {getFlow = function() return 0 end, setFlowOverride = function() end,
+                  setOverrideEnabled = function() end, getOverrideEnabled = function() return true end}
+    local hw = {reactor = sim.reactor, input = reac.wrapGate("in", dead),
+                output = reac.wrapGate("out", sim.outGate)}
+    local t, warned, alarmed = 0, false, false
+    while t < 60 do
+        local actions = ctl:step(reac.readInfo(sim.reactor), t)
+        reac.apply(hw, actions)
+        for _, e in ipairs(actions.events) do
+            if e.message:find("input gate is not feeding") then warned = true end
+        end
+        for _, al in ipairs(ctl.alarms) do if al:find("CHARGING STALLED") then alarmed = true end end
+        for _ = 1, 2 do sim:tick() end
+        t = t + 0.1
+    end
+    check(warned and alarmed, "warned=%s alarmed=%s", tostring(warned), tostring(alarmed))
+end)
+
+test("gain settings are editable (Output / Rod / Flow Gain)", function()
+    cc.reset(); freshModules()
+    local persist = require("persist")
+    local cfg = require("config")
+    local function schemaOf(path, kind)
+        local src = assert(io.open(path)):read("*a")
+        return src:find(kind, 1, true) ~= nil
+    end
+    check(schemaOf("drivers/draconic.lua", "outputAggressiveness"), "Output Gain missing")
+    check(schemaOf("drivers/extreme.lua", "rodGain") and schemaOf("drivers/extreme.lua", "flowGain"),
+          "ER gains missing")
+    local c = {outputAggressiveness = 1}
+    persist.adjust(c, {{key = "outputAggressiveness", step = 0.1, min = 0.2, max = 3, fmt = "num"}},
+                   "outputAggressiveness", -1)
+    check(math.abs(c.outputAggressiveness - 0.9) < 1e-9, "gain %s", tostring(c.outputAggressiveness))
+    check(persist.format({fmt = "num"}, 0.9) == "0.9", "num format")
+    check(cfg.extreme.rodGain == 1 and cfg.extreme.flowGain == 1, "config defaults")
+end)
+
+test("manual output mode is remembered across a restart", function()
+    cc.reset()
+    local sim, mon = oneReactorWithCore()
+    runProgram({sims = {sim}, untilTime = 10, config = function(c) c.reactor.autoStartOnBoot = true end, at = {
+        {t = 3, fn = function() touchText(mon, "Reactor ") end},
+        {t = 4, fn = function() touchText(mon, "AU") end}
+    }})
+    check(mon.text():find("Output %(man%)"), "did not switch to manual:\n%s", mon.text())
+    cc.output = {}
+    runProgram({sims = {sim}, untilTime = 20, at = {
+        {t = 13, fn = function() touchText(mon, "Reactor ") end}
+    }})
+    check(mon.text():find("Output %(man%)") and mon.text():find(" MA "),
+          "manual mode lost on restart:\n%s", mon.text())
+end)
+
+test("a turbine connected while running is picked up (hot-plug)", function()
+    cc.reset()
+    local sim = ErSim.new({activelyCooled = true, maxOutput = 3000, turbines = 1, turbineLoad = 6000})
+    cc.addPeripheral("BigReactors-Reactor_0", "BigReactors-Reactor", sim.erReactor)
+    runProgram({sims = {sim}, untilTime = 600, config = function(c) c.extreme.autoStartOnBoot = true end, at = {
+        {t = 10, fn = function()
+            cc.addPeripheral("BigReactors-Turbine_0", "BigReactors-Turbine", sim.erTurbines[1])
+            os.queueEvent("peripheral", "BigReactors-Turbine_0")
+        end}
+    }})
+    check(cc.outputText():find("Running 1 unit"), "started with wrong unit count")
+    check(cc.readFile("logs/draconic.log"):find("New unit connected: Turbine 1"), "not picked up")
+    check(math.abs(sim.turbines[1].rpm - 1800) < 100, "hot-plugged turbine not controlled: %.0f RPM",
+          sim.turbines[1].rpm)
+end)
+
+test("separate steam groups keep their own steam demand", function()
+    cc.reset()
+    -- System A: 1 turbine. System B: 3 turbines on a bigger reactor.
+    local a = ErSim.new({activelyCooled = true, maxOutput = 3000, turbines = 1, turbineLoad = 6000})
+    local b = ErSim.new({activelyCooled = true, maxOutput = 9000, turbines = 3, turbineLoad = 6000})
+    cc.addPeripheral("BigReactors-Reactor_0", "BigReactors-Reactor", a.erReactor)
+    cc.addPeripheral("BigReactors-Turbine_0", "BigReactors-Turbine", a.erTurbines[1])
+    cc.addPeripheral("BigReactors-Reactor_1", "BigReactors-Reactor", b.erReactor)
+    for i = 1, 3 do
+        cc.addPeripheral("BigReactors-Turbine_" .. i, "BigReactors-Turbine", b.erTurbines[i])
+    end
+    local lo, hi = 1, 0
+    runProgram({sims = {a, b}, untilTime = 1500, config = function(c)
+        c.extreme.autoStartOnBoot = true
+        c.extreme.units = {
+            {peripheral = "BigReactors-Reactor_0", steamGroup = "A"},
+            {peripheral = "BigReactors-Turbine_0", steamGroup = "A"},
+            {peripheral = "BigReactors-Reactor_1", steamGroup = "B"},
+            {peripheral = "BigReactors-Turbine_1", steamGroup = "B"},
+            {peripheral = "BigReactors-Turbine_2", steamGroup = "B"},
+            {peripheral = "BigReactors-Turbine_3", steamGroup = "B"}
+        }
+    end, at = {{t = 1200, fn = function() end}}})
+    for _, sim in ipairs({a, b}) do
+        local level = sim.steam / sim.steamMax
+        check(level > 0.05 and level < 0.95, "steam tank %.2f", level)
+        for _, tb in ipairs(sim.turbines) do
+            check(math.abs(tb.rpm - 1800) < 100, "turbine rpm %.0f", tb.rpm)
+        end
+    end
+end)
+
+------------------------------------------------------------
+-- ALARMS, WASTE, TOTALS, UPDATER
+------------------------------------------------------------
+local function alarmPeripherals()
+    local log = {notes = 0, chat = {}}
+    cc.addPeripheral("speaker_0", "speaker", {playNote = function() log.notes = log.notes + 1 end})
+    cc.addPeripheral("chatBox_0", "chatBox", {sendMessage = function(msg) table.insert(log.chat, msg) end})
+    return log
+end
+
+test("alarms: edge-triggered chat, repeating bell, silence, redstone", function()
+    cc.reset(); freshModules()
+    local log = alarmPeripherals()
+    local alarms = require("alarms")
+    alarms.init({redstoneSide = "top", repeatSeconds = 10})
+    alarms.update({{unit = "Alpha", text = "LOW FUEL 18%"}}, 0)
+    check(#log.chat == 1 and log.notes == 1 and cc.redstone.top, "first raise")
+    alarms.update({{unit = "Alpha", text = "LOW FUEL 17%"}}, 5)
+    check(#log.chat == 1 and log.notes == 1, "changed number counted as a new alarm")
+    alarms.update({{unit = "Alpha", text = "LOW FUEL 17%"}}, 11)
+    check(log.notes == 2, "bell did not repeat")
+    alarms.silence()
+    alarms.update({{unit = "Alpha", text = "LOW FUEL 17%"}}, 30)
+    check(log.notes == 2, "silenced bell still rang")
+    alarms.update({{unit = "Alpha", text = "LOW FUEL 17%"}, {unit = "Beta", text = "TRIP"}}, 31)
+    check(log.notes == 3 and #log.chat == 2, "new alarm did not override silence")
+    alarms.update({}, 40)
+    check(log.chat[3] == "All alarms cleared" and not cc.redstone.top, "clear not reported")
+end)
+
+test("program sounds alarms and the alarm bar silences them", function()
+    cc.reset()
+    local log = alarmPeripherals()
+    local sim = ErSim.new({load = 1000})
+    sim.fuel = 3000                 -- 5% of the tank: LOW FUEL
+    cc.addPeripheral("BigReactors-Reactor_0", "BigReactors-Reactor", sim.erReactor)
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local beforeSilence
+    runProgram({sims = {sim}, untilTime = 120, at = {
+        {t = 30, fn = function()
+            beforeSilence = log.notes
+            touchText(mon, "LOW FUEL")
+        end}
+    }})
+    check(#log.chat >= 1 and log.chat[1]:find("LOW FUEL"), "no chat message: %s", table.concat(log.chat, " | "))
+    check(beforeSilence >= 2, "bell did not repeat before silence (%d)", beforeSilence)
+    check(log.notes <= beforeSilence + 1, "bell kept ringing after silence (%d -> %d)", beforeSilence, log.notes)
+    check(cc.readFile("logs/draconic.log"):find("ALARM Fission 1: LOW FUEL"), "alarm not logged")
+end)
+
+test("waste is ejected on both mods' APIs", function()
+    for _, mod in ipairs({"er", "br"}) do
+        local er = erUtils()
+        local sim = ErSim.new({load = 10000})
+        sim.waste = 15000           -- ~23% of a 64000 mB tank
+        ER_CFG.wasteEjectAt = 0.2
+        erLoop(er, sim, mod, 10)
+        ER_CFG.wasteEjectAt = nil
+        check((sim.ejections or 0) >= 1, "%s: waste not ejected", mod)
+    end
+end)
+
+test("long-term totals integrate generation and survive a restart", function()
+    cc.reset()
+    local sim = ErSim.new({load = 10000})
+    cc.addPeripheral("BigReactors-Reactor_0", "BigReactors-Reactor", sim.erReactor)
+    local auto = function(c) c.extreme.autoStartOnBoot = true end
+    runProgram({sims = {sim}, untilTime = 600, config = auto})
+    check(cc.readFile("data/totals.db"), "totals not saved")
+    freshModules()
+    local totals = require("totals")
+    totals.load()
+    local _, lifetime = totals.network(24)
+    -- ~10 kFE/t for most of 600 s = ~1.2e8 FE.
+    check(lifetime > 0.8e8 and lifetime < 1.5e8, "lifetime %.3g FE", lifetime)
+    cc.output = {}
+    runProgram({sims = {sim}, untilTime = 1200, config = auto})
+    totals.load()
+    local _, after = totals.network(24)
+    check(after > lifetime * 1.6, "totals did not continue after restart: %.3g -> %.3g", lifetime, after)
+end)
+
+test("updater: version compare", function()
+    cc.reset(); freshModules()
+    local u = require("updater")
+    check(u.newer("4.10", "4.9") and u.newer("5", "4.9.9") and not u.newer("4.1", "4.1")
+          and not u.newer("4.0", "4.1"), "version ordering")
+end)
+
+test("System page: check, two-tap update, install and reboot", function()
+    local served = {}
+    cc.reset({http = {get = function(url)
+        local name = url:match("/main/(.+)$")
+        local ok, body = pcall(readRepoFileEarly, name)
+        if not ok then return nil, "404" end
+        if name == "main_control.lua" then body = body:gsub('local VERSION = "[^"]+"', 'local VERSION = "9.9"') end
+        served[name] = true
+        return {getResponseCode = function() return 200 end,
+                readAll = function() return body end, close = function() end}
+    end}, shell = {run = function(path)
+        local fn = assert((loadstring or load)(cc.readFile(path)))
+        fn()
+        return true
+    end}})
+    local sim = ErSim.new({load = 1000})
+    cc.addPeripheral("BigReactors-Reactor_0", "BigReactors-Reactor", sim.erReactor)
+    local turbineSim = ErSim.new({turbines = 1})
+    cc.addPeripheral("BigReactors-Turbine_0", "BigReactors-Turbine", turbineSim.erTurbines[1])
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local sysScreen, armed = "", ""
+    runProgram({sims = {sim}, untilTime = 120, at = {
+        {t = 3, fn = function() touchText(mon, "[i] Overview") end},
+        {t = 4, fn = function() touchText(mon, "CHECK") end},
+        {t = 6, fn = function() sysScreen = mon.text(); touchText(mon, "UPDATE") end},
+        {t = 7, fn = function() armed = mon.text(); touchText(mon, "CONFIRM") end}
+    }})
+    check(sysScreen:find("v4%.1") and sysScreen:find("v9%.9 available"), "system page:\n%s", sysScreen)
+    check(armed:find("CONFIRM"), "update did not ask for confirmation:\n%s", armed)
+    check(cc.rebooted, "did not reboot after installing")
+    check(served["install.lua"] and served["persist.lua"], "installer did not run")
+    check(cc.readFile("main_control.lua"):find('VERSION = "9.9"'), "new version not written")
+    check(cc.readFile("logs/draconic.log"):find("Update installed"), "install not logged")
+end)
+
+------------------------------------------------------------
+-- MEKANISM
+------------------------------------------------------------
+local MekSim = require("mek_sim")
+
+local function mekCfg(over)
+    cc.reset(); freshModules()
+    local cfg = {}
+    for k, v in pairs(require("config").mekanism) do cfg[k] = v end
+    for k, v in pairs(over or {}) do cfg[k] = v end
+    return require("mek_utils"), cfg
+end
+
+-- Runs a fission controller against the sim for `seconds`.
+local function mekLoop(mek, sim, ctl, seconds, onCycle)
+    local adapter = mek.wrap("fission", "p", sim.fission)
+    local t = 0
+    while t < seconds do
+        local d = mek.read(adapter)
+        local out = ctl:step(d, t)
+        local errs = mek.apply(adapter, out)
+        check(#errs == 0, "apply: %s", table.concat(errs, "; "))
+        for _ = 1, 10 do sim:tick() end
+        t = t + 0.5
+        if onCycle then onCycle(t, out) end
+        if sim.meltdown then break end
+    end
+end
+
+test("Mekanism: losing coolant SCRAMs before any damage, no auto-restart", function()
+    local mek, cfg = mekCfg({targetBurnRate = 15})
+    local sim = MekSim.new({active = true, burn = 15, temperature = 750})
+    local ctl = mek.newFissionController(cfg)
+    ctl:requestStart()
+    mekLoop(mek, sim, ctl, 600, function(t)
+        if t == 60 then sim.coolantSupply = 0 end           -- coolant pump fails
+        if t == 120 then sim.coolantSupply = 0.05 end       -- ...and is fixed
+    end)
+    check((sim.scrams or 0) >= 1, "never scrammed")
+    check(sim.damage == 0 and sim.maxTemperatureSeen < 1200,
+          "damage %.2f, peak %.0fK", sim.damage, sim.maxTemperatureSeen)
+    check(not sim.active, "restarted on its own after a trip")
+    check(ctl.trip and ctl.trip.reason:find("coolant"), "trip reason %s", tostring(ctl.trip and ctl.trip.reason))
+    ctl:requestStart()
+    mekLoop(mek, sim, ctl, 30)
+    check(sim.active, "START did not reactivate a safe reactor")
+end)
+
+test("Mekanism: steam backing up (turbine stopped) SCRAMs", function()
+    local mek, cfg = mekCfg({targetBurnRate = 15})
+    local sim = MekSim.new({active = true, burn = 15, temperature = 750})
+    local ctl = mek.newFissionController(cfg)
+    ctl:requestStart()
+    mekLoop(mek, sim, ctl, 600, function(t) if t == 30 then sim.heatedDrain = 0 end end)
+    check((sim.scrams or 0) >= 1 and ctl.trip.reason:find("heated"), "no heated-coolant scram")
+    check(sim.damage == 0, "damage %.2f", sim.damage)
+end)
+
+test("Mekanism: burn rate ramps up and backs off near the limit", function()
+    local mek, cfg = mekCfg({targetBurnRate = 40, burnRampPerSecond = 1})
+    -- 40 mB/t would settle at 1500K: the governor must hold it below the trip.
+    local sim = MekSim.new({active = true, burn = 0, temperature = 300, maxBurn = 50})
+    local ctl = mek.newFissionController(cfg)
+    ctl:requestStart()
+    local prev, maxStep, cut = 0, 0, false
+    mekLoop(mek, sim, ctl, 900, function(_, out)
+        maxStep = math.max(maxStep, sim.burn - prev)
+        prev = sim.burn
+        for _, a in ipairs(ctl.alarms) do if a:find("BURN RATE REDUCED") then cut = true end end
+    end)
+    check(maxStep <= 0.5 + 1e-9, "ramped %.2f mB/t in one 0.5s cycle", maxStep)
+    check(cut, "governor never cut the burn rate")
+    check(sim.maxTemperatureSeen < 1000, "peak %.0fK reached the trip", sim.maxTemperatureSeen)
+    check(sim.active and sim.damage == 0, "reactor tripped or damaged")
+end)
+
+test("Mekanism: adapters dedupe ports, convert Joules, clamp fusion injection", function()
+    local mek = mekCfg()
+    local sim = MekSim.new({})
+    cc.addPeripheral("fissionReactorPort_0", "fissionReactorPort", sim.fission)
+    cc.addPeripheral("fissionReactorPort_1", "fissionReactorPort", sim.fission)
+    cc.addPeripheral("fissionReactorLogicAdapter_0", "fissionReactorLogicAdapter", sim.fission)
+    local keys = {}
+    for _, n in ipairs(peripheral.getNames()) do
+        keys[mek.classify(n) .. "@" .. mek.multiblockKey(n, peripheral.wrap(n))] = true
+    end
+    local count = 0
+    for _ in pairs(keys) do count = count + 1 end
+    check(count == 1, "%d units for one reactor", count)
+    check(mek.toFE(2500) == 1000, "J -> FE %s", tostring(mek.toFE(2500)))
+    mekanismEnergyHelper = {joulesToFE = function(j) return j / 4 end}
+    check(mek.toFE(2500) == 625, "server conversion rate ignored")
+    mekanismEnergyHelper = nil
+    local fusion = mek.wrap("fusion", "f", sim.fusion)
+    fusion.setInjection(37)
+    check(sim.injection == 38, "injection not made even: %s", tostring(sim.injection))
+end)
+
+test("Mekanism program run: overview, fission page, SCRAM on exit", function()
+    cc.reset()
+    local sim = MekSim.new({active = true, burn = 10, temperature = 600})
+    cc.addPeripheral("fissionReactorPort_0", "fissionReactorPort", sim.fission)
+    cc.addPeripheral("fissionReactorLogicAdapter_0", "fissionReactorLogicAdapter", sim.fission)
+    cc.addPeripheral("turbineValve_0", "turbineValve", sim.turbine)
+    cc.addPeripheral("fusionReactorPort_0", "fusionReactorPort", sim.fusion)
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local overview = ""
+    runProgram({sims = {sim}, untilTime = 120, at = {
+        {t = 5, fn = function() overview = mon.text(); touchText(mon, "Fission 1") end}
+    }})
+    check(cc.outputText():find("Running 3 unit"), "units:\n%s", cc.outputText())
+    check(overview:find("Fission 1") and overview:find("Mek Turbine 1") and overview:find("Fusion 1"),
+          "overview:\n%s", overview)
+    check(mon.text():find("Fission Status") and mon.text():find("SCRAM"), "fission page:\n%s", mon.text())
+    check(not sim.active, "fission reactor left running after Ctrl+T")
+    check(cc.readFile("logs/draconic.log"):find("reactor SCRAMmed"), "exit scram not logged")
+end)
+
+test("Mekanism settings: scram temperature can never reach the damage threshold", function()
+    cc.reset(); freshModules()
+    local persist = require("persist")
+    local src = assert(io.open("drivers/mekanism.lua")):read("*a")
+    check(src:find("max = 1150"), "scram temperature cap missing")
+    local cfg = {maxTemperature = 1100, tempMargin = 100}
+    local schema = {{key = "maxTemperature", step = 25, fmt = "int",
+                     min = function(c) return 400 + c.tempMargin end, max = 1150}}
+    for _ = 1, 20 do persist.adjust(cfg, schema, "maxTemperature", 1) end
+    check(cfg.maxTemperature == 1150, "cap %s", tostring(cfg.maxTemperature))
+end)
+
+------------------------------------------------------------
 -- ENERGY STORAGE
 ------------------------------------------------------------
 -- Mock peripherals, one per supported API.
@@ -1280,6 +1664,328 @@ test("main_control starts without require (issue 3: os.run / dofile)", function(
     local out = cc.outputText()
     check(not out:find("attempt to call"), "require error:\n%s", out)
     check(out:find("No reactor found"), "did not reach discovery:\n%s", out)
+end)
+
+------------------------------------------------------------
+-- REMOTE LOGGING (log_shipper.lua)
+------------------------------------------------------------
+-- Strict JSON decoder: errors on anything that is not valid JSON.
+local function decodeJSON(text)
+    local pos = 1
+    local function fail(msg) error(string.format("JSON: %s at %d in %s", msg, pos, text:sub(1, 200)), 0) end
+    local function ws() pos = text:find("[^ \t\r\n]", pos) or (#text + 1) end
+    local value
+    local function str()
+        pos = pos + 1
+        local out = {}
+        while true do
+            local c = text:sub(pos, pos)
+            if c == "" then fail("unterminated string") end
+            if c == '"' then pos = pos + 1; return table.concat(out) end
+            if c:byte() < 32 then fail("raw control char") end
+            if c == "\\" then
+                local e = text:sub(pos + 1, pos + 1)
+                local simple = {['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b",
+                                f = "\f", n = "\n", r = "\r", t = "\t"}
+                if simple[e] then
+                    table.insert(out, simple[e]); pos = pos + 2
+                elseif e == "u" then
+                    local hex = text:sub(pos + 2, pos + 5)
+                    if not hex:match("^%x%x%x%x$") then fail("bad \\u") end
+                    local code = tonumber(hex, 16)
+                    check(code < 256, "only \\u00XX expected")
+                    table.insert(out, string.char(code)); pos = pos + 6
+                else
+                    fail("bad escape")
+                end
+            else
+                table.insert(out, c); pos = pos + 1
+            end
+        end
+    end
+    function value()
+        ws()
+        local c = text:sub(pos, pos)
+        if c == "{" then
+            local obj = {}
+            pos = pos + 1; ws()
+            if text:sub(pos, pos) == "}" then pos = pos + 1; return obj end
+            while true do
+                ws()
+                if text:sub(pos, pos) ~= '"' then fail("key expected") end
+                local k = str(); ws()
+                if text:sub(pos, pos) ~= ":" then fail("colon expected") end
+                pos = pos + 1
+                obj[k] = value(); ws()
+                local d = text:sub(pos, pos); pos = pos + 1
+                if d == "}" then return obj end
+                if d ~= "," then fail("comma expected") end
+            end
+        elseif c == "[" then
+            local arr = {}
+            pos = pos + 1; ws()
+            if text:sub(pos, pos) == "]" then pos = pos + 1; return arr end
+            while true do
+                table.insert(arr, value()); ws()
+                local d = text:sub(pos, pos); pos = pos + 1
+                if d == "]" then return arr end
+                if d ~= "," then fail("comma expected") end
+            end
+        elseif c == '"' then
+            return str()
+        elseif text:find("^true", pos) then pos = pos + 4; return true
+        elseif text:find("^false", pos) then pos = pos + 5; return false
+        elseif text:find("^null", pos) then pos = pos + 4; return nil
+        else
+            local num = text:match("^-?%d+%.?%d*[eE]?[-+]?%d*", pos)
+            if not num or num == "" then fail("unexpected " .. c) end
+            pos = pos + #num
+            return tonumber(num)
+        end
+    end
+    local v = value(); ws()
+    if pos <= #text then fail("trailing data") end
+    return v
+end
+
+local REMOTE_URL = "http://logs.example.com:8780/ingest"
+
+local function enableRemote(extra)
+    return function(cfg)
+        cfg.logging.remote = {enabled = true, url = REMOTE_URL, token = "s3cret",
+                              batchSeconds = 5, maxQueue = 1000, timeout = 10}
+        for k, v in pairs(extra or {}) do cfg.logging.remote[k] = v end
+        cfg.reactor.autoStartOnBoot = true
+        cfg.peripherals.inputGate, cfg.peripherals.outputGate = "flow_gate_0", "flow_gate_1"
+    end
+end
+
+-- Lines per file from every successful request, in arrival order.
+local function shippedLines(api, delivered)
+    local byFile, payloads = {}, {}
+    for _, req in ipairs(api.requests) do
+        if delivered == nil or delivered(req) then
+            local p = decodeJSON(req.body)
+            table.insert(payloads, p)
+            for _, e in ipairs(p.entries) do
+                byFile[e.file] = byFile[e.file] or {}
+                if not e.header then table.insert(byFile[e.file], e.line) end
+            end
+        end
+    end
+    return byFile, payloads
+end
+
+local function localLines(name)
+    local out = {}
+    for line in (cc.readFile("logs/" .. name) or ""):gmatch("([^\n]*)\n") do
+        table.insert(out, line)
+    end
+    return out
+end
+
+local function newFakeLog()
+    local fake = {lines = {}, sinks = {}}
+    function fake.log(level, msg) table.insert(fake.lines, level .. " " .. msg) end
+    function fake.addSink(fn)
+        table.insert(fake.sinks, fn)
+        return function() fake.sinks = {} end
+    end
+    return fake
+end
+
+test("remote logging: disabled by default sends nothing", function()
+    cc.reset({http = cc.newHttp(function() error("must not be called") end,
+                                function() error("must not check") end)})
+    check(loadConfig().logging.remote.enabled == false, "remote logging on by default")
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 60, config = function(cfg)
+        cfg.peripherals.inputGate, cfg.peripherals.outputGate = "flow_gate_0", "flow_gate_1"
+    end})
+    check(#http.requests == 0, "%d requests sent", #http.requests)
+    check(cc.readFile("logs/draconic.log"):find("Starting"), "local log missing")
+end)
+
+test("remote logging: log and CSV lines reach the collector in order", function()
+    local api = cc.newHttp(function() return {code = 200, latency = 0.3} end)
+    cc.reset({http = api, label = "Reactor \"Room\""})
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 300, config = enableRemote()})
+    check(#api.requests >= 10, "only %d requests", #api.requests)
+    check(api.maxInFlight == 1, "%d requests in flight at once", api.maxInFlight)
+    local byFile, payloads = shippedLines(api)
+    for _, req in ipairs(api.requests) do
+        check(req.method == "POST" and req.url == REMOTE_URL, "bad request %s %s", req.method, req.url)
+        check(req.headers.Authorization == "Bearer s3cret", "auth header %s",
+              tostring(req.headers.Authorization))
+        check(req.headers["Content-Type"] == "application/json", "content type")
+        check(req.timeout == 10, "timeout %s", tostring(req.timeout))
+    end
+    for _, p in ipairs(payloads) do
+        check(p.computer_id == 7 and p.computer_label == 'Reactor "Room"', "identity %s %s",
+              tostring(p.computer_id), tostring(p.computer_label))
+        check(p.dropped == 0 and type(p.sent_at) == "number", "dropped/sent_at")
+    end
+    -- Every file arrives in local order: the shipped lines are a prefix of
+    -- the local file (lines logged after the last batch are not sent yet).
+    for _, name in ipairs({"draconic.log", "reactor_stats.csv"}) do
+        local remote, here = byFile[name], localLines(name)
+        check(remote and #remote > 3, "%s not shipped", name)
+        if name:find("%.csv$") then table.remove(here, 1) end    -- header entry
+        check(#remote <= #here and #remote >= #here - 3, "%s: %d shipped, %d local", name, #remote, #here)
+        for i, line in ipairs(remote) do
+            check(line == here[i], "%s line %d: %q ~= %q", name, i, line, tostring(here[i]))
+        end
+    end
+    -- Startup lines written before the shipper started are included.
+    check(byFile["draconic.log"][1]:find("%[INFO%] Starting v"), "first line %s", byFile["draconic.log"][1])
+    -- The CSV header goes first and is flagged.
+    local first
+    for _, p in ipairs(payloads) do
+        for _, e in ipairs(p.entries) do
+            if e.file == "reactor_stats.csv" and not first then first = e end
+        end
+    end
+    check(first.header == true and first.line == localLines("reactor_stats.csv")[1], "csv header %q", first.line)
+    check(math.abs(sim.temperature - 7000) < 150, "temperature %.0f", sim.temperature)
+end)
+
+test("remote logging: payload JSON stays valid for any byte", function()
+    cc.reset({http = cc.newHttp(function() return {code = 200} end)})
+    freshModules()
+    local shipper = require("log_shipper").new({enabled = true, url = REMOTE_URL, token = "t"}, newFakeLog())
+    local nasty = 'quote" back\\ tab\t nl\n cr\r nul\0 bell\7 del\127 hi\200\255 }],{'
+    shipper.enqueue("draconic.log", nasty)
+    local ok, err = cc.run(function() check(shipper.sendOnce(), "send failed") end)
+    check(ok, "run: %s", tostring(err))
+    local p = decodeJSON(http.requests[1].body)
+    check(p.entries[1].line == nasty and p.entries[1].file == "draconic.log", "round trip %q", p.entries[1].line)
+end)
+
+test("remote logging: bounded queue drops oldest and reports the count", function()
+    cc.reset({http = cc.newHttp(function() return {code = 200} end)})
+    freshModules()
+    local fake = newFakeLog()
+    local shipper = require("log_shipper").new({enabled = true, url = REMOTE_URL, token = "t",
+                                                maxQueue = 10, batchEntries = 1000}, fake)
+    check(#fake.sinks == 1, "sink not registered")
+    for i = 1, 25 do fake.sinks[1]("draconic.log", "line " .. i) end
+    check(shipper.queue.size() == 10 and shipper.queue.dropped == 15, "size %d dropped %d",
+          shipper.queue.size(), shipper.queue.dropped)
+    local ok, err = cc.run(function() check(shipper.sendOnce(), "send failed") end)
+    check(ok, "run: %s", tostring(err))
+    local p = decodeJSON(http.requests[1].body)
+    check(p.dropped == 15 and #p.entries == 10, "dropped %s entries %d", tostring(p.dropped), #p.entries)
+    check(p.entries[1].line == "line 16" and p.entries[10].line == "line 25", "kept the wrong lines")
+    check(shipper.queue.dropped == 0 and shipper.queue.size() == 0, "not acknowledged")
+    local warned = false
+    for _, l in ipairs(fake.lines) do warned = warned or l:find("15 entries were dropped") ~= nil end
+    check(warned, "drop count not logged locally:\n%s", table.concat(fake.lines, "\n"))
+end)
+
+test("remote logging: overflow during a failed send is still counted", function()
+    local api = cc.newHttp(function() return {fail = "Connection refused", latency = 1} end)
+    cc.reset({http = api})
+    freshModules()
+    local fake = newFakeLog()
+    local shipper = require("log_shipper").new({enabled = true, url = REMOTE_URL, token = "t",
+                                                maxQueue = 5, batchEntries = 1000}, fake)
+    for i = 1, 5 do fake.sinks[1]("draconic.log", "a" .. i) end
+    cc.run(function()
+        parallel.waitForAll(function() check(not shipper.sendOnce(), "should fail") end,
+                            function() for i = 1, 3 do fake.sinks[1]("draconic.log", "b" .. i) end end)
+    end)
+    -- a1..a3 were evicted while in flight and the send failed: lost.
+    check(shipper.queue.dropped == 3 and shipper.queue.size() == 5, "dropped %d size %d",
+          shipper.queue.dropped, shipper.queue.size())
+end)
+
+test("remote logging: batches are split under maxBatchBytes", function()
+    cc.reset({http = cc.newHttp(function() return {code = 200} end)})
+    freshModules()
+    local fake = newFakeLog()
+    local shipper = require("log_shipper").new({enabled = true, url = REMOTE_URL, token = "t",
+                                                maxBatchBytes = 4096, batchEntries = 1000}, fake)
+    local sent = {}
+    for i = 1, 60 do
+        local line = string.format("%03d ", i) .. string.rep("x", 200)
+        fake.sinks[1]("draconic.log", line)
+        table.insert(sent, line)
+    end
+    cc.run(function() while shipper.queue.size() > 0 do check(shipper.sendOnce(), "send failed") end end)
+    check(#http.requests >= 4, "only %d requests", #http.requests)
+    local got = {}
+    for _, req in ipairs(http.requests) do
+        check(#req.body <= 4096, "body %d bytes", #req.body)
+        for _, e in ipairs(decodeJSON(req.body).entries) do table.insert(got, e.line) end
+    end
+    check(table.concat(got, "|") == table.concat(sent, "|"), "lines lost or reordered")
+end)
+
+test("remote logging: collector down -> backoff, reactor keeps regulating, catch-up", function()
+    local api = cc.newHttp(function(req)
+        if req.time < 400 then return {fail = "Connection refused", latency = 0.5} end
+        return {code = 200, latency = 0.2}
+    end)
+    cc.reset({http = api})
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 700, config = enableRemote()})
+    check(not sim.exploded and sim.state == "running", "reactor %s", sim.state)
+    check(math.abs(sim.temperature - 7000) < 150, "temperature %.0f", sim.temperature)
+    -- Gaps between failed attempts double up to the 60 s cap.
+    local gaps = {}
+    for i = 2, #api.requests do
+        if api.requests[i].time < 400 then
+            table.insert(gaps, api.requests[i].time - api.requests[i - 1].time)
+        end
+    end
+    check(#gaps >= 5 and #gaps <= 12, "%d failed attempts", #gaps)
+    check(gaps[1] < gaps[3] and gaps[3] < gaps[5], "no backoff: %s", table.concat(gaps, ", "))
+    for _, g in ipairs(gaps) do check(g <= 62, "gap %.1f over the cap", g) end
+    check(math.abs(gaps[#gaps] - 60.5) < 1, "cap not reached: %s", table.concat(gaps, ", "))
+    -- After recovery everything queued during the outage arrives.
+    local byFile = shippedLines(api, function(req) return req.time >= 400 end)
+    check(byFile["draconic.log"][1]:find("Starting v"), "backlog lost: %s", tostring(byFile["draconic.log"][1]))
+    local log = cc.readFile("logs/draconic.log")
+    check(log:find("collector unreachable: Connection refused"), "outage not logged")
+    check(log:find("collector reachable again"), "recovery not logged")
+    local _, warnings = log:gsub("collector unreachable", "")
+    check(warnings == 1, "outage logged %d times", warnings)
+    check(api.maxInFlight == 1, "parallel requests")
+end)
+
+test("remote logging: blocked URL or missing http API disables with a reason", function()
+    local api = cc.newHttp(function() error("must not send") end,
+                           function() return false, "Domain not permitted" end)
+    cc.reset({http = api})
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 60, config = enableRemote({url = "http://192.168.1.5:8780/ingest"})})
+    local log = cc.readFile("logs/draconic.log")
+    check(log:find("blocked: Domain not permitted") and log:find("computercraft%-server%.toml"),
+          "no explanation:\n%s", log)
+    check(#api.requests == 0, "sent anyway")
+    check(sim.state == "running", "reactor %s", sim.state)
+
+    cc.reset()                                   -- http = nil: API disabled
+    sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 30, config = enableRemote()})
+    check(cc.readFile("logs/draconic.log"):find("http API is not available"), "missing http not explained")
+end)
+
+test("remote logging: rejected token is explained, entries are kept", function()
+    local api = cc.newHttp(function() return {code = 401, reason = "Unauthorized"} end)
+    cc.reset({http = api})
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 120, config = enableRemote()})
+    local log = cc.readFile("logs/draconic.log")
+    check(log:find("HTTP 401") and log:find("token"), "401 not explained:\n%s", log)
+    check(require("log_shipper").current.queue.size() > 0, "entries discarded")
 end)
 
 ------------------------------------------------------------

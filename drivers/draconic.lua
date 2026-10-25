@@ -53,7 +53,10 @@ local SETTINGS = {
      min = 0.05, max = function(c) return c.targetField - 0.05 end},
     {key = "safeTemperature", label = "Restart At", step = 250, fmt = "temp",
      min = 1000, max = function(c) return c.targetTemperature - 500 end},
-    {key = "autoRestart", label = "Auto Restart", fmt = "bool"}
+    {key = "autoRestart", label = "Auto Restart", fmt = "bool"},
+    -- Temperature loop speed; lower if output hunts, higher if it lags.
+    {key = "outputAggressiveness", label = "Output Gain", step = 0.1, fmt = "num",
+     min = 0.2, max = 3}
 }
 
 local STATS_COLUMNS = {"status", "temperature", "field", "saturation", "fuel",
@@ -105,6 +108,18 @@ local function newUnit(ctx, hw, spec, index, total)
     local ok, flow = pcall(hw.output.get)
     if ok and type(flow) == "number" then
         unit.controller.outputRate = flow
+    end
+    -- Manual output mode survives reboots, like drmon's config.txt.
+    local saved = ctx.persist and ctx.persist.state(id) or {}
+    if saved.autoOutput == false then
+        unit.controller.autoOutput = false
+        unit.controller.manualOutput = tonumber(saved.manualOutput) or unit.controller.outputRate
+    end
+    local function saveMode()
+        if ctx.persist then
+            ctx.persist.setState(id, {autoOutput = unit.controller.autoOutput,
+                                      manualOutput = unit.controller.manualOutput})
+        end
     end
     say("INFO", string.format("Reactor %s, input gate %s, output gate %s",
         hw.reactorName, hw.input.name, hw.output.name))
@@ -187,6 +202,7 @@ local function newUnit(ctx, hw, spec, index, total)
         local delta = action:match("^out:(-?%d+)$")
         if delta then
             ctl:adjustManualOutput(tonumber(delta))
+            saveMode()
             say("INFO", "Manual output set to " .. tostring(math.floor(ctl.manualOutput)))
         elseif action == "start" then
             ctl:requestStart()
@@ -196,6 +212,7 @@ local function newUnit(ctx, hw, spec, index, total)
             say("INFO", "Stop requested from screen")
         elseif action == "auto" then
             ctl:setAutoOutput(not ctl.autoOutput)
+            saveMode()
             say("INFO", "Output regulation: " .. (ctl.autoOutput and "AUTO" or "MANUAL"))
         else
             return false
@@ -250,7 +267,10 @@ function driver.discover(ctx)
     local specs = type(pcfg.reactors) == "table" and pcfg.reactors or {}
     local units = {}
     for i, hw in ipairs(list) do
-        table.insert(units, newUnit(ctx, hw, specs[i], i, #list))
+        -- On a hot-plug rescan, reactors already running are skipped.
+        if not (ctx.known and ctx.known("draconic:" .. hw.reactorName)) then
+            table.insert(units, newUnit(ctx, hw, specs[i], i, #list))
+        end
     end
     return units
 end

@@ -195,6 +195,11 @@ function Sim:buildPeripherals()
             end
         end,
         activateReactor = function()
+            -- DE canActivate: a stopping reactor above 2000C resumes.
+            if sim.state == "stopping" and sim.temperature >= 2000 then
+                sim.state = "running"
+                return
+            end
             if sim.state == "warming_up" and sim.temperature >= 2000
                     and sim.field >= sim.maxField / 2
                     and sim.saturation >= sim.maxSaturation / 2 then

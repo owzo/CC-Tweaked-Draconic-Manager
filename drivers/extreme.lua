@@ -16,14 +16,20 @@ Units (same contract as drivers/draconic.lua)
   kind "turbine"  turbine: spin-up, steam flow to hold targetRPM, coils
                   off while its own buffer is full
 
-Steam coupling: all actively cooled reactors and all turbines on the
-network are treated as one steam system (the usual build: reactors feed
-a shared pipe network). Each active reactor's feed-forward demand is the
-turbines' total commanded flow split evenly between active reactors;
-the reactor's own steam tank level trims it.
+Steam coupling: actively cooled reactors and turbines in the same steam
+group share steam (default: everything is one group, the usual build of
+reactors feeding a shared pipe network). Separate systems get separate
+groups via config.extreme.units[i].steamGroup. Each active reactor's
+feed-forward demand is its group's total commanded turbine flow, split
+evenly between the group's active reactors; the reactor's own steam
+tank level trims it.
 ]]
 
 local driver = {id = "extreme", label = "Extreme / Bigger Reactors"}
+
+-- Steam groups, kept across discover() calls so units found later
+-- (hot-plugged) join the right group.
+local plants = {}
 
 local STATS = {
     fission = {"active", "rods", "buffer", "production", "fuel", "waste", "fuel_temp", "case_temp"},
@@ -38,7 +44,8 @@ end
 local SETTINGS = {
     fission = {
         pctRange("bufferLow", "Buffer Low", 0, function(c) return c.bufferHigh - 0.1 end),
-        pctRange("bufferHigh", "Buffer High", function(c) return c.bufferLow + 0.1 end, 1)
+        pctRange("bufferHigh", "Buffer High", function(c) return c.bufferLow + 0.1 end, 1),
+        {key = "rodGain", label = "Rod Gain", step = 0.1, fmt = "num", min = 0.2, max = 3}
     },
     turbine = {
         {key = "targetRPM", label = "Target RPM", step = 50, fmt = "rpm",
@@ -46,7 +53,8 @@ local SETTINGS = {
         {key = "maxRPM", label = "Cut Steam At", step = 50, fmt = "rpm",
          min = function(c) return c.targetRPM + 50 end, max = 2500},
         pctRange("coilsOffAbove", "Coils Off At", function(c) return c.coilsOnBelow + 0.05 end, 1),
-        pctRange("coilsOnBelow", "Coils On At", 0.05, function(c) return c.coilsOffAbove - 0.05 end)
+        pctRange("coilsOnBelow", "Coils On At", 0.05, function(c) return c.coilsOffAbove - 0.05 end),
+        {key = "flowGain", label = "Flow Gain", step = 0.1, fmt = "num", min = 0.2, max = 3}
     }
 }
 
@@ -69,17 +77,22 @@ function driver.discover(ctx)
         if spec.peripheral then perUnit[spec.peripheral] = spec end
     end
 
-    -- Shared steam bookkeeping between this driver's units.
-    local plant = {turbines = {}, steamReactors = {}}
-    function plant.steamDemandPerReactor()
-        local total, active = 0, 0
-        for _, t in ipairs(plant.turbines) do
-            if t.data and t.data.active then total = total + (t.controller.flow or 0) end
+    local function plantFor(group)
+        local plant = plants[group]
+        if plant then return plant end
+        plant = {turbines = {}, steamReactors = {}}
+        function plant.steamDemandPerReactor()
+            local total, active = 0, 0
+            for _, t in ipairs(plant.turbines) do
+                if t.data and t.data.active then total = total + (t.controller.flow or 0) end
+            end
+            for _, r in ipairs(plant.steamReactors) do
+                if r.data and r.data.active and r.data.activelyCooled then active = active + 1 end
+            end
+            return active > 0 and total / active or nil
         end
-        for _, r in ipairs(plant.steamReactors) do
-            if r.data and r.data.active and r.data.activelyCooled then active = active + 1 end
-        end
-        return active > 0 and total / active or nil
+        plants[group] = plant
+        return plant
     end
 
     local units, counts = {}, {reactor = 0, turbine = 0}
@@ -89,8 +102,11 @@ function driver.discover(ctx)
         local adapter = kind and er.wrap(kind, name, dev)
         if adapter then
             counts[adapter.kind] = counts[adapter.kind] + 1
+        end
+        local id = "extreme:" .. name
+        if adapter and not (ctx.known and ctx.known(id)) then
             local spec = perUnit[name] or {}
-            local id = "extreme:" .. name
+            local plant = plantFor(spec.steamGroup or "default")
             local defaults = merged(base, spec.settings)
             local cfg = merged(defaults, ctx.overrides and ctx.overrides(id))
             local isTurbine = adapter.kind == "turbine"
@@ -109,6 +125,18 @@ function driver.discover(ctx)
                 data = nil
             }
             local function say(level, msg) ctx.log.log(level, "[" .. unit.name .. "] " .. msg) end
+            -- Manual rod mode survives reboots.
+            local saved = ctx.persist and ctx.persist.state(id) or {}
+            if not isTurbine and saved.auto == false then
+                unit.controller.auto = false
+                unit.controller.manualRods = tonumber(saved.manualRods) or 50
+            end
+            local function saveMode()
+                if ctx.persist and not isTurbine then
+                    ctx.persist.setState(id, {auto = unit.controller.auto,
+                                              manualRods = unit.controller.manualRods})
+                end
+            end
             local failed = 0
 
             function unit.run()
@@ -155,9 +183,11 @@ function driver.discover(ctx)
                     ctl:requestStop(); say("INFO", "Stop requested from screen")
                 elseif action == "auto" and ctl.setAuto then
                     ctl:setAuto(not ctl.auto)
+                    saveMode()
                     say("INFO", "Rod control: " .. (ctl.auto and "AUTO" or "MANUAL"))
                 elseif delta and ctl.adjustRods then
                     ctl:adjustRods(tonumber(delta))
+                    saveMode()
                     say("INFO", "Manual rods set to " .. math.floor(ctl.manualRods) .. "%")
                 else
                     return false

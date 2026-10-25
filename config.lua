@@ -88,6 +88,10 @@ config.extreme = {
     bufferLow       = 0.30,
     bufferHigh      = 0.70,
     lowFuel         = 0.10,         -- Alarm below this fuel fraction
+    wasteEjectAt    = 0.20,         -- Eject waste above this share of the
+                                    -- fuel tank (needs an access port set
+                                    -- to output); nil = never
+    wasteAlarmAt    = 0.50,         -- Alarm when waste still piles up
 
     -- Turbines: efficiency peaks at ~1800 RPM in both mods.
     targetRPM       = 1800,
@@ -97,6 +101,12 @@ config.extreme = {
 
     autoStartOnBoot = false,        -- Activate reactors/turbines on start
     controlInterval = 0.25,         -- Seconds per control cycle
+
+    -- Control loop speed multipliers (1.0 = tested default). Lower one if
+    -- rods or steam flow keep hunting back and forth; raise it if the
+    -- buffer or RPM drifts and recovers slowly. Also on the S page.
+    rodGain         = 1.0,
+    flowGain        = 1.0,
 
     -- Optional names and per-unit overrides, by peripheral name:
     -- units = {{peripheral = "BigReactors-Turbine_0", name = "Turbine A",
@@ -123,6 +133,56 @@ config.storage = {
 }
 
 ------------------------------------------------------------
+-- MEKANISM (optional)
+------------------------------------------------------------
+-- Fission reactors CAN melt down (damage above 1200 K, explosion at
+-- 100% damage). These limits SCRAM well before that; a tripped reactor
+-- stays off until a person presses START.
+config.mekanism = {
+    targetBurnRate   = nil,         -- mB/t; nil = keep the reactor's current rate
+    burnRampPerSecond = 1.0,        -- Max burn-rate increase per second
+    maxTemperature   = 1000,        -- K: SCRAM at or above (damage starts at 1200)
+    tempMargin       = 100,         -- K below maxTemperature where burn is cut back
+    maxDamage        = 0,           -- %: SCRAM on any damage
+    minCoolant       = 0.20,        -- SCRAM when coolant tank below this
+    maxHeatedCoolant = 0.95,        -- SCRAM when steam/heated coolant backs up
+    maxWaste         = 0.90,        -- SCRAM when waste tank above this
+    lowFuel          = 0.05,        -- Alarm below this fuel fraction
+    scramOnExit      = true,        -- SCRAM fission reactors when the program stops
+    autoStartOnBoot  = false,
+    fusionInjection  = nil,         -- Even number 2-98; nil = leave as set in game
+    controlInterval  = 0.5,         -- Seconds per cycle (each read costs a tick)
+    -- Optional names/overrides by peripheral name:
+    -- units = {{peripheral = "fissionReactorPort_0", name = "Fission A"}},
+    units = {}
+}
+
+------------------------------------------------------------
+-- ALARMS
+------------------------------------------------------------
+-- Every unit alarm (trip, low fuel, link lost, charging stalled,
+-- overspeed, waste...) can sound, post to chat and drive redstone.
+config.alarms = {
+    enabled            = true,
+    speaker            = true,      -- Any attached speaker plays a bell
+    repeatSeconds      = 10,        -- Repeat while active (tap the red
+                                    -- alarm bar to silence)
+    chat               = true,      -- Advanced Peripherals Chat Box
+    chatPrefix         = "Reactor",
+    redstoneSide       = nil,       -- e.g. "top": on while any alarm
+    redstoneIntegrator = nil        -- AP Redstone Integrator name, to use
+                                    -- its side instead of the computer's
+}
+
+------------------------------------------------------------
+-- UPDATES
+------------------------------------------------------------
+config.update = {
+    -- Where the System page checks for and installs new versions.
+    repoBase = "https://raw.githubusercontent.com/owzo/CC-Tweaked-Draconic-Manager/main/"
+}
+
+------------------------------------------------------------
 -- USER INTERFACE
 ------------------------------------------------------------
 config.ui = {
@@ -141,11 +201,26 @@ config.ui = {
 ------------------------------------------------------------
 -- LOGGING AND STATISTICS
 ------------------------------------------------------------
+-- Every log line and stats row is written under `directory`. On the
+-- host disk that is <world>/computercraft/computer/<id>/logs/ (see the
+-- README section "Logs on a real computer").
 config.logging = {
     directory     = "logs",         -- Created automatically
     maxFileBytes  = 65536,          -- Rotate files beyond this size
     statsInterval = 10,             -- Seconds between stats CSV rows
-    printLevel    = "WARN"          -- Minimum level echoed to terminal
+    printLevel    = "WARN",         -- Minimum level echoed to terminal
+
+    -- Optional: also send every log line and CSV row to
+    -- tools/log_collector.py running on a real computer. LAN/localhost
+    -- collectors must be allowed in computercraft-server.toml first.
+    remote = {
+        enabled      = false,
+        url          = "http://192.168.1.50:8780/ingest",
+        token        = "",          -- Same value as the collector's --token
+        batchSeconds = 5,           -- Seconds between batches
+        maxQueue     = 1000,        -- Lines kept while the collector is down
+        timeout      = 10           -- Seconds per HTTP request
+    }
 }
 
 return config

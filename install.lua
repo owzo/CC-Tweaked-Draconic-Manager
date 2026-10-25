@@ -29,9 +29,15 @@ local files = {
     "stat_utils.lua",
     "storage_utils.lua",
     "er_utils.lua",
+    "mek_utils.lua",
     "persist.lua",
+    "log_shipper.lua",
+    "alarms.lua",
+    "totals.lua",
+    "updater.lua",
     "drivers/draconic.lua",
     "drivers/extreme.lua",
+    "drivers/mekanism.lua",
     "drivers/storage.lua",
     "config.lua"
 }

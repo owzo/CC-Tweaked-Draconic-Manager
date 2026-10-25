@@ -1,8 +1,9 @@
 # CC:Tweaked-Draconic Manager
 
 A ComputerCraft: Tweaked program that runs **Draconic Evolution** reactors
-and, when installed, **Extreme Reactors** or **Bigger Reactors** reactors and
-turbines, from one computer with a touchscreen dashboard.
+and, when installed, **Extreme Reactors** / **Bigger Reactors** reactors and
+turbines and **Mekanism** fission, fusion, turbines and boilers, from one
+computer with a touchscreen dashboard.
 
 Each mod is optional: with only Draconic Evolution you get the Draconic
 features, with only Extreme/Bigger Reactors you get those, and with both
@@ -21,12 +22,15 @@ shutdown on unsafe conditions.
   - temperature above `maxTemperature` (8000 °C)
   - field below `minField` (20%)
   - remaining fuel below `minFuel` (10%)
-- **Auto-restart**: after a temperature or field trip the reactor restarts once it has cooled below `safeTemperature`. This is capped at 3 restarts per hour, after which a person has to press START. A low-fuel trip never restarts on its own.
+- **Auto-restart**: after a temperature or field trip the reactor resumes as soon as it has cooled below `safeTemperature`, straight from its shutdown (Draconic Evolution allows re-activation above 2000 °C), so there is no full cooldown and recharge. This is capped at 3 restarts per hour, after which a person has to press START. A low-fuel trip never restarts on its own.
+- **Wiring check**: if charging makes no progress for 30 seconds, an alarm says the input gate isn't reaching the energy injector (wrong gate, a fluid gate, or no power behind it).
+- **Remembers manual modes**: manual output (Draconic) and manual rods (Extreme/Bigger Reactors) survive reboots.
+- **Hot-plug**: machines connected while the program runs are picked up within a few seconds, with no restart. A second Draconic reactor still needs the setup wizard (restart) or `config.lua`, because its gates have to be assigned.
 - **Fail-safe exit**: if the program stops (Ctrl+T, crash, reactor link lost), the output gate goes to 0 and the input gate to twice the last field demand. With output at 0, saturation climbs and field drain collapses, so that margin is wide.
 - **Plug-and-play detection**: peripherals are found by the methods they expose, not by their names. On DE 1.16 to 1.20 flux gates report the type `flow_gate`, not `flux_gate`. This breaks drmon and was one cause of [issue 5](https://github.com/owzo/CC-Tweaked-Draconic-Manager/issues/5). Detection works with any modem name. If two gates are found you are asked once which one is the input, and the answer is saved.
 - **Dashboard** (styled after drmon): shows status, generation, temperature, field, saturation, fuel, gate rates, an optional energy core readout and alarms. It redraws through a buffer, so there is no flicker. It works on any number of monitors and falls back to the computer screen when none are attached.
 - **Energy storage**: Draconic energy cores, Mekanism induction matrices and energy cubes, Flux Networks, Powah, EnderIO, Thermal and any Forge-energy block, with input/output/net flow, time to full/empty and an **Energy Network** view (generation, storage flow, consumption). See [Energy storage](#energy-storage).
-- **Logging**: events go to `logs/draconic.log` and a stats CSV to `logs/reactor_stats.csv`. Both rotate in size so the disk can never fill up.
+- **Logging**: events go to `logs/draconic.log` and a stats CSV to `logs/reactor_stats.csv`. Both rotate in size so the disk can never fill up. Optionally every line is also sent to a small collector on a real computer (see [Logs on a real computer](#logs-on-a-real-computer)).
 
 ## Requirements
 
@@ -134,12 +138,35 @@ active (steam) cooling. Settings live in `config.extreme`.
 | Active (steam) reactor | Matches steam production to what the turbines are set to draw, and uses its steam tank level only as a trim. A steam tank holds only seconds of mismatch, too little to steer by on its own. |
 | Turbine | Spins up with the coils off (engaged coils brake the rotor; Bigger Reactors turbines start engaged), then a PI loop on steam flow holds `targetRPM` (1800, the efficiency peak in both mods). When the turbine's own buffer is full, the coils switch off and the rotor is kept at speed; they switch back on below `coilsOnBelow`. Steam is cut above `maxRPM`. |
 
-All steam-cooled reactors and turbines on the network are treated as one
-steam system (the usual build: reactors feed a shared pipe network).
+By default all steam-cooled reactors and turbines on the network are treated
+as one steam system (the usual build: reactors feed a shared pipe network).
+If you run separate steam systems, give each unit a `steamGroup`; only
+units in the same group share steam demand:
+
+```lua
+config.extreme.units = {
+    {peripheral = "BigReactors-Reactor_0", steamGroup = "A"},
+    {peripheral = "BigReactors-Turbine_0", steamGroup = "A"},
+    {peripheral = "BigReactors-Reactor_1", steamGroup = "B"},
+    {peripheral = "BigReactors-Turbine_1", steamGroup = "B"},
+}
+```
+
+**Tuning:** every control loop has a speed multiplier you can change live on
+the unit's `S` page: `Output Gain` (Draconic), `Rod Gain` (fission) and
+`Flow Gain` (turbines). Lower it if rods, output or flow keep hunting back
+and forth; raise it if the buffer, temperature or RPM drifts and recovers
+slowly. Changes are saved, and `RESET` returns to `config.lua`.
 
 **Neither mod can melt down or explode**, and turbines take no damage from
 overspeed. The worst outcome of bad control is wasted fuel or steam, so
 these controllers aim for efficiency rather than safety margins.
+
+**Waste and fuel:** waste shares the fuel tank, so once it passes
+`wasteEjectAt` (20% of the tank) the program ejects it. That needs a reactor
+access port set to output. If waste keeps piling up past `wasteAlarmAt`
+anyway, an alarm says to check the access port. Fission pages show fuel and
+waste side by side, and low fuel raises an alarm.
 
 Each page has `START` / `STOP` (activate or deactivate). Reactor pages also
 have `-10 -1 AU +1 +10`, where `AU`/`MA` toggles automatic rod control and
@@ -237,6 +264,69 @@ anything (`"enderio:*"`). `config.peripherals.energyCore` still works: that
 peripheral becomes the **primary** store, the one shown on Draconic reactor
 pages (otherwise the first Draconic pylon, then the first other store).
 
+## Mekanism
+
+Fission reactors, fusion reactors, industrial turbines and thermoelectric
+boilers are found automatically through their ports/valves. Several ports on
+one structure count as one unit.
+
+**A Mekanism fission reactor can melt down.** Damage builds above 1200 K, and
+at 100% damage an explosion is likely within about a minute (meltdowns are
+on by default). The program protects it the way the widely used cc-mek-scada
+does, and SCRAMs (instant shutdown) on any of these:
+
+| Trip | Default (`config.mekanism`) |
+| --- | --- |
+| Temperature | ≥ 1000 K (`maxTemperature`; can't be set above 1150) |
+| Damage | any (`maxDamage = 0`) |
+| Coolant | < 20% |
+| Heated coolant / steam | > 95% (turbines not keeping up) |
+| Waste | > 90% |
+
+- **No automatic restart after a trip:** a person presses START.
+- **The burn rate ramps up gradually** to the target you set (`-10 -1 +1 +10`
+  on the page). It is cut back automatically while the temperature is within
+  100 K of the trip or coolant runs low, so most excursions are handled
+  before a SCRAM is needed.
+- **When the program stops** (Ctrl+T, crash, update), running fission
+  reactors are SCRAMmed (`scramOnExit`), because an unsupervised reactor is
+  the riskier state. Make sure the computer is chunk-loaded.
+- **Turbines and boilers** are monitored, with alarms for steam backing up
+  or low water.
+- **Fusion reactors** can't explode. They're monitored, and the injection
+  rate is adjustable with `-2 / +2` (it must be even).
+- **Every Mekanism call costs a server tick**, so all readings are taken in
+  parallel each cycle. Energy is converted from Mekanism's Joules to FE
+  using the server's own conversion rate.
+
+## Alarms
+
+Every unit alarm (trip, low fuel, waste, link lost, charging stalled,
+overspeed, no steam...) can reach players away from the monitor:
+
+| Output | Needs | Behaviour |
+| --- | --- | --- |
+| Bell | Any speaker on the network | Rings on a new alarm, then every `repeatSeconds` while it lasts |
+| Chat | Advanced Peripherals **Chat Box** | One message per new alarm, and one when everything has cleared |
+| Redstone | `redstoneSide` (computer side) or an AP **Redstone Integrator** | On while any alarm is active: lamps, sirens, or wire it into a hardware shutdown |
+
+**Tap the red alarm bar** at the bottom of any page (or `SILENCE` on the
+System page) to stop the bell until a new alarm appears. Alarms are also
+written to the log (`ALARM <unit>: <text>`). Settings are in `config.alarms`.
+
+## System page, updates and totals
+
+Tap `[i] Overview` (the top row of the Overview) for the System page:
+
+- **Version** and **update check**. `CHECK` asks GitHub for the latest
+  version; `UPDATE`, then `CONFIRM` within 10 seconds, puts every reactor in
+  its fail-safe state, runs the official installer (which keeps your
+  `config.lua`) and reboots into the new version. Source: `config.update.repoBase`.
+- **Energy totals**: energy produced in the last 24 hours, lifetime total,
+  and a per-hour bar chart, kept across reboots in `data/totals.db`. Each
+  unit's Graphs page also starts with its own energy-per-hour chart.
+- **Alarm status** and `SILENCE`.
+
 ## Menus and monitors
 
 With more than one unit (reactor, turbine or energy store), every monitor
@@ -320,6 +410,12 @@ above the target.
 | `storage.*` | see [Energy storage](#energy-storage) | Storage include/exclude/names, poll interval |
 | `ui.textScale` | auto | Monitor text scale |
 | `logging.statsInterval` | 10 | Seconds between CSV rows |
+| `logging.directory` | `logs` | Folder for every log and stats file |
+| `logging.remote.enabled` | false | Send all logs to `tools/log_collector.py` (see [Logs on a real computer](#logs-on-a-real-computer)) |
+| `logging.remote.url` / `token` | | Collector URL (`.../ingest`) and its `--token` |
+| `logging.remote.batchSeconds` | 5 | Seconds between batches |
+| `logging.remote.maxQueue` | 1000 | Lines kept while the collector is unreachable |
+| `logging.remote.timeout` | 10 | Seconds per HTTP request |
 
 The program checks the config at startup and refuses to run with
 inconsistent limits (for example a target above the trip temperature).
@@ -402,6 +498,168 @@ watch `logs/reactor_stats.csv`.
 - A full energy core is safe. The reactor can't output, so saturation rises
   and the temperature falls.
 
+## Logs on a real computer
+
+Everything the program logs goes through one place (`stat_utils.lua`) into
+`config.logging.directory` (`logs/` by default):
+
+| File | Content |
+| --- | --- |
+| `draconic.log` | Every event (all levels), all units |
+| `reactor_stats.csv` / `draconic_<name>.csv` | Draconic reactor stats, one row per `statsInterval` |
+| `extreme_<name>.csv` | Extreme/Bigger Reactors reactor and turbine stats |
+| `*.old` | The previous copy after a file passed `maxFileBytes` |
+
+There are two ways to read them outside Minecraft.
+
+### Option 1: read the files on the host disk
+
+ComputerCraft keeps each computer's files as plain files in the world
+save, under `computercraft/computer/<computer id>/`. Run `id` in the
+computer's shell to get its id. The log folder is then:
+
+| Where the world runs | Log folder |
+| --- | --- |
+| Singleplayer (or Open to LAN) | `.minecraft/saves/<world>/computercraft/computer/<id>/logs/` |
+| Dedicated server | `<server folder>/<level-name>/computercraft/computer/<id>/logs/` (`<level-name>` is `world` unless `server.properties` changes it) |
+
+You can open or tail these files while the game runs. A computer's disk
+is limited (`computer_space_limit`, 1,000,000 bytes by default), which is
+why the files rotate. This only works when you can reach the machine
+Minecraft runs on.
+
+### Option 2: send the logs to a collector (any PC or server)
+
+The program can also POST every log line and every CSV row, including the
+CSV headers, to `tools/log_collector.py`. The collector writes real files,
+one folder per in-game computer:
+
+```text
+cc-logs/computer-7-Reactors/draconic.log
+cc-logs/computer-7-Reactors/reactor_stats.csv
+```
+
+The folder is `computer-<id>`, plus `-<label>` when the computer has a
+label (unsafe characters become `_`). If you change the label, a new
+folder is started.
+
+Shipping runs in its own coroutine. It never blocks reactor control. Lines
+wait in a bounded queue (`maxQueue`, 1000 by default) while the collector
+is down. When the queue is full the oldest lines are dropped. The drop
+count is written to the local log and sent with the next batch. Failed
+sends are retried with exponential backoff, up to one attempt a minute.
+Messages from startup are buffered (last 200 lines) and sent once the
+controller is running. Lines logged during shutdown are only kept locally.
+
+**1. Run the collector.** You need Python 3.8 or newer and no extra packages:
+
+```shell
+python3 -c "import secrets; print(secrets.token_urlsafe(24))"   # make a token
+python3 tools/log_collector.py --token <token> --bind 0.0.0.0 --port 8780 --root cc-logs
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--token` | `$CC_LOG_TOKEN` | Shared secret (required) |
+| `--bind` | `127.0.0.1` | Listen address. Use `0.0.0.0` (or the PC's LAN IP) when Minecraft runs on another machine |
+| `--port` | 8780 | TCP port |
+| `--root` | `./cc-logs` | Where the files go |
+| `--max-bytes` | 10 MiB | Rotate a file to `.1` … `.N` beyond this size |
+| `--backups` | 5 | Rotated copies kept per file |
+| `--max-request` | 4 MiB | Largest accepted request body |
+
+`GET /health` answers `{"ok": true}` so you can check that the collector is reachable.
+
+**2. Allow the collector's address in CC:Tweaked.** By default CC:Tweaked
+blocks every private address: localhost (127.0.0.0/8, ::1), LAN ranges
+(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), link-local, 100.64.0.0/10
+and others. The default rules are:
+
+```toml
+[[http.rules]]
+    host = "$private"
+    action = "deny"
+[[http.rules]]
+    host = "*"
+    action = "allow"
+    max_download = 16777216
+    max_upload = 4194304
+    max_websocket_message = 131072
+    use_proxy = false
+```
+
+Rules are checked in order and the first matching rule that sets `action`
+wins. Add an allow rule for your collector **above** the `$private` rule in
+`computercraft-server.toml`:
+
+```toml
+[[http.rules]]
+    host = "192.168.1.50"     # collector PC; "127.0.0.1" if it runs on the Minecraft machine
+    port = 8780               # optional: only this port
+    action = "allow"
+[[http.rules]]
+    host = "$private"
+    action = "deny"
+[[http.rules]]
+    host = "*"
+    action = "allow"
+    max_download = 16777216
+    max_upload = 4194304
+    max_websocket_message = 131072
+    use_proxy = false
+```
+
+`host` also accepts a CIDR range such as `"192.168.1.0/24"`. Keep
+`[http] enabled = true`. If a rule is malformed, CC:Tweaked logs an error
+and denies **all** HTTP, so check the game log after editing.
+
+`computercraft-server.toml` is a per-world server config:
+
+| Where the world runs | File |
+| --- | --- |
+| Singleplayer | `.minecraft/saves/<world>/serverconfig/computercraft-server.toml` (copy it to `.minecraft/defaultconfigs/` to apply it to new worlds) |
+| Dedicated server | `<server folder>/<level-name>/serverconfig/computercraft-server.toml` |
+
+Restart the world or server after editing it. A public `https://` URL,
+for example the collector behind a reverse proxy with TLS, is allowed by
+the default rules and needs no change.
+
+**3. Turn it on in `config.lua`:**
+
+```lua
+config.logging = {
+    ...
+    remote = {
+        enabled      = true,
+        url          = "http://192.168.1.50:8780/ingest",
+        token        = "<token>",
+        batchSeconds = 5,       -- seconds between batches
+        maxQueue     = 1000,    -- lines kept while the collector is down
+        timeout      = 10       -- seconds per HTTP request
+    }
+}
+```
+
+Restart the program. At startup it checks that the `http` API exists, that
+the URL is allowed (`http.checkURL`) and that a token is set. If any check
+fails it logs a `WARN` explaining why, turns remote logging off, and keeps
+logging locally. The reactors are not affected either way.
+
+**Security notes**
+
+- The token is the only thing stopping anyone who can reach the port from
+  writing files into `--root`. Use a long random token. Anyone who can read
+  `config.lua` on the computer can see it.
+- Plain `http://` sends the token and the logs unencrypted. That is fine on
+  your own LAN or on the same machine. **Don't expose the collector to the
+  internet directly.** Put it behind a reverse proxy with TLS
+  (Caddy, nginx) and use the `https://` URL, or use a VPN.
+- Bind to `127.0.0.1` when Minecraft and the collector share a machine.
+  Otherwise bind to the LAN address and firewall the port.
+- The collector only writes `*.log`, `*.csv` and `*.txt` files with simple
+  names inside its own folder. It rejects path traversal, absolute paths
+  and symlinked folders.
+
 ## Troubleshooting
 
 | Error | Cause and fix |
@@ -410,12 +668,24 @@ watch `logs/reactor_stats.csv`.
 | `No reactor found` / `Need two flux gates` | Check the wiring (wired modems, right-clicked). The message lists every peripheral the computer can see; compare it with `peripherals`. |
 | Only `energy_storage` peripherals listed | Draconic Evolution build too old for CC. Update to 3.1.2.604+ (see Compatibility). |
 | `Control loop runs every …s` warning | Server lag. Keep conservative limits. |
+| `Remote log: http://… is blocked: Domain not permitted` | CC:Tweaked denies private/LAN/localhost addresses by default. Add an allow rule for the collector above the `$private` rule in `computercraft-server.toml`, then restart the world or server (see [Logs on a real computer](#logs-on-a-real-computer)). |
+| `Remote log: the http API is not available` | `[http] enabled = false` in `computercraft-server.toml`. Turn it on, or read the files on the host disk instead. |
+| `Remote log: collector unreachable: Connection refused` | The collector is not running, or it listens on `127.0.0.1` while Minecraft runs on another machine (use `--bind 0.0.0.0`), or a firewall blocks the port. Lines wait in the queue and are retried. |
+| `Remote log: collector unreachable: … (HTTP 401)` | `config.logging.remote.token` does not match the collector's `--token`. |
+| `Remote log: N entries were dropped` | The collector was down long enough to fill `maxQueue`. Raise it, or fix the collector sooner. The full log is still on the computer. |
+| Collector folder is missing a computer | The folder is `computer-<id>-<label>`. Run `id` on the computer, and check the collector output: it logs every batch and every rejected request. |
+| `CHARGING STALLED - CHECK INPUT GATE` | The input gate isn't feeding the energy injector: the wrong gate was picked (run `set draconic.inputGate <name>`), it's a fluid gate, or the energy source is empty. |
 
 ## Development
 
 ```text
 main_control.lua       scheduler: loads drivers, one coroutine per unit, UI, input, fail-safe exit
 persist.lua            saved in-game settings and monitor pins (data/manager.db), settings schema
+mek_utils.lua          Mekanism adapters, fission protection + burn governor
+drivers/mekanism.lua   Mekanism fission / fusion / turbine / boiler units
+alarms.lua             speaker / chat box / redstone alarm outputs, silence
+totals.lua             long-term energy totals (data/totals.db)
+updater.lua            update check and install from GitHub
 drivers/draconic.lua   Draconic reactor units (wraps reac_utils)
 drivers/extreme.lua    Extreme / Bigger Reactors units (wraps er_utils)
 drivers/storage.lua    read-only energy storage, meter and Energy Network units
@@ -423,17 +693,23 @@ reac_utils.lua         Draconic discovery, gate adapter, controller (pure logic)
 monitor_utils.lua      overview, unit pages, settings, graphs, navigation, touch hit-testing
 er_utils.lua           Extreme / Bigger Reactors adapters and controllers
 storage_utils.lua      storage adapters per mod API, J->FE, flow tracking, network aggregate
-stat_utils.lua         event log, per-unit stats CSV, rotation
+stat_utils.lua         event log, per-unit stats CSV, rotation, sink hook
+log_shipper.lua        optional remote logging: bounded queue, batched HTTP POST, backoff
 config.lua             user settings
 install.lua            online installer
 offline_install.lua    floppy-disk installer
 tests/                 CC mock, reactor simulator, test suite
+tools/log_collector.py remote log collector (Python 3.8+, standard library only)
 ```
 
-Run the tests with any Lua 5.2+ interpreter from the repository root:
+Every push and pull request runs the tests automatically on GitHub (Lua 5.2
+and 5.4, plus a Lua 5.1 syntax check of every shipped file; see
+`.github/workflows/tests.yml`). To run them yourself, use any Lua 5.2+
+interpreter from the repository root:
 
 ```shell
 lua tests/run_tests.lua
+python3 -m unittest discover -s tools -p "test_*.py"   # log collector
 ```
 
 The suite has controller unit tests and closed-loop runs against an

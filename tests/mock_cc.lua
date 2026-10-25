@@ -251,13 +251,19 @@ function M.removePeripheral(name) registry[name] = nil end
 local queue, timers, nextTimer
 
 function os.clock() return M.time end
+-- CC never returns from a reboot; end the program like Ctrl+T would.
+function os.reboot() M.rebooted = true; error("Terminated", 0) end
 function os.day() return 1 end
 function os.startTimer(delay)
     nextTimer = nextTimer + 1
     timers[nextTimer] = M.time + math.max(delay, 0.05)
     return nextTimer
 end
+function os.cancelTimer(id) timers[id] = nil end
 function os.queueEvent(...) table.insert(queue, {...}) end
+function os.getComputerID() return M.computerId end
+function os.getComputerLabel() return M.computerLabel end
+function os.epoch() return math.floor(M.time * 1000) end
 function os.pullEventRaw(filter) return coroutine.yield(filter) end
 function os.pullEvent(filter)
     local ev = {coroutine.yield(filter)}
@@ -328,6 +334,41 @@ textutils = {
 }
 textutils.unserialise = textutils.unserialize
 
+-- textutils.serializeJSON, transcribed from CC:Tweaked's rom/apis/textutils.lua
+-- (default options: bytes 0x7F-0xFF become \u00XX, control chars escaped).
+do
+    local map = {['"'] = '\\"', ["\\"] = "\\\\", ["\b"] = "\\b", ["\f"] = "\\f",
+                 ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t"}
+    local function hexify(c) return ("\\u00%02X"):format(c:byte()) end
+    for i = 0, 0x1f do
+        local c = string.char(i)
+        if map[c] == nil then map[c] = hexify(c) end
+    end
+    local function str(s)
+        return '"' .. s:gsub('[\0-\31"\\]', map):gsub("[\127-\255]", hexify) .. '"'
+    end
+    local function impl(t)
+        local ty = type(t)
+        if ty == "string" then return str(t) end
+        if ty == "number" or ty == "boolean" then return tostring(t) end
+        assert(ty == "table", "cannot serialize " .. ty)
+        if next(t) == nil then return "{}" end
+        local obj, arr, largest = {}, {}, 0
+        for k, v in pairs(t) do
+            if type(k) == "string" then
+                table.insert(obj, str(k) .. ":" .. impl(v))
+            elseif type(k) == "number" and k > largest then
+                largest = k
+            end
+        end
+        for k = 1, largest do arr[k] = t[k] == nil and "null" or impl(t[k]) end
+        if #obj > 0 or largest == 0 then return "{" .. table.concat(obj, ",") .. "}" end
+        return "[" .. table.concat(arr, ",") .. "]"
+    end
+    textutils.serializeJSON = function(t) return impl(t) end
+    textutils.serialiseJSON = textutils.serializeJSON
+end
+
 ------------------------------------------------------------
 -- MISC APIS
 ------------------------------------------------------------
@@ -360,6 +401,84 @@ function M.reset(opts)
                         {__index = function(_, k) return M.terminal[k] end})
     http = opts.http
     shell = opts.shell
+    M.redstone = {}
+    redstone = {setOutput = function(side, on) M.redstone[side] = on end,
+                getOutput = function(side) return M.redstone[side] or false end}
+    rs = redstone
+    M.computerId, M.computerLabel = 7, opts.label
+end
+
+--[[
+Fake http API with requests answered in virtual time.
+  handler(req, n) -> {code = 200, body = "", latency = s}
+                  or {fail = "Connection refused", latency = s}
+  check(url)      -> ok, err for http.checkURL (default: allowed)
+req = {url, body, headers, timeout, method, time}. Every request is kept
+in api.requests; api.maxInFlight is the peak of concurrent requests.
+http.post/http.get wait for http_success/http_failure like CC's.
+]]
+function M.newHttp(handler, check)
+    local api = {requests = {}, inFlight = 0, maxInFlight = 0}
+    local function handle(code, body)
+        return {getResponseCode = function() return code end,
+                readAll = function() return body or "" end,
+                getResponseHeaders = function() return {} end,
+                close = function() end}
+    end
+    local function deliver(at, ...)
+        if at <= M.time then os.queueEvent(...) else M.schedule(at, ...) end
+    end
+    function api.request(url, body, headers)
+        local req = type(url) == "table" and url or {url = url, body = body, headers = headers}
+        req = {url = req.url, body = req.body, headers = req.headers or {}, timeout = req.timeout,
+               method = req.method or (req.body and "POST" or "GET"), time = M.time}
+        if api.inFlight >= 16 then return false, "Too many ongoing HTTP requests" end
+        table.insert(api.requests, req)
+        api.inFlight = api.inFlight + 1
+        api.maxInFlight = math.max(api.maxInFlight, api.inFlight)
+        local r = handler(req, #api.requests) or {code = 200}
+        local latency = r.latency or 0
+        local limit = req.timeout or 30
+        local at
+        if latency > limit then
+            at = M.time + limit
+            deliver(at, "http_failure", req.url, "Timed out")
+        elseif r.fail then
+            at = M.time + latency
+            deliver(at, "http_failure", req.url, r.fail)
+        elseif r.code and (r.code < 200 or r.code >= 300) then
+            at = M.time + latency
+            deliver(at, "http_failure", req.url, r.reason or ("HTTP " .. r.code), handle(r.code, r.body))
+        else
+            at = M.time + latency
+            deliver(at, "http_success", req.url, handle(r.code or 200, r.body))
+        end
+        return true
+    end
+    local function wait(url, ok, err)
+        if not ok then return nil, err end
+        while true do
+            local ev, u, a, b = os.pullEvent()
+            if (ev == "http_success" or ev == "http_failure") and u == url then
+                api.inFlight = api.inFlight - 1
+                if ev == "http_success" then return a end
+                return nil, a, b
+            end
+        end
+    end
+    function api.post(url, body, headers)
+        if type(url) == "table" then return wait(url.url, api.request(url)) end
+        return wait(url, api.request(url, body, headers))
+    end
+    function api.get(url, headers)
+        if type(url) == "table" then return wait(url.url, api.request(url)) end
+        return wait(url, api.request({url = url, headers = headers}))
+    end
+    function api.checkURL(url)
+        if check then return check(url) end
+        return true
+    end
+    return api
 end
 
 function M.capture(...)

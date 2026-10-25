@@ -420,6 +420,8 @@ local INNER_TAU_TICKS = 20
 -- Manual mode uses the smaller fraction: an abrupt 2x output step on
 -- DE 1.16+ heats the core ~400C per tick.
 local OUTPUT_SLEW_FRACTION = 0.05
+-- Seconds of warm-up without progress before the charging alarm.
+local CHARGE_STALL_SECONDS = 30
 local MANUAL_SLEW_FRACTION = 0.01
 local OUTPUT_SLEW_FLOOR = 20000
 -- Manual mode interlock: temperature rise rate (C/s) above target.
@@ -550,6 +552,27 @@ function Controller:limitIncrease(target, info, fraction)
     return clamp(target, 0, self.cfg.maxOutflow)
 end
 
+-- Charging that makes no progress means the input gate is not reaching
+-- the energy injector: the wrong gate, a fluid gate (DE reports fluid
+-- and flux gates identically), or no power behind it.
+function Controller:checkChargeProgress(info, now, actions)
+    local progress = info.fieldPct + info.satPct + info.temperature / 10000
+    if not self.chargeProgress or progress > self.chargeProgress + 1e-4 then
+        self.chargeProgress, self.chargeProgressAt = progress, now
+        self.chargeStallWarned = false
+        return
+    end
+    if now - self.chargeProgressAt >= CHARGE_STALL_SECONDS then
+        table.insert(self.alarms, "CHARGING STALLED - CHECK INPUT GATE")
+        if not self.chargeStallWarned then
+            self.chargeStallWarned = true
+            emit(actions, "WARN", string.format(
+                "Charging made no progress for %ds: the input gate is not feeding the energy "
+                .. "injector (wrong gate, a fluid gate, or no power behind it)", CHARGE_STALL_SECONDS))
+        end
+    end
+end
+
 function Controller:commandReady(name, now)
     local last = self.lastCommandAt[name]
     if last and now - last < COMMAND_COOLDOWN then
@@ -655,10 +678,32 @@ function Controller:step(info, now)
     elseif status == "stopping" then
         actions.input = self:fieldInput(info)
         actions.output = 0
+        -- Draconic Evolution lets a stopping reactor be re-activated while
+        -- it is above 2000C, so a trip need not wait for a full cooldown
+        -- and recharge: resume once it has cooled to safeTemperature and
+        -- the field is back near its target.
+        local tripAllows = (self.trip == nil)
+            or (self.trip.restartable and c.autoRestart and self:restartBudgetLeft(now))
+        if self.desired == "run" and tripAllows and not lowFuel
+                and info.temperature >= WARM_TEMPERATURE
+                and info.temperature <= c.safeTemperature
+                and info.fieldPct >= c.targetField * 0.9 then
+            if self:commandReady("activate", now) then
+                actions.command = "activate"
+                if self.trip then
+                    table.insert(self.autoRestarts, now)
+                    emit(actions, "WARN", "Resuming without cooldown after trip: " .. self.trip.reason)
+                else
+                    emit(actions, "INFO", "Resuming reactor")
+                end
+                self.trip = nil
+            end
+        end
 
     elseif status == "warming_up" then
         actions.input = clamp(c.chargeInflow, 0, c.maxInflow)
         actions.output = 0
+        self:checkChargeProgress(info, now, actions)
         if self.desired == "stop" then
             if self:commandReady("stop", now) then actions.command = "stop" end
         elseif info.temperature >= WARM_TEMPERATURE

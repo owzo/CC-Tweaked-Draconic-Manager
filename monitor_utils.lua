@@ -164,6 +164,9 @@ local function bar(win, y, width, pct, color)
 end
 
 local function labelValue(win, y, width, label, value, color)
+    -- The value wins: a long label is cut rather than overlapped.
+    local room = width - #value - 3
+    if #label > room then label = label:sub(1, math.max(0, room)) end
     text(win, 2, y, label, colors.white)
     text(win, width - #value, y, value, color or colors.white)
 end
@@ -403,8 +406,9 @@ function LAYOUTS.fission(model, w)
     gap(BARS, "bars")
 
     local fuel = ok and (d.fuelMax or 0) > 0 and d.fuel / d.fuelMax or 0
+    local waste = ok and (d.fuelMax or 0) > 0 and (d.waste or 0) / d.fuelMax or 0
     local fuelC = pctColor(fuel, lim.lowFuel or 0.1, (lim.lowFuel or 0.1) * 3)
-    lr("Fuel", string.format("%.1f%%", fuel * 100), fuelC)
+    lr(string.format("Fuel  Waste %.0f%%", waste * 100), string.format("%.1f%%", fuel * 100), fuelC)
     bar(fuel, fuelC)
     return page.controls()
 end
@@ -441,6 +445,99 @@ function LAYOUTS.turbine(model, w)
     lr("Energy Buffer", string.format("%.1f%%", level * 100), colors.white)
     bar(level, colors.blue)
     return page.controls()
+end
+
+-- Mekanism ---------------------------------------------------------------
+local function mekStatus(d, onText)
+    if not d then return "NO SIGNAL", colors.red end
+    if d.formed == false then return "NOT FORMED", colors.orange end
+    return onText, colors.green
+end
+
+local function fracBar(page, label, v, color)
+    page.lr(label, v and string.format("%.1f%%", v * 100) or "--", color)
+    page.bar(v or 0, color)
+end
+
+function LAYOUTS.mek_fission(model, w)
+    local d, ctl, lim = model.data or {}, model.controller, model.limits
+    local page = newPage(model)
+    local status, color
+    if ctl.trip then
+        status, color = "SCRAMMED", colors.red
+    else
+        status, color = mekStatus(model.data, d.active and "ACTIVE" or "OFF")
+        if model.data and model.data.formed ~= false and not d.active then color = colors.lightGray end
+    end
+    page.header("Fission Status", status, color)
+    page.lr("Burn", string.format("%.1f / %.1f mB/t", d.burnRate or 0, lim.targetBurnRate or d.burnRate or 0),
+            colors.lime)
+    page.buttons({{"-10", "burn:-10", colors.gray}, {"-1", "burn:-1", colors.gray},
+                  {"+1", "burn:1", colors.gray}, {"+10", "burn:10", colors.gray}})
+    local t = d.temperature or 0
+    local tc = t >= lim.maxTemperature - lim.tempMargin and colors.orange or colors.green
+    if t >= lim.maxTemperature then tc = colors.red end
+    page.lr(string.format("Temp (scram %d)", lim.maxTemperature), formatInt(t) .. "K", tc)
+    page.bar(t / 1200, tc)
+    page.lr("Damage", string.format("%d%%", d.damage or 0), (d.damage or 0) > 0 and colors.red or colors.green)
+    page.gap(BARS, "bars")
+    fracBar(page, "Coolant", d.coolant, pctColor(d.coolant or 0, lim.minCoolant, lim.minCoolant * 2))
+    fracBar(page, "Heated Coolant", d.heated, (d.heated or 0) > 0.8 and colors.orange or colors.lightBlue)
+    page.gap(BARS, "bars")
+    fracBar(page, string.format("Fuel  Waste %.0f%%", (d.waste or 0) * 100), d.fuel,
+            pctColor(d.fuel or 0, lim.lowFuel or 0.05, (lim.lowFuel or 0.05) * 3))
+    page.gap(CONTROLS)
+    page.buttons({{"START", "start", colors.green}, {"SCRAM", "stop", colors.red}})
+    page.add({kind = "footer"})
+    return page.items
+end
+
+function LAYOUTS.mek_turbine(model, w)
+    local d = model.data or {}
+    local page = newPage(model)
+    page.header("Turbine Status", mekStatus(model.data, "ONLINE"))
+    page.lr("Generation", fitRate("Generation", d.production or 0, w, " FE/t"), colors.lime)
+    page.lr("Steam Flow", formatInt(d.flow or 0) .. " mB/t", colors.lightBlue)
+    page.lr("Dumping", tostring(d.dumping or "--"), colors.white)
+    page.gap(BARS, "bars")
+    fracBar(page, "Steam", d.steam, (d.steam or 0) > 0.9 and colors.orange or colors.lightBlue)
+    page.gap(BARS, "bars")
+    local e = (d.maxEnergy or 0) > 0 and d.energy / d.maxEnergy or nil
+    fracBar(page, "Energy Buffer", e, colors.blue)
+    page.gap(CONTROLS)
+    page.add({kind = "footer"})
+    return page.items
+end
+
+function LAYOUTS.mek_boiler(model, w)
+    local d = model.data or {}
+    local page = newPage(model)
+    page.header("Boiler Status", mekStatus(model.data, "ONLINE"))
+    page.lr("Boil Rate", formatInt(d.boilRate or 0) .. " mB/t", colors.lime)
+    page.lr("Temperature", formatInt(d.temperature or 0) .. "K", colors.orange)
+    page.gap(BARS, "bars")
+    fracBar(page, "Water", d.water, pctColor(d.water or 0, 0.1, 0.3))
+    page.gap(BARS, "bars")
+    fracBar(page, "Steam", d.steam, colors.lightBlue)
+    page.gap(CONTROLS)
+    page.add({kind = "footer"})
+    return page.items
+end
+
+function LAYOUTS.mek_fusion(model, w)
+    local d = model.data or {}
+    local page = newPage(model)
+    page.header("Fusion Status", mekStatus(model.data, d.ignited and "IGNITED" or "COLD"))
+    page.lr("Generation", fitRate("Generation", d.production or 0, w, " FE/t"), colors.lime)
+    page.lr("Plasma", monitor_utils.formatRF(d.plasma or 0) .. "K", colors.orange)
+    page.lr("Case", monitor_utils.formatRF(d.case or 0) .. "K", colors.orange)
+    page.lr("Injection", tostring(d.injection or "--"), colors.lightBlue)
+    page.buttons({{"-2", "inj:-2", colors.gray}, {"+2", "inj:2", colors.gray}})
+    page.gap(BARS, "bars")
+    fracBar(page, "D-T Fuel", d.dtFuel, pctColor(d.dtFuel or 0, 0.05, 0.2))
+    page.gap(CONTROLS)
+    page.add({kind = "footer"})
+    return page.items
 end
 
 local function buildLayout(model, w)
@@ -617,6 +714,39 @@ function CARDS.turbine(m)
         formatInt(d.rpm) .. " RPM", rc, d.rpm / lim.maxRPM, rc, d.produced or 0
 end
 
+function CARDS.mek_fission(m)
+    local d, ctl = m.data, m.controller
+    if not d or d.formed == false then
+        return d and "NOT FORMED" or "NO SIGNAL", colors.orange, "--", "--", colors.gray, 0, colors.gray, 0
+    end
+    local status = ctl.trip and "SCRAMMED" or (d.active and "ACTIVE" or "OFF")
+    local sc = ctl.trip and colors.red or (d.active and colors.green or colors.lightGray)
+    local cc = pctColor(d.coolant or 0, m.limits.minCoolant, m.limits.minCoolant * 2)
+    return status, sc, string.format("Burn %.1f mB/t", d.burnRate or 0),
+        formatInt(d.temperature or 0) .. "K", (d.damage or 0) > 0 and colors.red or colors.green,
+        d.coolant or 0, cc, 0
+end
+
+local function mekSimple(line, value, pct)
+    return function(m)
+        local d = m.data
+        if not d or d.formed == false then
+            return d and "NOT FORMED" or "NO SIGNAL", colors.orange, "--", "--", colors.gray, 0, colors.gray, 0
+        end
+        return "ONLINE", colors.green, line(d), value(d), colors.white, pct(d) or 0, colors.lightBlue,
+            (m.kind == "mek_turbine" or m.kind == "mek_fusion") and (d.production or 0) or 0
+    end
+end
+CARDS.mek_turbine = mekSimple(function(d) return "Gen " .. monitor_utils.formatRF(d.production or 0) .. " FE/t" end,
+    function(d) return string.format("Steam %.0f%%", (d.steam or 0) * 100) end,
+    function(d) return d.steam end)
+CARDS.mek_boiler = mekSimple(function(d) return "Boil " .. formatInt(d.boilRate or 0) .. " mB/t" end,
+    function(d) return string.format("Water %.0f%%", (d.water or 0) * 100) end,
+    function(d) return d.water end)
+CARDS.mek_fusion = mekSimple(function(d) return "Gen " .. monitor_utils.formatRF(d.production or 0) .. " FE/t" end,
+    function(d) return d.ignited and "IGNITED" or "COLD" end,
+    function(d) return d.dtFuel end)
+
 function CARDS.storage(m)
     local i = m.info
     if not i or not i.max then
@@ -657,8 +787,9 @@ local function buildOverview(units, w, h, view)
         local a = m.controller and m.controller.alarms and m.controller.alarms[1]
         if a then table.insert(alarms, m.name .. ": " .. a) end
     end
-    page.add({kind = "lr", label = "Overview", value = "Total " .. monitor_utils.formatRF(total) .. " rf/t",
-              color = colors.lime})
+    -- Tap the header for the System page (version, updates, totals, alarms).
+    page.add({kind = "lr", label = "[i] Overview", value = monitor_utils.formatRF(total) .. " rf/t",
+              color = colors.lime, action = "nav:system"})
     -- Energy network line (consumption, storage flow and charge) when any
     -- storage is attached.
     local headerRows = 2
@@ -761,6 +892,26 @@ local function metricsOf(m)
             {"Generation", d.produced, nil, colors.lime, "rate"},
             {"Steam Flow", d.flow, d.flowLimit, colors.lightBlue, "int"}
         }
+    elseif m.kind == "mek_fission" then
+        local d = m.data or {}
+        return {
+            {"Temperature K", d.temperature, 1200, colors.orange, "int"},
+            {"Burn mB/t", d.burnRate, d.maxBurnRate, colors.lime, "num"},
+            {"Coolant", d.coolant, 1, colors.lightBlue, "pct"},
+            {"Heated", d.heated, 1, colors.blue, "pct"}
+        }
+    elseif m.kind == "mek_turbine" then
+        local d = m.data or {}
+        return {{"Generation", d.production, nil, colors.lime, "rate"},
+                {"Steam", d.steam, 1, colors.lightBlue, "pct"}}
+    elseif m.kind == "mek_boiler" then
+        local d = m.data or {}
+        return {{"Boil mB/t", d.boilRate, d.maxBoilRate, colors.lime, "int"},
+                {"Water", d.water, 1, colors.lightBlue, "pct"}}
+    elseif m.kind == "mek_fusion" then
+        local d = m.data or {}
+        return {{"Generation", d.production, nil, colors.lime, "rate"},
+                {"Plasma K", d.plasma, nil, colors.orange, "rate"}}
     elseif m.kind == "storage" then
         local i = m.info
         return {
@@ -802,6 +953,7 @@ local function fmtMetric(v, fmt)
     if fmt == "temp" then return formatInt(v) .. "C" end
     if fmt == "pct" then return string.format("%.1f%%", v * 100) end
     if fmt == "rate" then return monitor_utils.formatRF(v) end
+    if fmt == "num" then return string.format("%.1f", v) end
     return formatInt(v)
 end
 
@@ -811,6 +963,14 @@ local function buildGraphs(model, w, h)
     page.nav(model.name .. " Graphs")
     local metrics = metricsOf(model)
     local hist = history[model.id] or {}
+    -- Energy per hour over the last day, from the long-term totals.
+    if model.hourly then
+        local hourly = {}
+        for i, v in ipairs(model.hourly) do hourly[i] = v end
+        table.insert(metrics, 1, {"Energy/h (24h)", hourly[#hourly], nil, colors.yellow, "rate"})
+        hist = {hourly}
+        for i, series in pairs(history[model.id] or {}) do hist[i + 1] = series end
+    end
     -- Fit as many charts as leave at least 3 rows each.
     local free = h - 3                     -- top gap, nav, footer
     local charts = math.max(1, math.min(#metrics, math.floor(free / 4)))
@@ -835,6 +995,49 @@ local function buildGraphs(model, w, h)
                       rows = rows, color = color, width = width})
         end
     end
+    page.add({kind = "footer"})
+    return page.items
+end
+
+------------------------------------------------------------
+-- SYSTEM PAGE
+------------------------------------------------------------
+--[[
+view.system = {
+  version, update = {text, color, confirm}, alarms = {count, silenced},
+  hourly = network energy per hour (oldest first), lifetime
+}
+]]
+local function buildSystem(view, w, h)
+    local sys = view.system or {}
+    local page = newPage({nav = {back = true, page = "system"}, name = "System"})
+    page.gap(TOP)
+    page.buttons({{"<", "nav:overview", colors.gray}, {"System", "noop", colors.blue}}, {3, nil})
+    page.lr("Version", "v" .. tostring(sys.version or "?"), colors.white)
+    local upd = sys.update or {}
+    page.lr("Update", upd.text or "not checked", upd.color or colors.lightGray)
+    page.buttons({{"CHECK", "sys:check", colors.gray},
+                  {upd.confirm and "CONFIRM" or "UPDATE", "sys:update",
+                   upd.confirm and colors.orange or colors.blue}})
+    page.gap(BARS)
+    local hourly = sys.hourly or {}
+    local today = 0
+    for _, v in ipairs(hourly) do today = today + v end
+    page.lr("Energy 24h", monitor_utils.formatRF(today), colors.lime)
+    page.lr("Lifetime", monitor_utils.formatRF(sys.lifetime or 0), colors.lime)
+    local hi = 1
+    for _, v in ipairs(hourly) do hi = math.max(hi, v) end
+    local rows = math.max(1, math.min(4, h - 13))
+    for r = 1, rows do
+        page.add({kind = "graph", samples = hourly, lo = 0, hi = hi, row = r, rows = rows,
+                  color = colors.yellow, width = w - 2})
+    end
+    page.gap(BARS)
+    local al = sys.alarms or {}
+    page.lr("Alarms", (al.count or 0) == 0 and "none"
+            or (tostring(al.count) .. (al.silenced and " (silenced)" or " active")),
+            (al.count or 0) == 0 and colors.green or colors.red)
+    page.buttons({{"SILENCE", "alarm:silence", colors.gray}})
     page.add({kind = "footer"})
     return page.items
 end
@@ -894,6 +1097,8 @@ local function drawItems(target, items, model)
                 win.setCursorPos(1, y)
                 win.write(string.rep(" ", w))
                 centered(win, y, alarm:sub(1, w), colors.white, colors.red, w)
+                -- Tapping the alarm bar silences repeating alarm sounds.
+                table.insert(target.buttons, {x1 = 1, x2 = w, y = y, action = "alarm:silence"})
             elseif model.events and model.events[1] then
                 text(win, 2, y, model.events[1].message:sub(1, w - 2), colors.gray)
             end
@@ -937,8 +1142,10 @@ local function pageFor(name, view)
     else
         pinned = nil
     end
-    if v.page ~= "overview" and not findUnit(units, v.unit) then v.page = "overview" end
-    if #units == 1 and v.page == "overview" then
+    if v.page ~= "overview" and v.page ~= "system" and not findUnit(units, v.unit) then
+        v.page = "overview"
+    end
+    if #units == 1 and v.page == "overview" and not v.chosenOverview then
         v.page, v.unit = "detail", units[1].id
     end
     return v, pinned
@@ -963,6 +1170,10 @@ local function renderTarget(target, view)
 
     local v, pinned = pageFor(target.name, view)
     target.view = v
+    if v.page == "system" then
+        drawItems(target, fitLayout(buildSystem(view, w, h), h) or {}, {events = view.events})
+        return
+    end
     if v.page == "overview" then
         drawItems(target, fitLayout(buildOverview(units, w, h, v), h) or {}, {events = view.events})
         return
@@ -971,8 +1182,9 @@ local function renderTarget(target, view)
     local model = {}
     for k, val in pairs(findUnit(units, v.unit)) do model[k] = val end
     model.core, model.events = view.core, view.events
+    model.hourly = view.hourlyFor and view.hourlyFor(model.id) or nil
     model.formatSetting = view.formatSetting or function(_, val) return tostring(val) end
-    model.nav = {back = not pinned and #units > 1, pinned = pinned ~= nil, page = v.page}
+    model.nav = {back = not pinned, pinned = pinned ~= nil, page = v.page}
     if v.page == "settings" and not (model.settings and #model.settings > 0) then v.page = "detail" end
 
     local items
@@ -1033,6 +1245,9 @@ function monitor_utils.handleTouch(name, x, y)
                 v.page, v.unit = "detail", unitId
             elseif a == "nav:overview" then
                 v.page = "overview"
+                v.chosenOverview = true
+            elseif a == "nav:system" then
+                v.page = "system"
             elseif a == "nav:detail" or a == "nav:graphs" or a == "nav:settings" then
                 v.page = a:sub(5)
             elseif a == "ovr:next" then
