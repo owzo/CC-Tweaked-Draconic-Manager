@@ -20,11 +20,29 @@ On exit (Ctrl+T or a crash) the gates are left in the fail-safe
 position: output at zero and input at twice the last field demand.
 ]]
 
-local config            = require("config")
-local reac_utils        = require("reac_utils")
-local monitor_utils     = require("monitor_utils")
-local stat_utils        = require("stat_utils")
-local energy_core_utils = require("energy_core_utils")
+-- `require` only exists for programs started by the shell. When launched
+-- another way (os.run, dofile, os.loadAPI, an old startup file) fall back
+-- to loading the module file from this program's directory.
+local function import(name)
+    if type(require) == "function" then
+        return require(name)
+    end
+    local dir = ""
+    if shell and shell.getRunningProgram then
+        dir = fs.getDir(shell.getRunningProgram())
+    end
+    local path = fs.combine(dir, name .. ".lua")
+    if not fs.exists(path) then
+        error("Missing " .. path .. " - run the installer again", 0)
+    end
+    return dofile(path)
+end
+
+local config            = import("config")
+local reac_utils        = import("reac_utils")
+local monitor_utils     = import("monitor_utils")
+local stat_utils        = import("stat_utils")
+local energy_core_utils = import("energy_core_utils")
 
 local VERSION = "3.0"
 local LINK_LOST_LIMIT = 10     -- consecutive failed reads before rediscovery
