@@ -447,6 +447,99 @@ function LAYOUTS.turbine(model, w)
     return page.controls()
 end
 
+-- Mekanism ---------------------------------------------------------------
+local function mekStatus(d, onText)
+    if not d then return "NO SIGNAL", colors.red end
+    if d.formed == false then return "NOT FORMED", colors.orange end
+    return onText, colors.green
+end
+
+local function fracBar(page, label, v, color)
+    page.lr(label, v and string.format("%.1f%%", v * 100) or "--", color)
+    page.bar(v or 0, color)
+end
+
+function LAYOUTS.mek_fission(model, w)
+    local d, ctl, lim = model.data or {}, model.controller, model.limits
+    local page = newPage(model)
+    local status, color
+    if ctl.trip then
+        status, color = "SCRAMMED", colors.red
+    else
+        status, color = mekStatus(model.data, d.active and "ACTIVE" or "OFF")
+        if model.data and model.data.formed ~= false and not d.active then color = colors.lightGray end
+    end
+    page.header("Fission Status", status, color)
+    page.lr("Burn", string.format("%.1f / %.1f mB/t", d.burnRate or 0, lim.targetBurnRate or d.burnRate or 0),
+            colors.lime)
+    page.buttons({{"-10", "burn:-10", colors.gray}, {"-1", "burn:-1", colors.gray},
+                  {"+1", "burn:1", colors.gray}, {"+10", "burn:10", colors.gray}})
+    local t = d.temperature or 0
+    local tc = t >= lim.maxTemperature - lim.tempMargin and colors.orange or colors.green
+    if t >= lim.maxTemperature then tc = colors.red end
+    page.lr(string.format("Temp (scram %d)", lim.maxTemperature), formatInt(t) .. "K", tc)
+    page.bar(t / 1200, tc)
+    page.lr("Damage", string.format("%d%%", d.damage or 0), (d.damage or 0) > 0 and colors.red or colors.green)
+    page.gap(BARS, "bars")
+    fracBar(page, "Coolant", d.coolant, pctColor(d.coolant or 0, lim.minCoolant, lim.minCoolant * 2))
+    fracBar(page, "Heated Coolant", d.heated, (d.heated or 0) > 0.8 and colors.orange or colors.lightBlue)
+    page.gap(BARS, "bars")
+    fracBar(page, string.format("Fuel  Waste %.0f%%", (d.waste or 0) * 100), d.fuel,
+            pctColor(d.fuel or 0, lim.lowFuel or 0.05, (lim.lowFuel or 0.05) * 3))
+    page.gap(CONTROLS)
+    page.buttons({{"START", "start", colors.green}, {"SCRAM", "stop", colors.red}})
+    page.add({kind = "footer"})
+    return page.items
+end
+
+function LAYOUTS.mek_turbine(model, w)
+    local d = model.data or {}
+    local page = newPage(model)
+    page.header("Turbine Status", mekStatus(model.data, "ONLINE"))
+    page.lr("Generation", fitRate("Generation", d.production or 0, w, " FE/t"), colors.lime)
+    page.lr("Steam Flow", formatInt(d.flow or 0) .. " mB/t", colors.lightBlue)
+    page.lr("Dumping", tostring(d.dumping or "--"), colors.white)
+    page.gap(BARS, "bars")
+    fracBar(page, "Steam", d.steam, (d.steam or 0) > 0.9 and colors.orange or colors.lightBlue)
+    page.gap(BARS, "bars")
+    local e = (d.maxEnergy or 0) > 0 and d.energy / d.maxEnergy or nil
+    fracBar(page, "Energy Buffer", e, colors.blue)
+    page.gap(CONTROLS)
+    page.add({kind = "footer"})
+    return page.items
+end
+
+function LAYOUTS.mek_boiler(model, w)
+    local d = model.data or {}
+    local page = newPage(model)
+    page.header("Boiler Status", mekStatus(model.data, "ONLINE"))
+    page.lr("Boil Rate", formatInt(d.boilRate or 0) .. " mB/t", colors.lime)
+    page.lr("Temperature", formatInt(d.temperature or 0) .. "K", colors.orange)
+    page.gap(BARS, "bars")
+    fracBar(page, "Water", d.water, pctColor(d.water or 0, 0.1, 0.3))
+    page.gap(BARS, "bars")
+    fracBar(page, "Steam", d.steam, colors.lightBlue)
+    page.gap(CONTROLS)
+    page.add({kind = "footer"})
+    return page.items
+end
+
+function LAYOUTS.mek_fusion(model, w)
+    local d = model.data or {}
+    local page = newPage(model)
+    page.header("Fusion Status", mekStatus(model.data, d.ignited and "IGNITED" or "COLD"))
+    page.lr("Generation", fitRate("Generation", d.production or 0, w, " FE/t"), colors.lime)
+    page.lr("Plasma", monitor_utils.formatRF(d.plasma or 0) .. "K", colors.orange)
+    page.lr("Case", monitor_utils.formatRF(d.case or 0) .. "K", colors.orange)
+    page.lr("Injection", tostring(d.injection or "--"), colors.lightBlue)
+    page.buttons({{"-2", "inj:-2", colors.gray}, {"+2", "inj:2", colors.gray}})
+    page.gap(BARS, "bars")
+    fracBar(page, "D-T Fuel", d.dtFuel, pctColor(d.dtFuel or 0, 0.05, 0.2))
+    page.gap(CONTROLS)
+    page.add({kind = "footer"})
+    return page.items
+end
+
 local function buildLayout(model, w)
     return (LAYOUTS[model.kind] or LAYOUTS.draconic)(model, w)
 end
@@ -537,6 +630,39 @@ function CARDS.turbine(m)
     return mode[1], mode[2], "Gen " .. monitor_utils.formatRF(d.produced or 0) .. " FE/t",
         formatInt(d.rpm) .. " RPM", rc, d.rpm / lim.maxRPM, rc, d.produced or 0
 end
+
+function CARDS.mek_fission(m)
+    local d, ctl = m.data, m.controller
+    if not d or d.formed == false then
+        return d and "NOT FORMED" or "NO SIGNAL", colors.orange, "--", "--", colors.gray, 0, colors.gray, 0
+    end
+    local status = ctl.trip and "SCRAMMED" or (d.active and "ACTIVE" or "OFF")
+    local sc = ctl.trip and colors.red or (d.active and colors.green or colors.lightGray)
+    local cc = pctColor(d.coolant or 0, m.limits.minCoolant, m.limits.minCoolant * 2)
+    return status, sc, string.format("Burn %.1f mB/t", d.burnRate or 0),
+        formatInt(d.temperature or 0) .. "K", (d.damage or 0) > 0 and colors.red or colors.green,
+        d.coolant or 0, cc, 0
+end
+
+local function mekSimple(line, value, pct)
+    return function(m)
+        local d = m.data
+        if not d or d.formed == false then
+            return d and "NOT FORMED" or "NO SIGNAL", colors.orange, "--", "--", colors.gray, 0, colors.gray, 0
+        end
+        return "ONLINE", colors.green, line(d), value(d), colors.white, pct(d) or 0, colors.lightBlue,
+            (m.kind == "mek_turbine" or m.kind == "mek_fusion") and (d.production or 0) or 0
+    end
+end
+CARDS.mek_turbine = mekSimple(function(d) return "Gen " .. monitor_utils.formatRF(d.production or 0) .. " FE/t" end,
+    function(d) return string.format("Steam %.0f%%", (d.steam or 0) * 100) end,
+    function(d) return d.steam end)
+CARDS.mek_boiler = mekSimple(function(d) return "Boil " .. formatInt(d.boilRate or 0) .. " mB/t" end,
+    function(d) return string.format("Water %.0f%%", (d.water or 0) * 100) end,
+    function(d) return d.water end)
+CARDS.mek_fusion = mekSimple(function(d) return "Gen " .. monitor_utils.formatRF(d.production or 0) .. " FE/t" end,
+    function(d) return d.ignited and "IGNITED" or "COLD" end,
+    function(d) return d.dtFuel end)
 
 function CARDS.storage(m)
     local i = m.info
@@ -649,6 +775,26 @@ local function metricsOf(m)
             {"Generation", d.produced, nil, colors.lime, "rate"},
             {"Steam Flow", d.flow, d.flowLimit, colors.lightBlue, "int"}
         }
+    elseif m.kind == "mek_fission" then
+        local d = m.data or {}
+        return {
+            {"Temperature K", d.temperature, 1200, colors.orange, "int"},
+            {"Burn mB/t", d.burnRate, d.maxBurnRate, colors.lime, "num"},
+            {"Coolant", d.coolant, 1, colors.lightBlue, "pct"},
+            {"Heated", d.heated, 1, colors.blue, "pct"}
+        }
+    elseif m.kind == "mek_turbine" then
+        local d = m.data or {}
+        return {{"Generation", d.production, nil, colors.lime, "rate"},
+                {"Steam", d.steam, 1, colors.lightBlue, "pct"}}
+    elseif m.kind == "mek_boiler" then
+        local d = m.data or {}
+        return {{"Boil mB/t", d.boilRate, d.maxBoilRate, colors.lime, "int"},
+                {"Water", d.water, 1, colors.lightBlue, "pct"}}
+    elseif m.kind == "mek_fusion" then
+        local d = m.data or {}
+        return {{"Generation", d.production, nil, colors.lime, "rate"},
+                {"Plasma K", d.plasma, nil, colors.orange, "rate"}}
     elseif m.kind == "storage" then
         local i = m.info
         return {
@@ -677,6 +823,7 @@ local function fmtMetric(v, fmt)
     if fmt == "temp" then return formatInt(v) .. "C" end
     if fmt == "pct" then return string.format("%.1f%%", v * 100) end
     if fmt == "rate" then return monitor_utils.formatRF(v) end
+    if fmt == "num" then return string.format("%.1f", v) end
     return formatInt(v)
 end
 

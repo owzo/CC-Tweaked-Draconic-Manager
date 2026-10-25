@@ -143,6 +143,7 @@ function persist.format(item, value)
     if item.fmt == "pct" then return string.format("%d%%", math.floor(value * 100 + 0.5)) end
     if item.fmt == "temp" then return int(value) .. "C" end
     if item.fmt == "num" then return string.format("%.1f", value) end
+    if item.fmt == "int" then return int(value) end
     return int(value)
 end
 

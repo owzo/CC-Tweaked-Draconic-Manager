@@ -55,7 +55,7 @@ local UPDATE_CONFIRM_SECONDS = 10
 
 -- Every driver is optional: a missing or broken driver file only removes
 -- that mod's support. Drivers whose mod is not attached find no units.
-local DRIVERS = {"drivers.draconic", "drivers.extreme", "drivers.energy_core"}
+local DRIVERS = {"drivers.draconic", "drivers.extreme", "drivers.mekanism", "drivers.energy_core"}
 
 local state = {
     units = {},                -- every discovered unit, in driver order
