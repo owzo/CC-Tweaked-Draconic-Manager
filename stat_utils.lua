@@ -18,6 +18,13 @@ Single logging subsystem for the whole program.
 
 Files are rotated to "<name>.old" once they exceed maxFileBytes so the
 computer's limited disk space (1 MB by default) can never fill up.
+
+- stat_utils.addSink(fn)       Also hand every written line to
+                               fn(fileName, line, csvHeader) (used by
+                               log_shipper). fileName is relative, e.g.
+                               "draconic.log"; csvHeader is the CSV header
+                               line for .csv files. Returns a remover.
+                               Sinks must not yield; errors are ignored.
 ]]
 
 local stat_utils = {}
@@ -32,6 +39,10 @@ local settings = {
     printLevel    = "WARN"
 }
 local lastStatsAt = {}      -- csv key -> last write time
+local sinks = {}
+-- Lines written before the first sink is added (remote logging only),
+-- replayed to it so startup messages are shipped too.
+local early, EARLY_LIMIT = nil, 200
 
 stat_utils.recent = {}
 
@@ -65,7 +76,19 @@ local function rotateIfNeeded(file)
     end
 end
 
-local function append(file, line)
+local function notify(file, line, header)
+    local name = fs.getName(file)
+    if early then
+        table.insert(early, {name, line, header})
+        if #early > EARLY_LIMIT then table.remove(early, 1) end
+    end
+    for _, sink in ipairs(sinks) do
+        pcall(sink, name, line, header)
+    end
+end
+
+local function append(file, line, header)
+    notify(file, line, header)
     local ok = pcall(function()
         rotateIfNeeded(file)
         local handle = fs.open(file, "a")
@@ -89,6 +112,22 @@ function stat_utils.init(loggingConfig)
     end
     lastStatsAt = {}
     stat_utils.recent = {}
+    local remote = settings.remote
+    early = (type(remote) == "table" and remote.enabled == true and #sinks == 0) and {} or nil
+end
+
+function stat_utils.addSink(fn)
+    table.insert(sinks, fn)
+    local backlog = early
+    early = nil
+    for _, e in ipairs(backlog or {}) do
+        pcall(fn, e[1], e[2], e[3])
+    end
+    return function()
+        for i, f in ipairs(sinks) do
+            if f == fn then table.remove(sinks, i); return end
+        end
+    end
 end
 
 function stat_utils.log(level, message)
@@ -120,8 +159,9 @@ function stat_utils.recordRow(key, columns, row, force)
     lastStatsAt[key] = t
 
     local file = path(key .. ".csv")
+    local header = "time," .. table.concat(columns, ",")
     if not fs.exists(file) then
-        append(file, "time," .. table.concat(columns, ","))
+        append(file, header, header)
     end
     local cells = {timestamp()}
     for _, col in ipairs(columns) do
@@ -131,7 +171,7 @@ function stat_utils.recordRow(key, columns, row, force)
         end
         table.insert(cells, v == nil and "" or tostring(v))
     end
-    append(file, table.concat(cells, ","))
+    append(file, table.concat(cells, ","), header)
     return true
 end
 

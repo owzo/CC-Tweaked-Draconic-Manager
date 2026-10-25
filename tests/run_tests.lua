@@ -11,13 +11,14 @@ local cc = require("mock_cc")
 local Sim = require("reactor_sim")
 
 local MODULES = {"config", "reac_utils", "monitor_utils", "stat_utils",
-                 "energy_core_utils"}
+                 "energy_core_utils", "log_shipper"}
 local TICK = 0.05
 
 -- Everything the installers must ship; MODULE_FILES are loaded by
 -- main_control and must never call require themselves.
 PROGRAM_FILES = {"main_control.lua", "config.lua", "reac_utils.lua", "monitor_utils.lua",
                  "stat_utils.lua", "energy_core_utils.lua", "er_utils.lua", "persist.lua",
+                 "log_shipper.lua",
                  "drivers/draconic.lua", "drivers/extreme.lua", "drivers/energy_core.lua"}
 MODULE_FILES = {}
 for _, f in ipairs(PROGRAM_FILES) do
@@ -991,6 +992,328 @@ test("main_control starts without require (issue 3: os.run / dofile)", function(
     local out = cc.outputText()
     check(not out:find("attempt to call"), "require error:\n%s", out)
     check(out:find("No reactor found"), "did not reach discovery:\n%s", out)
+end)
+
+------------------------------------------------------------
+-- REMOTE LOGGING (log_shipper.lua)
+------------------------------------------------------------
+-- Strict JSON decoder: errors on anything that is not valid JSON.
+local function decodeJSON(text)
+    local pos = 1
+    local function fail(msg) error(string.format("JSON: %s at %d in %s", msg, pos, text:sub(1, 200)), 0) end
+    local function ws() pos = text:find("[^ \t\r\n]", pos) or (#text + 1) end
+    local value
+    local function str()
+        pos = pos + 1
+        local out = {}
+        while true do
+            local c = text:sub(pos, pos)
+            if c == "" then fail("unterminated string") end
+            if c == '"' then pos = pos + 1; return table.concat(out) end
+            if c:byte() < 32 then fail("raw control char") end
+            if c == "\\" then
+                local e = text:sub(pos + 1, pos + 1)
+                local simple = {['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b",
+                                f = "\f", n = "\n", r = "\r", t = "\t"}
+                if simple[e] then
+                    table.insert(out, simple[e]); pos = pos + 2
+                elseif e == "u" then
+                    local hex = text:sub(pos + 2, pos + 5)
+                    if not hex:match("^%x%x%x%x$") then fail("bad \\u") end
+                    local code = tonumber(hex, 16)
+                    check(code < 256, "only \\u00XX expected")
+                    table.insert(out, string.char(code)); pos = pos + 6
+                else
+                    fail("bad escape")
+                end
+            else
+                table.insert(out, c); pos = pos + 1
+            end
+        end
+    end
+    function value()
+        ws()
+        local c = text:sub(pos, pos)
+        if c == "{" then
+            local obj = {}
+            pos = pos + 1; ws()
+            if text:sub(pos, pos) == "}" then pos = pos + 1; return obj end
+            while true do
+                ws()
+                if text:sub(pos, pos) ~= '"' then fail("key expected") end
+                local k = str(); ws()
+                if text:sub(pos, pos) ~= ":" then fail("colon expected") end
+                pos = pos + 1
+                obj[k] = value(); ws()
+                local d = text:sub(pos, pos); pos = pos + 1
+                if d == "}" then return obj end
+                if d ~= "," then fail("comma expected") end
+            end
+        elseif c == "[" then
+            local arr = {}
+            pos = pos + 1; ws()
+            if text:sub(pos, pos) == "]" then pos = pos + 1; return arr end
+            while true do
+                table.insert(arr, value()); ws()
+                local d = text:sub(pos, pos); pos = pos + 1
+                if d == "]" then return arr end
+                if d ~= "," then fail("comma expected") end
+            end
+        elseif c == '"' then
+            return str()
+        elseif text:find("^true", pos) then pos = pos + 4; return true
+        elseif text:find("^false", pos) then pos = pos + 5; return false
+        elseif text:find("^null", pos) then pos = pos + 4; return nil
+        else
+            local num = text:match("^-?%d+%.?%d*[eE]?[-+]?%d*", pos)
+            if not num or num == "" then fail("unexpected " .. c) end
+            pos = pos + #num
+            return tonumber(num)
+        end
+    end
+    local v = value(); ws()
+    if pos <= #text then fail("trailing data") end
+    return v
+end
+
+local REMOTE_URL = "http://logs.example.com:8780/ingest"
+
+local function enableRemote(extra)
+    return function(cfg)
+        cfg.logging.remote = {enabled = true, url = REMOTE_URL, token = "s3cret",
+                              batchSeconds = 5, maxQueue = 1000, timeout = 10}
+        for k, v in pairs(extra or {}) do cfg.logging.remote[k] = v end
+        cfg.reactor.autoStartOnBoot = true
+        cfg.peripherals.inputGate, cfg.peripherals.outputGate = "flow_gate_0", "flow_gate_1"
+    end
+end
+
+-- Lines per file from every successful request, in arrival order.
+local function shippedLines(api, delivered)
+    local byFile, payloads = {}, {}
+    for _, req in ipairs(api.requests) do
+        if delivered == nil or delivered(req) then
+            local p = decodeJSON(req.body)
+            table.insert(payloads, p)
+            for _, e in ipairs(p.entries) do
+                byFile[e.file] = byFile[e.file] or {}
+                if not e.header then table.insert(byFile[e.file], e.line) end
+            end
+        end
+    end
+    return byFile, payloads
+end
+
+local function localLines(name)
+    local out = {}
+    for line in (cc.readFile("logs/" .. name) or ""):gmatch("([^\n]*)\n") do
+        table.insert(out, line)
+    end
+    return out
+end
+
+local function newFakeLog()
+    local fake = {lines = {}, sinks = {}}
+    function fake.log(level, msg) table.insert(fake.lines, level .. " " .. msg) end
+    function fake.addSink(fn)
+        table.insert(fake.sinks, fn)
+        return function() fake.sinks = {} end
+    end
+    return fake
+end
+
+test("remote logging: disabled by default sends nothing", function()
+    cc.reset({http = cc.newHttp(function() error("must not be called") end,
+                                function() error("must not check") end)})
+    check(loadConfig().logging.remote.enabled == false, "remote logging on by default")
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 60, config = function(cfg)
+        cfg.peripherals.inputGate, cfg.peripherals.outputGate = "flow_gate_0", "flow_gate_1"
+    end})
+    check(#http.requests == 0, "%d requests sent", #http.requests)
+    check(cc.readFile("logs/draconic.log"):find("Starting"), "local log missing")
+end)
+
+test("remote logging: log and CSV lines reach the collector in order", function()
+    local api = cc.newHttp(function() return {code = 200, latency = 0.3} end)
+    cc.reset({http = api, label = "Reactor \"Room\""})
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 300, config = enableRemote()})
+    check(#api.requests >= 10, "only %d requests", #api.requests)
+    check(api.maxInFlight == 1, "%d requests in flight at once", api.maxInFlight)
+    local byFile, payloads = shippedLines(api)
+    for _, req in ipairs(api.requests) do
+        check(req.method == "POST" and req.url == REMOTE_URL, "bad request %s %s", req.method, req.url)
+        check(req.headers.Authorization == "Bearer s3cret", "auth header %s",
+              tostring(req.headers.Authorization))
+        check(req.headers["Content-Type"] == "application/json", "content type")
+        check(req.timeout == 10, "timeout %s", tostring(req.timeout))
+    end
+    for _, p in ipairs(payloads) do
+        check(p.computer_id == 7 and p.computer_label == 'Reactor "Room"', "identity %s %s",
+              tostring(p.computer_id), tostring(p.computer_label))
+        check(p.dropped == 0 and type(p.sent_at) == "number", "dropped/sent_at")
+    end
+    -- Every file arrives in local order: the shipped lines are a prefix of
+    -- the local file (lines logged after the last batch are not sent yet).
+    for _, name in ipairs({"draconic.log", "reactor_stats.csv"}) do
+        local remote, here = byFile[name], localLines(name)
+        check(remote and #remote > 3, "%s not shipped", name)
+        if name:find("%.csv$") then table.remove(here, 1) end    -- header entry
+        check(#remote <= #here and #remote >= #here - 3, "%s: %d shipped, %d local", name, #remote, #here)
+        for i, line in ipairs(remote) do
+            check(line == here[i], "%s line %d: %q ~= %q", name, i, line, tostring(here[i]))
+        end
+    end
+    -- Startup lines written before the shipper started are included.
+    check(byFile["draconic.log"][1]:find("%[INFO%] Starting v"), "first line %s", byFile["draconic.log"][1])
+    -- The CSV header goes first and is flagged.
+    local first
+    for _, p in ipairs(payloads) do
+        for _, e in ipairs(p.entries) do
+            if e.file == "reactor_stats.csv" and not first then first = e end
+        end
+    end
+    check(first.header == true and first.line == localLines("reactor_stats.csv")[1], "csv header %q", first.line)
+    check(math.abs(sim.temperature - 7000) < 150, "temperature %.0f", sim.temperature)
+end)
+
+test("remote logging: payload JSON stays valid for any byte", function()
+    cc.reset({http = cc.newHttp(function() return {code = 200} end)})
+    freshModules()
+    local shipper = require("log_shipper").new({enabled = true, url = REMOTE_URL, token = "t"}, newFakeLog())
+    local nasty = 'quote" back\\ tab\t nl\n cr\r nul\0 bell\7 del\127 hi\200\255 }],{'
+    shipper.enqueue("draconic.log", nasty)
+    local ok, err = cc.run(function() check(shipper.sendOnce(), "send failed") end)
+    check(ok, "run: %s", tostring(err))
+    local p = decodeJSON(http.requests[1].body)
+    check(p.entries[1].line == nasty and p.entries[1].file == "draconic.log", "round trip %q", p.entries[1].line)
+end)
+
+test("remote logging: bounded queue drops oldest and reports the count", function()
+    cc.reset({http = cc.newHttp(function() return {code = 200} end)})
+    freshModules()
+    local fake = newFakeLog()
+    local shipper = require("log_shipper").new({enabled = true, url = REMOTE_URL, token = "t",
+                                                maxQueue = 10, batchEntries = 1000}, fake)
+    check(#fake.sinks == 1, "sink not registered")
+    for i = 1, 25 do fake.sinks[1]("draconic.log", "line " .. i) end
+    check(shipper.queue.size() == 10 and shipper.queue.dropped == 15, "size %d dropped %d",
+          shipper.queue.size(), shipper.queue.dropped)
+    local ok, err = cc.run(function() check(shipper.sendOnce(), "send failed") end)
+    check(ok, "run: %s", tostring(err))
+    local p = decodeJSON(http.requests[1].body)
+    check(p.dropped == 15 and #p.entries == 10, "dropped %s entries %d", tostring(p.dropped), #p.entries)
+    check(p.entries[1].line == "line 16" and p.entries[10].line == "line 25", "kept the wrong lines")
+    check(shipper.queue.dropped == 0 and shipper.queue.size() == 0, "not acknowledged")
+    local warned = false
+    for _, l in ipairs(fake.lines) do warned = warned or l:find("15 entries were dropped") ~= nil end
+    check(warned, "drop count not logged locally:\n%s", table.concat(fake.lines, "\n"))
+end)
+
+test("remote logging: overflow during a failed send is still counted", function()
+    local api = cc.newHttp(function() return {fail = "Connection refused", latency = 1} end)
+    cc.reset({http = api})
+    freshModules()
+    local fake = newFakeLog()
+    local shipper = require("log_shipper").new({enabled = true, url = REMOTE_URL, token = "t",
+                                                maxQueue = 5, batchEntries = 1000}, fake)
+    for i = 1, 5 do fake.sinks[1]("draconic.log", "a" .. i) end
+    cc.run(function()
+        parallel.waitForAll(function() check(not shipper.sendOnce(), "should fail") end,
+                            function() for i = 1, 3 do fake.sinks[1]("draconic.log", "b" .. i) end end)
+    end)
+    -- a1..a3 were evicted while in flight and the send failed: lost.
+    check(shipper.queue.dropped == 3 and shipper.queue.size() == 5, "dropped %d size %d",
+          shipper.queue.dropped, shipper.queue.size())
+end)
+
+test("remote logging: batches are split under maxBatchBytes", function()
+    cc.reset({http = cc.newHttp(function() return {code = 200} end)})
+    freshModules()
+    local fake = newFakeLog()
+    local shipper = require("log_shipper").new({enabled = true, url = REMOTE_URL, token = "t",
+                                                maxBatchBytes = 4096, batchEntries = 1000}, fake)
+    local sent = {}
+    for i = 1, 60 do
+        local line = string.format("%03d ", i) .. string.rep("x", 200)
+        fake.sinks[1]("draconic.log", line)
+        table.insert(sent, line)
+    end
+    cc.run(function() while shipper.queue.size() > 0 do check(shipper.sendOnce(), "send failed") end end)
+    check(#http.requests >= 4, "only %d requests", #http.requests)
+    local got = {}
+    for _, req in ipairs(http.requests) do
+        check(#req.body <= 4096, "body %d bytes", #req.body)
+        for _, e in ipairs(decodeJSON(req.body).entries) do table.insert(got, e.line) end
+    end
+    check(table.concat(got, "|") == table.concat(sent, "|"), "lines lost or reordered")
+end)
+
+test("remote logging: collector down -> backoff, reactor keeps regulating, catch-up", function()
+    local api = cc.newHttp(function(req)
+        if req.time < 400 then return {fail = "Connection refused", latency = 0.5} end
+        return {code = 200, latency = 0.2}
+    end)
+    cc.reset({http = api})
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 700, config = enableRemote()})
+    check(not sim.exploded and sim.state == "running", "reactor %s", sim.state)
+    check(math.abs(sim.temperature - 7000) < 150, "temperature %.0f", sim.temperature)
+    -- Gaps between failed attempts double up to the 60 s cap.
+    local gaps = {}
+    for i = 2, #api.requests do
+        if api.requests[i].time < 400 then
+            table.insert(gaps, api.requests[i].time - api.requests[i - 1].time)
+        end
+    end
+    check(#gaps >= 5 and #gaps <= 12, "%d failed attempts", #gaps)
+    check(gaps[1] < gaps[3] and gaps[3] < gaps[5], "no backoff: %s", table.concat(gaps, ", "))
+    for _, g in ipairs(gaps) do check(g <= 62, "gap %.1f over the cap", g) end
+    check(math.abs(gaps[#gaps] - 60.5) < 1, "cap not reached: %s", table.concat(gaps, ", "))
+    -- After recovery everything queued during the outage arrives.
+    local byFile = shippedLines(api, function(req) return req.time >= 400 end)
+    check(byFile["draconic.log"][1]:find("Starting v"), "backlog lost: %s", tostring(byFile["draconic.log"][1]))
+    local log = cc.readFile("logs/draconic.log")
+    check(log:find("collector unreachable: Connection refused"), "outage not logged")
+    check(log:find("collector reachable again"), "recovery not logged")
+    local _, warnings = log:gsub("collector unreachable", "")
+    check(warnings == 1, "outage logged %d times", warnings)
+    check(api.maxInFlight == 1, "parallel requests")
+end)
+
+test("remote logging: blocked URL or missing http API disables with a reason", function()
+    local api = cc.newHttp(function() error("must not send") end,
+                           function() return false, "Domain not permitted" end)
+    cc.reset({http = api})
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 60, config = enableRemote({url = "http://192.168.1.5:8780/ingest"})})
+    local log = cc.readFile("logs/draconic.log")
+    check(log:find("blocked: Domain not permitted") and log:find("computercraft%-server%.toml"),
+          "no explanation:\n%s", log)
+    check(#api.requests == 0, "sent anyway")
+    check(sim.state == "running", "reactor %s", sim.state)
+
+    cc.reset()                                   -- http = nil: API disabled
+    sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 30, config = enableRemote()})
+    check(cc.readFile("logs/draconic.log"):find("http API is not available"), "missing http not explained")
+end)
+
+test("remote logging: rejected token is explained, entries are kept", function()
+    local api = cc.newHttp(function() return {code = 401, reason = "Unauthorized"} end)
+    cc.reset({http = api})
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    runProgram({sims = {sim}, untilTime = 120, config = enableRemote()})
+    local log = cc.readFile("logs/draconic.log")
+    check(log:find("HTTP 401") and log:find("token"), "401 not explained:\n%s", log)
+    check(require("log_shipper").current.queue.size() > 0, "entries discarded")
 end)
 
 ------------------------------------------------------------

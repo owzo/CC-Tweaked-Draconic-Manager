@@ -45,6 +45,7 @@ local config        = import("config")
 local monitor_utils = import("monitor_utils")
 local stat_utils    = import("stat_utils")
 local persist       = import("persist")
+local log_shipper   = import("log_shipper")
 
 local VERSION = "4.0"
 
@@ -354,7 +355,7 @@ local function main()
 
     setupDisplays()
     print(string.format("Running %d unit(s). Hold Ctrl+T to stop.", #state.units))
-    local loops = {uiLoop, eventLoop}
+    local loops = {uiLoop, eventLoop, log_shipper.loop(config.logging.remote, stat_utils)}
     for _, u in ipairs(state.units) do table.insert(loops, u.run) end
     parallel.waitForAny((table.unpack or unpack)(loops))
 end

@@ -123,11 +123,26 @@ config.ui = {
 ------------------------------------------------------------
 -- LOGGING AND STATISTICS
 ------------------------------------------------------------
+-- Every log line and stats row is written under `directory`. On the
+-- host disk that is <world>/computercraft/computer/<id>/logs/ (see the
+-- README section "Logs on a real computer").
 config.logging = {
     directory     = "logs",         -- Created automatically
     maxFileBytes  = 65536,          -- Rotate files beyond this size
     statsInterval = 10,             -- Seconds between stats CSV rows
-    printLevel    = "WARN"          -- Minimum level echoed to terminal
+    printLevel    = "WARN",         -- Minimum level echoed to terminal
+
+    -- Optional: also send every log line and CSV row to
+    -- tools/log_collector.py running on a real computer. LAN/localhost
+    -- collectors must be allowed in computercraft-server.toml first.
+    remote = {
+        enabled      = false,
+        url          = "http://192.168.1.50:8780/ingest",
+        token        = "",          -- Same value as the collector's --token
+        batchSeconds = 5,           -- Seconds between batches
+        maxQueue     = 1000,        -- Lines kept while the collector is down
+        timeout      = 10           -- Seconds per HTTP request
+    }
 }
 
 return config
