@@ -6,57 +6,54 @@
 --[[
 README
 -------
-Entry point for the CC:Tweaked Draconic Reactor Manager.
+Entry point for the CC:Tweaked Reactor Manager.
 
-Three cooperative loops run under parallel.waitForAny:
-  controlLoop  reads the reactor, runs the controller, drives the gates
-  uiLoop       redraws the dashboard and records statistics
-  eventLoop    touchscreen / mouse input and peripheral hot-plugging
+Drivers (drivers/*.lua) discover "units": reactors, turbines, storage.
+Each unit runs its own control coroutine; alongside them:
+  uiLoop     redraws the dashboards and records statistics
+  eventLoop  touchscreen / mouse input and monitor hot-plugging
 
-Shared state lives in the `state` table. ComputerCraft coroutines only
-switch at yields (sleep / pullEvent), so no locking is needed.
+ComputerCraft coroutines only switch at yields (sleep / pullEvent), so
+no locking is needed.
 
-On exit (Ctrl+T or a crash) the gates are left in the fail-safe
-position: output at zero and input at twice the last field demand.
+On exit (Ctrl+T or a crash) every unit leaves its hardware fail-safe
+(Draconic: output at zero, field input at twice the last demand).
 ]]
 
 -- `require` only exists for programs started by the shell. When launched
 -- another way (os.run, dofile, os.loadAPI, an old startup file) fall back
 -- to loading the module file from this program's directory.
+local loaded = {}
 local function import(name)
     if type(require) == "function" then
         return require(name)
     end
+    if loaded[name] ~= nil then return loaded[name] end
     local dir = ""
     if shell and shell.getRunningProgram then
         dir = fs.getDir(shell.getRunningProgram())
     end
-    local path = fs.combine(dir, name .. ".lua")
+    local path = fs.combine(dir, (name:gsub("%.", "/")) .. ".lua")
     if not fs.exists(path) then
         error("Missing " .. path .. " - run the installer again", 0)
     end
-    return dofile(path)
+    loaded[name] = dofile(path)
+    return loaded[name]
 end
 
-local config            = import("config")
-local reac_utils        = import("reac_utils")
-local monitor_utils     = import("monitor_utils")
-local stat_utils        = import("stat_utils")
-local energy_core_utils = import("energy_core_utils")
+local config        = import("config")
+local monitor_utils = import("monitor_utils")
+local stat_utils    = import("stat_utils")
 
-local VERSION = "3.0"
-local LINK_LOST_LIMIT = 10     -- consecutive failed reads before rediscovery
-local SLOW_CYCLE = 0.25        -- seconds; warn when the control loop is slower
+local VERSION = "4.0"
+
+-- Every driver is optional: a missing or broken driver file only removes
+-- that mod's support. Drivers whose mod is not attached find no units.
+local DRIVERS = {"drivers.draconic", "drivers.energy_core"}
 
 local state = {
-    hw         = nil,          -- reac_utils.discover() result
-    controller = nil,
-    info       = nil,
-    core       = nil,          -- energy core handle
-    coreInfo   = nil,
-    failedReads = 0,
-    cyclePeriod = nil,         -- smoothed real control period (seconds)
-    slowWarned = false
+    units = {},                -- every discovered unit, in driver order
+    byId = {}
 }
 
 ------------------------------------------------------------
@@ -89,11 +86,17 @@ local function banner()
     term.setTextColor(colors.white)
     term.clear()
     term.setCursorPos(1, 1)
-    print("CC:Tweaked Draconic Reactor Manager v" .. VERSION)
+    print("CC:Tweaked Reactor Manager v" .. VERSION)
     print(string.rep("-", 40))
 end
 
--- Asked once when two gates exist and config.lua does not name them.
+local function askNumber(prompt)
+    write(prompt)
+    return tonumber(read())
+end
+
+-- Asked once when one reactor has two or more gates and config.lua does
+-- not name them.
 local function askGates(gates)
     print("")
     print("Found " .. #gates .. " flux gates:")
@@ -101,15 +104,13 @@ local function askGates(gates)
         print("  " .. i .. ") " .. name)
     end
     print("Which gate feeds the reactor ENERGY INJECTOR?")
-    write("Number: ")
-    local inIdx = tonumber(read())
+    local inIdx = askNumber("Number: ")
     local outIdx
     if #gates == 2 and inIdx then
         outIdx = inIdx == 1 and 2 or 1
     else
         print("Which gate takes power from a STABILIZER?")
-        write("Number: ")
-        outIdx = tonumber(read())
+        outIdx = askNumber("Number: ")
     end
     if not inIdx or not outIdx or not gates[inIdx] or not gates[outIdx] then
         return nil
@@ -118,31 +119,105 @@ local function askGates(gates)
     return gates[inIdx], gates[outIdx]
 end
 
-local function discoverHardware()
-    while true do
-        local hw, err = reac_utils.discover(config.peripherals, askGates)
-        if hw then
-            stat_utils.log("INFO", string.format("Reactor %s, input gate %s, output gate %s",
-                hw.reactorName, hw.input.name, hw.output.name))
-            return hw
+-- One-time wizard when several Draconic reactor peripherals are attached.
+-- A reactor with modems on two of its blocks shows up twice; the player
+-- skips the duplicate by leaving its input gate blank.
+local function askUnits(reactors, gates)
+    print("")
+    print("Several Draconic reactors found. Set up each one.")
+    print("Flux gates:")
+    for i, name in ipairs(gates) do print("  " .. i .. ") " .. name) end
+    local specs, used = {}, {}
+    for _, rname in ipairs(reactors) do
+        local dev = peripheral.wrap(rname)
+        local ok, info = pcall(dev.getReactorInfo)
+        local desc = ""
+        if ok and type(info) == "table" then
+            desc = string.format(" [%s, %.0fC]", tostring(info.status), tonumber(info.temperature) or 0)
         end
-        stat_utils.log("ERROR", err)
+        print("")
+        print("Reactor peripheral " .. rname .. desc)
+        local inIdx = askNumber("  Input gate (feeds injector), blank = skip duplicate: ")
+        if inIdx and gates[inIdx] and not used[gates[inIdx]] then
+            local outIdx = askNumber("  Output gate (from stabilizer): ")
+            if not outIdx or not gates[outIdx] or used[gates[outIdx]] or outIdx == inIdx then
+                print("  Invalid output gate; reactor skipped.")
+            else
+                write("  Name [Reactor " .. (#specs + 1) .. "]: ")
+                local nameIn = read()
+                local spec = {
+                    name = (nameIn and nameIn ~= "") and nameIn or ("Reactor " .. (#specs + 1)),
+                    reactor = rname, inputGate = gates[inIdx], outputGate = gates[outIdx]
+                }
+                used[spec.inputGate], used[spec.outputGate] = true, true
+                table.insert(specs, spec)
+            end
+        end
+    end
+    print("")
+    print("Saved " .. #specs .. " reactor(s). Run 'set draconic.units nil' to redo setup.")
+    return specs
+end
+
+------------------------------------------------------------
+-- DISCOVERY
+------------------------------------------------------------
+local function loadDrivers()
+    local drivers = {}
+    for _, name in ipairs(DRIVERS) do
+        local ok, drv = pcall(import, name)
+        if ok and type(drv) == "table" then
+            table.insert(drivers, drv)
+        else
+            stat_utils.log("WARN", "Driver " .. name .. " unavailable: " .. tostring(drv))
+        end
+    end
+    return drivers
+end
+
+local function controlsSomething(units)
+    for _, u in ipairs(units) do
+        if u.kind ~= "storage" then return true end
+    end
+    return false
+end
+
+local function describePeripherals()
+    local lines = {}
+    for _, name in ipairs(peripheral.getNames()) do
+        table.insert(lines, name .. " (" .. tostring(peripheral.getType(name)) .. ")")
+    end
+    return lines
+end
+
+local function discoverUnits(drivers)
+    local ctx = {config = config, log = stat_utils, import = import,
+                 askGates = askGates, askUnits = askUnits}
+    while true do
+        local units, problems = {}, {}
+        for _, drv in ipairs(drivers) do
+            local ok, found, err = pcall(drv.discover, ctx)
+            if not ok then
+                table.insert(problems, drv.label .. ": " .. tostring(found))
+            else
+                for _, u in ipairs(found or {}) do table.insert(units, u) end
+                if err then table.insert(problems, err) end
+            end
+        end
+        if controlsSomething(units) then
+            for _, p in ipairs(problems) do stat_utils.log("WARN", p) end
+            return units
+        end
+        for _, p in ipairs(problems) do stat_utils.log("ERROR", p) end
+        if #problems == 0 then
+            stat_utils.log("ERROR", "No reactor found. Connect wired modems (right-click them) to your reactor blocks.")
+        end
         print("Attached peripherals:")
-        local list = reac_utils.describePeripherals()
+        local list = describePeripherals()
         if #list == 0 then print("  (none)") end
         for _, line in ipairs(list) do print("  " .. line) end
         print("Retrying in 5 seconds (Ctrl+T to quit)...")
         sleep(5)
-    end
-end
-
-local function setupCore()
-    local core, why = energy_core_utils.discover(config.peripherals.energyCore)
-    state.core = core
-    if core then
-        stat_utils.log("INFO", "Energy core: " .. core.name)
-    elseif config.peripherals.energyCore then
-        stat_utils.log("WARN", "Energy core: " .. why)
     end
 end
 
@@ -156,104 +231,32 @@ end
 ------------------------------------------------------------
 -- LOOPS
 ------------------------------------------------------------
-local function controlLoop()
-    local c = config.reactor
-    while true do
-        local cycleStart = os.clock()
-        local info, err = reac_utils.readInfo(state.hw.reactor)
-        if info then
-            state.failedReads = 0
-        else
-            state.failedReads = state.failedReads + 1
-            if state.failedReads == 1 then
-                stat_utils.log("ERROR", "Reactor read failed: " .. tostring(err))
-            end
-        end
-        state.info = info
-
-        local actions = state.controller:step(info, os.clock())
-        for _, e in ipairs(actions.events) do
-            stat_utils.log(e.level, e.message)
-        end
-        if actions.command then
-            stat_utils.log("INFO", "Reactor command: " .. actions.command)
-        end
-        for _, problem in ipairs(reac_utils.apply(state.hw, actions)) do
-            stat_utils.log("ERROR", problem)
-        end
-
-        if state.failedReads >= LINK_LOST_LIMIT then
-            -- Peripheral names change if a modem was replaced; look again.
-            local hw = reac_utils.discover(config.peripherals, nil)
-            if hw then
-                state.hw = hw
-                stat_utils.log("WARN", "Reconnected to reactor " .. hw.reactorName)
-            end
-            state.failedReads = 0
-        end
-
-        -- Peripheral calls may already have used the interval (DE 1.20
-        -- runs them on the server thread); otherwise wait out the rest.
-        local remaining = c.controlInterval - (os.clock() - cycleStart)
-        if remaining > 0 then
-            sleep(remaining)
-        end
-
-        -- Track the real period: server lag stretches it and shrinks the
-        -- time the controller has to react to field loss.
-        local period = os.clock() - cycleStart
-        state.cyclePeriod = state.cyclePeriod and (state.cyclePeriod * 0.9 + period * 0.1) or period
-        if state.cyclePeriod > SLOW_CYCLE and not state.slowWarned then
-            state.slowWarned = true
-            stat_utils.log("WARN", string.format(
-                "Control loop runs every %.2fs (server lag?); keep conservative limits",
-                state.cyclePeriod))
-        end
+local function firstStorage()
+    for _, u in ipairs(state.units) do
+        if u.kind == "storage" then return u end
     end
 end
 
 local function uiLoop()
     while true do
-        state.coreInfo = energy_core_utils.read(state.core, os.clock())
-        monitor_utils.render({
-            info       = state.info,
-            controller = state.controller,
-            core       = state.coreInfo,
-            limits     = config.reactor,
-            events     = stat_utils.recent
-        })
-        if state.info then
-            local i, ctl = state.info, state.controller
-            stat_utils.recordStats({
-                status = i.status, temperature = i.temperature,
-                fieldPct = i.fieldPct, satPct = i.satPct,
-                fuelRemaining = i.fuelRemaining, generationRate = i.generationRate,
-                inputRate = ctl.inputRate, outputRate = ctl.outputRate,
-                corePct = state.coreInfo and state.coreInfo.pct,
-                cyclePeriod = state.cyclePeriod
-            })
+        local storage = firstStorage()
+        local core = storage and storage.info
+        local models = {}
+        for _, u in ipairs(state.units) do
+            if u.kind ~= "storage" then table.insert(models, u.model()) end
+        end
+        monitor_utils.render({units = models, core = core, events = stat_utils.recent})
+        for _, u in ipairs(state.units) do
+            u.record({corePct = core and core.pct})
         end
         sleep(config.ui.refreshInterval)
     end
 end
 
-local function dispatch(action)
-    local ctl = state.controller
-    if not action then return end
-    local delta = action:match("^out:(-?%d+)$")
-    if delta then
-        ctl:adjustManualOutput(tonumber(delta))
-        stat_utils.log("INFO", "Manual output set to " .. monitor_utils.formatRF(ctl.manualOutput))
-    elseif action == "start" then
-        ctl:requestStart()
-        stat_utils.log("INFO", "Start requested from screen")
-    elseif action == "stop" then
-        ctl:requestStop()
-        stat_utils.log("INFO", "Stop requested from screen")
-    elseif action == "auto" then
-        ctl:setAutoOutput(not ctl.autoOutput)
-        stat_utils.log("INFO", "Output regulation: " .. (ctl.autoOutput and "AUTO" or "MANUAL"))
-    end
+local function dispatch(action, unitId)
+    if not action or action == "redraw" then return end
+    local unit = state.byId[unitId]
+    if unit then unit.act(action) end
 end
 
 local function eventLoop()
@@ -266,7 +269,6 @@ local function eventLoop()
         elseif event == "peripheral" or event == "peripheral_detach"
                 or event == "monitor_resize" then
             setupDisplays()
-            if not state.core then setupCore() end
         end
     end
 end
@@ -275,14 +277,12 @@ end
 -- SHUTDOWN
 ------------------------------------------------------------
 local function failSafe(reason)
-    if not state.hw then return end
-    local input = state.controller and state.controller:blindInput()
-        or config.reactor.chargeInflow
-    local actions = {input = input, output = 0, events = {}}
-    reac_utils.apply(state.hw, actions)
-    stat_utils.log("WARN", string.format(
-        "Program exiting (%s); gates left fail-safe: input %s, output 0",
-        tostring(reason), monitor_utils.formatRF(input)))
+    for _, u in ipairs(state.units) do
+        local ok, err = pcall(u.failSafe, reason)
+        if not ok then
+            stat_utils.log("ERROR", u.name .. ": fail-safe failed: " .. tostring(err))
+        end
+    end
 end
 
 ------------------------------------------------------------
@@ -299,20 +299,14 @@ local function main()
     end
 
     stat_utils.log("INFO", "Starting v" .. VERSION)
-    state.hw = discoverHardware()
-    setupCore()
-
-    state.info = reac_utils.readInfo(state.hw.reactor)
-    state.controller = reac_utils.newController(config.reactor, state.info)
-    -- Continue from the gate's real flow so a restart does not jolt output.
-    local ok, flow = pcall(state.hw.output.get)
-    if ok and type(flow) == "number" then
-        state.controller.outputRate = flow
-    end
+    state.units = discoverUnits(loadDrivers())
+    for _, u in ipairs(state.units) do state.byId[u.id] = u end
 
     setupDisplays()
-    print("Running. Hold Ctrl+T to stop.")
-    parallel.waitForAny(controlLoop, uiLoop, eventLoop)
+    print(string.format("Running %d unit(s). Hold Ctrl+T to stop.", #state.units))
+    local loops = {uiLoop, eventLoop}
+    for _, u in ipairs(state.units) do table.insert(loops, u.run) end
+    parallel.waitForAny((table.unpack or unpack)(loops))
 end
 
 local ok, err = pcall(main)

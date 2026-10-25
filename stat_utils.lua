@@ -10,9 +10,10 @@ Single logging subsystem for the whole program.
 
 - stat_utils.log(level, msg)   Append a timestamped event to
                                <dir>/draconic.log
-- stat_utils.recordStats(t)    Append a CSV row to
-                               <dir>/reactor_stats.csv, rate limited
-                               to one row per statsInterval seconds
+- stat_utils.recordRow(key, columns, row)
+                               Append a CSV row to <dir>/<key>.csv
+                               (one file per reactor), rate limited to
+                               one row per statsInterval seconds
 - stat_utils.recent            Last few events, shown on the monitor
 
 Files are rotated to "<name>.old" once they exceed maxFileBytes so the
@@ -30,7 +31,7 @@ local settings = {
     statsInterval = 10,
     printLevel    = "WARN"
 }
-local lastStatsAt = nil
+local lastStatsAt = {}      -- csv key -> last write time
 
 stat_utils.recent = {}
 
@@ -86,7 +87,7 @@ function stat_utils.init(loggingConfig)
     if not fs.exists(settings.directory) then
         fs.makeDir(settings.directory)
     end
-    lastStatsAt = nil
+    lastStatsAt = {}
     stat_utils.recent = {}
 end
 
@@ -107,33 +108,30 @@ function stat_utils.log(level, message)
     end
 end
 
--- snapshot fields: status, temperature, fieldPct, satPct, fuelRemaining,
--- generationRate, inputRate, outputRate, corePct, cyclePeriod
-function stat_utils.recordStats(snapshot, force)
+-- Appends one CSV row to <dir>/<key>.csv, at most once per statsInterval
+-- per key. `columns` is the ordered header; `row` maps column -> value
+-- (numbers are written with up to 4 decimals, nil as empty).
+function stat_utils.recordRow(key, columns, row, force)
     local t = now()
-    if not force and lastStatsAt
-            and t - lastStatsAt < settings.statsInterval then
+    local last = lastStatsAt[key]
+    if not force and last and t - last < settings.statsInterval then
         return false
     end
-    lastStatsAt = t
+    lastStatsAt[key] = t
 
-    local file = path("reactor_stats.csv")
+    local file = path(key .. ".csv")
     if not fs.exists(file) then
-        append(file, "time,status,temperature,field,saturation,fuel,"
-                  .. "generation,input,output,core,cycle_s")
+        append(file, "time," .. table.concat(columns, ","))
     end
-    append(file, string.format("%s,%s,%.1f,%.4f,%.4f,%.4f,%.0f,%.0f,%.0f,%s,%s",
-        timestamp(),
-        tostring(snapshot.status),
-        snapshot.temperature or 0,
-        snapshot.fieldPct or 0,
-        snapshot.satPct or 0,
-        snapshot.fuelRemaining or 0,
-        snapshot.generationRate or 0,
-        snapshot.inputRate or 0,
-        snapshot.outputRate or 0,
-        snapshot.corePct and string.format("%.4f", snapshot.corePct) or "",
-        snapshot.cyclePeriod and string.format("%.3f", snapshot.cyclePeriod) or ""))
+    local cells = {timestamp()}
+    for _, col in ipairs(columns) do
+        local v = row[col]
+        if type(v) == "number" then
+            v = (v == math.floor(v)) and string.format("%.0f", v) or string.format("%.4f", v)
+        end
+        table.insert(cells, v == nil and "" or tostring(v))
+    end
+    append(file, table.concat(cells, ","))
     return true
 end
 
