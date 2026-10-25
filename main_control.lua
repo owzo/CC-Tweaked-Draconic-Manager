@@ -45,8 +45,13 @@ local config        = import("config")
 local monitor_utils = import("monitor_utils")
 local stat_utils    = import("stat_utils")
 local persist       = import("persist")
+local alarms        = import("alarms")
+local totals        = import("totals")
+local updater       = import("updater")
 
-local VERSION = "4.0"
+local VERSION = "4.1"
+local TOTALS_SAVE_SECONDS = 60
+local UPDATE_CONFIRM_SECONDS = 10
 
 -- Every driver is optional: a missing or broken driver file only removes
 -- that mod's support. Drivers whose mod is not attached find no units.
@@ -56,7 +61,9 @@ local state = {
     units = {},                -- every discovered unit, in driver order
     byId = {},
     drivers = {},
-    rescanAt = nil             -- pending hot-plug rescan (os.clock time)
+    rescanAt = nil,            -- pending hot-plug rescan (os.clock time)
+    update = {text = "not checked"},
+    alarmCount = 0
 }
 
 -- How long peripheral events must settle before a hot-plug rescan.
@@ -290,9 +297,41 @@ local function currentPins()
     return pins
 end
 
+-- Every unit's active alarms, for the alarm outputs.
+local function activeAlarms()
+    local list = {}
+    for _, u in ipairs(state.units) do
+        local ctl = u.controller
+        for _, text in ipairs(ctl and ctl.alarms or {}) do
+            table.insert(list, {unit = u.name, text = text})
+        end
+    end
+    return list
+end
+
 local function uiLoop()
-    local nextSample = 0
+    local nextSample, lastTick, nextSave = 0, os.clock(), os.clock() + TOTALS_SAVE_SECONDS
     while true do
+        -- Long-term totals: integrate each unit's generation.
+        local now = os.clock()
+        for _, u in ipairs(state.units) do
+            if u.kind ~= "storage" then
+                local ok, s = pcall(u.summary)
+                if ok and s then totals.add(u.id, s.power, now - lastTick) end
+            end
+        end
+        lastTick = now
+        if now >= nextSave then
+            totals.save()
+            nextSave = now + TOTALS_SAVE_SECONDS
+        end
+
+        local current = activeAlarms()
+        state.alarmCount = #current
+        for _, a in ipairs(alarms.update(current, now)) do
+            stat_utils.log("WARN", "ALARM " .. a.unit .. ": " .. a.text)
+        end
+
         local storage = firstStorage()
         local core = storage and storage.info
         local models = {}
@@ -305,8 +344,17 @@ local function uiLoop()
             monitor_utils.sample(models)
             nextSample = os.clock() + (config.ui.graphInterval or 5)
         end
+        local hourly, lifetime = totals.network(24)
+        if state.update.confirmUntil and os.clock() > state.update.confirmUntil then
+            state.update.confirmUntil = nil
+        end
         monitor_utils.render({units = models, core = core, events = stat_utils.recent,
-                              pins = currentPins(), formatSetting = persist.format})
+                              pins = currentPins(), formatSetting = persist.format,
+                              hourlyFor = function(id) return totals.lastHours(id, 24) end,
+                              system = {version = VERSION, hourly = hourly, lifetime = lifetime,
+                                        alarms = {count = state.alarmCount, silenced = alarms.isSilenced()},
+                                        update = {text = state.update.text, color = state.update.color,
+                                                  confirm = state.update.confirmUntil ~= nil}}})
         if monitor_utils.lastError and monitor_utils.lastError ~= state.reportedUiError then
             state.reportedUiError = monitor_utils.lastError
             stat_utils.log("ERROR", "Display: " .. monitor_utils.lastError)
@@ -318,8 +366,57 @@ local function uiLoop()
     end
 end
 
+local failSafe
+
+local function checkUpdate()
+    state.update = {text = "checking...", color = colors.yellow}
+    local latest, err = updater.check(config.update.repoBase)
+    if not latest then
+        state.update = {text = "check failed", color = colors.red}
+        stat_utils.log("WARN", "Update check failed: " .. tostring(err))
+    elseif updater.newer(latest, VERSION) then
+        state.update = {text = "v" .. latest .. " available", color = colors.orange, latest = latest}
+        stat_utils.log("INFO", "Update available: v" .. latest)
+    else
+        state.update = {text = "up to date", color = colors.green}
+    end
+end
+
+local function installUpdate()
+    stat_utils.log("WARN", "Installing update from " .. config.update.repoBase)
+    state.update = {text = "installing...", color = colors.yellow}
+    failSafe("update")
+    local ok, err = updater.install(config.update.repoBase)
+    if not ok then
+        state.update = {text = "update failed", color = colors.red}
+        stat_utils.log("ERROR", "Update failed: " .. tostring(err))
+        return
+    end
+    totals.save()
+    stat_utils.log("INFO", "Update installed; rebooting")
+    os.reboot()
+end
+
 local function dispatch(action, unitId, monitor)
     if not action or action == "redraw" then return end
+    -- System-wide actions (no unit needed).
+    if action == "alarm:silence" then
+        alarms.silence()
+        stat_utils.log("INFO", "Alarm sound silenced")
+        return
+    elseif action == "sys:check" then
+        spawn(checkUpdate)
+        return
+    elseif action == "sys:update" then
+        if state.update.confirmUntil then
+            state.update.confirmUntil = nil
+            spawn(installUpdate)
+        else
+            -- Two taps: the first arms, the second (within 10 s) installs.
+            state.update.confirmUntil = os.clock() + UPDATE_CONFIRM_SECONDS
+        end
+        return
+    end
     local unit = state.byId[unitId]
     if not unit then return end
 
@@ -395,7 +492,7 @@ end
 ------------------------------------------------------------
 -- SHUTDOWN
 ------------------------------------------------------------
-local function failSafe(reason)
+function failSafe(reason)
     for _, u in ipairs(state.units) do
         local ok, err = pcall(u.failSafe, reason)
         if not ok then
@@ -419,6 +516,8 @@ local function main()
 
     stat_utils.log("INFO", "Starting v" .. VERSION)
     persist.load()
+    totals.load()
+    alarms.init(config.alarms)
     state.drivers = loadDrivers()
     for _, u in ipairs(discoverUnits(state.drivers)) do addUnit(u) end
 

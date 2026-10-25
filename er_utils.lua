@@ -122,6 +122,8 @@ local function erReactor(name, dev)
     -- for bad values, so arguments are validated here.
     function a.setActive(on) dev.setActive(on and true or false) end
     function a.setRods(level) dev.setAllControlRodLevels(math.floor(clamp(level, 0, 100) + 0.5)) end
+    -- Moves waste to an access port set to output; a no-op without one.
+    function a.ejectWaste() dev.doEjectWaste() end
     return a
 end
 
@@ -194,6 +196,7 @@ local function brReactor(name, dev)
 
     function a.setActive(on) dev.setActive(on and true or false) end
     function a.setRods(level) dev.setAllControlRodLevels(clamp(level, 0, 100)) end
+    function a.ejectWaste() dev.fuelTank().ejectWaste() end
     return a
 end
 
@@ -266,6 +269,7 @@ local RECOVERY_SECONDS_STEAM = 4
 local ROD_GAIN, ROD_RATE_MAX = 6, 6
 local ROD_GAIN_PASSIVE, ROD_RATE_MAX_PASSIVE = 20, 25
 local SMOOTHING = 0.3          -- EMA weight of the newest sample
+local WASTE_EJECT_COOLDOWN = 30 -- seconds between eject attempts
 
 local Buffer = {}
 Buffer.__index = Buffer
@@ -327,6 +331,20 @@ function Buffer:step(d, now, demandHint)
     local fuelPct = (d.fuelMax or 0) > 0 and d.fuel / d.fuelMax or 0
     if fuelPct < (c.lowFuel or 0.1) then
         table.insert(self.alarms, string.format("LOW FUEL %.0f%%", fuelPct * 100))
+    end
+    -- Waste shares the fuel tank and displaces fuel: eject it once it
+    -- passes wasteEjectAt (needs an access port set to output). If it
+    -- keeps piling up anyway, ejection isn't reaching anything: alarm.
+    local wastePct = (d.fuelMax or 0) > 0 and (d.waste or 0) / d.fuelMax or 0
+    if c.wasteEjectAt and wastePct >= c.wasteEjectAt
+            and (not self.lastEject or now - self.lastEject >= WASTE_EJECT_COOLDOWN) then
+        self.lastEject = now
+        out.ejectWaste = true
+        table.insert(out.events, {level = "INFO",
+            message = string.format("Ejecting waste (%.0f%% of fuel tank)", wastePct * 100)})
+    end
+    if wastePct >= (c.wasteAlarmAt or 0.5) then
+        table.insert(self.alarms, string.format("WASTE %.0f%% - CHECK ACCESS PORT", wastePct * 100))
     end
 
     -- Smoothed level and production; demand from the change in level.
@@ -498,6 +516,7 @@ function er_utils.apply(adapter, out, last)
     if out.coils ~= nil and out.coils ~= last.coils then
         try("setCoils", adapter.setCoils, out.coils); last.coils = out.coils
     end
+    if out.ejectWaste and adapter.ejectWaste then try("ejectWaste", adapter.ejectWaste) end
     return errors
 end
 

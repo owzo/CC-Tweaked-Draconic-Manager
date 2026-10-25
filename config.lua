@@ -88,6 +88,10 @@ config.extreme = {
     bufferLow       = 0.30,
     bufferHigh      = 0.70,
     lowFuel         = 0.10,         -- Alarm below this fuel fraction
+    wasteEjectAt    = 0.20,         -- Eject waste above this share of the
+                                    -- fuel tank (needs an access port set
+                                    -- to output); nil = never
+    wasteAlarmAt    = 0.50,         -- Alarm when waste still piles up
 
     -- Turbines: efficiency peaks at ~1800 RPM in both mods.
     targetRPM       = 1800,
@@ -108,6 +112,31 @@ config.extreme = {
     -- units = {{peripheral = "BigReactors-Turbine_0", name = "Turbine A",
     --           settings = {targetRPM = 900}}},
     units = {}
+}
+
+------------------------------------------------------------
+-- ALARMS
+------------------------------------------------------------
+-- Every unit alarm (trip, low fuel, link lost, charging stalled,
+-- overspeed, waste...) can sound, post to chat and drive redstone.
+config.alarms = {
+    enabled            = true,
+    speaker            = true,      -- Any attached speaker plays a bell
+    repeatSeconds      = 10,        -- Repeat while active (tap the red
+                                    -- alarm bar to silence)
+    chat               = true,      -- Advanced Peripherals Chat Box
+    chatPrefix         = "Reactor",
+    redstoneSide       = nil,       -- e.g. "top": on while any alarm
+    redstoneIntegrator = nil        -- AP Redstone Integrator name, to use
+                                    -- its side instead of the computer's
+}
+
+------------------------------------------------------------
+-- UPDATES
+------------------------------------------------------------
+config.update = {
+    -- Where the System page checks for and installs new versions.
+    repoBase = "https://raw.githubusercontent.com/owzo/CC-Tweaked-Draconic-Manager/main/"
 }
 
 ------------------------------------------------------------
