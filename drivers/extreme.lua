@@ -30,6 +30,26 @@ local STATS = {
     turbine = {"active", "mode", "rpm", "flow", "flow_set", "coils", "buffer", "production"}
 }
 
+local function pctRange(key, label, min, max)
+    return {key = key, label = label, step = 0.05, fmt = "pct", min = min, max = max}
+end
+
+-- Settings players can change on the monitor (see persist.lua).
+local SETTINGS = {
+    fission = {
+        pctRange("bufferLow", "Buffer Low", 0, function(c) return c.bufferHigh - 0.1 end),
+        pctRange("bufferHigh", "Buffer High", function(c) return c.bufferLow + 0.1 end, 1)
+    },
+    turbine = {
+        {key = "targetRPM", label = "Target RPM", step = 50, fmt = "rpm",
+         min = 500, max = function(c) return c.maxRPM - 50 end},
+        {key = "maxRPM", label = "Cut Steam At", step = 50, fmt = "rpm",
+         min = function(c) return c.targetRPM + 50 end, max = 2500},
+        pctRange("coilsOffAbove", "Coils Off At", function(c) return c.coilsOnBelow + 0.05 end, 1),
+        pctRange("coilsOnBelow", "Coils On At", 0.05, function(c) return c.coilsOffAbove - 0.05 end)
+    }
+}
+
 local function merged(base, overrides)
     local out = {}
     for k, v in pairs(base or {}) do out[k] = v end
@@ -70,10 +90,14 @@ function driver.discover(ctx)
         if adapter then
             counts[adapter.kind] = counts[adapter.kind] + 1
             local spec = perUnit[name] or {}
-            local cfg = merged(base, spec.settings)
+            local id = "extreme:" .. name
+            local defaults = merged(base, spec.settings)
+            local cfg = merged(defaults, ctx.overrides and ctx.overrides(id))
             local isTurbine = adapter.kind == "turbine"
             local unit = {
-                id = "extreme:" .. name,
+                id = id,
+                settings = SETTINGS[isTurbine and "turbine" or "fission"],
+                defaults = defaults,
                 name = spec.name or ((isTurbine and "Turbine " or "Fission ") .. counts[adapter.kind]),
                 kind = isTurbine and "turbine" or "fission",
                 driver = driver.id,

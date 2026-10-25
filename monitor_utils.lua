@@ -248,17 +248,27 @@ local function newPage(model)
     function page.bar(pct, color) page.add({kind = "bar", pct = pct, color = color}) end
     function page.buttons(defs, widths) page.add({kind = "buttons", defs = defs, widths = widths}) end
 
+    -- Navigation row: back to the overview (unless this monitor is pinned
+    -- or there is only one unit), the unit's name, graphs and settings.
+    function page.nav(title)
+        local nav = model.nav or {}
+        local defs, widths = {}, {}
+        local function add(def, width) table.insert(defs, def); table.insert(widths, width or false) end
+        if nav.back then add({"<", "nav:overview", colors.gray}, 3) end
+        add({title or model.name or "Unit", "noop", colors.blue})
+        if nav.page == "detail" then
+            add({"G", "nav:graphs", colors.gray}, 3)
+            if model.settings and #model.settings > 0 then add({"S", "nav:settings", colors.gray}, 3) end
+        else
+            add({"X", "nav:detail", colors.gray}, 3)
+        end
+        for i, wv in ipairs(widths) do if wv == false then widths[i] = nil end end
+        page.buttons(defs, widths)
+    end
+
     function page.header(label, status, color)
         page.gap(TOP)
-        if model.tabs and model.tabs.count > 1 then
-            -- Several units: each monitor pages through them on its own.
-            page.buttons({
-                {"<", "unit:prev", colors.gray},
-                {string.format("%s %d/%d", model.name or "Unit", model.tabs.index, model.tabs.count),
-                 "noop", colors.blue},
-                {">", "unit:next", colors.gray}
-            }, {3, nil, 3})
-        end
+        page.nav()
         page.lr(label, status, color)
         page.gap(HEADER)
     end
@@ -462,22 +472,279 @@ local function fitLayout(items, h)
     return items
 end
 
-local function drawDashboard(target, model)
-    local win = target.win
-    local w, h = win.getSize()
-    local ctl = model.controller
+-- Energy core / storage ------------------------------------------------
+function LAYOUTS.storage(model, w)
+    local i = model.info
+    local page = newPage(model)
+    page.header("Storage", i and "ONLINE" or "NO SIGNAL", i and colors.green or colors.red)
+    page.lr("Stored", i and (monitor_utils.formatRF(i.stored) .. " RF") or "--", colors.lime)
+    page.lr("Capacity", i and (monitor_utils.formatRF(i.max) .. " RF") or "--", colors.white)
+    local flow = i and i.transfer
+    page.lr("Transfer", flow and ((flow >= 0 and "+" or "") .. monitor_utils.formatRF(flow) .. " rf/t") or "--",
+            flow and flow < 0 and colors.orange or colors.lime)
+    page.gap(BARS, "bars")
+    local pct = i and i.pct or 0
+    page.lr("Charge", string.format("%.1f%%", pct * 100), pctColor(pct, 0.1, 0.25))
+    page.bar(pct, pctColor(pct, 0.1, 0.25))
+    page.gap(CONTROLS)
+    page.add({kind = "footer"})
+    return page.items
+end
 
-    win.setBackgroundColor(colors.black)
-    win.clear()
-    target.buttons = {}
+------------------------------------------------------------
+-- OVERVIEW CARDS
+------------------------------------------------------------
+-- Each returns status, statusColor, line label, line value, value
+-- colour, bar fraction, bar colour, power (for the total).
+local CARDS = {}
 
-    local items = w >= MIN_WIDTH and fitLayout(buildLayout(model, w), h)
-    if not items then
-        text(win, 1, 1, "Screen too small", colors.red)
-        text(win, 1, 2, string.format("Need %dx%d", MIN_WIDTH, MIN_HEIGHT), colors.white)
-        return
+function CARDS.draconic(m)
+    local i, ctl, lim = m.info, m.controller, m.limits
+    if not i then return "NO SIGNAL", colors.red, "Out --", "--", colors.red, 0, colors.gray, 0 end
+    local fc = pctColor(i.fieldPct, lim.minField * 1.5, lim.targetField * 0.9)
+    return string.upper((i.status:gsub("_", " "))), STATUS_COLORS[i.status] or colors.red,
+        "Out " .. monitor_utils.formatRF(ctl.outputRate),
+        formatInt(i.temperature) .. "C", tempColor(i.temperature, lim.targetTemperature, lim.maxTemperature),
+        i.fieldPct, fc, ctl.outputRate
+end
+
+function CARDS.fission(m)
+    local d, lim = m.data, m.limits
+    if not d or d.assembled == false then
+        return d and "UNASSEMBLED" or "NO SIGNAL", colors.orange, "--", "--", colors.gray, 0, colors.gray, 0
     end
+    local level = d.activelyCooled and ((d.steamMax or 0) > 0 and d.steam / d.steamMax or 0)
+        or ((d.capacity or 0) > 0 and d.stored / d.capacity or 0)
+    local line = d.activelyCooled and ("Steam " .. formatInt(d.steamMade or 0) .. " mB/t")
+        or ("Gen " .. monitor_utils.formatRF(d.produced or 0) .. " FE/t")
+    local inBand = level >= lim.bufferLow and level <= lim.bufferHigh
+    return d.active and "ONLINE" or "OFFLINE", d.active and colors.green or colors.lightGray,
+        line, string.format("%.0f%%", level * 100), inBand and colors.green or colors.orange,
+        level, inBand and colors.green or colors.orange, d.activelyCooled and 0 or (d.produced or 0)
+end
 
+function CARDS.turbine(m)
+    local d, ctl, lim = m.data, m.controller, m.limits
+    if not d or d.assembled == false then
+        return d and "UNASSEMBLED" or "NO SIGNAL", colors.orange, "--", "--", colors.gray, 0, colors.gray, 0
+    end
+    local mode = (d.active and MODE_TEXT[ctl.mode]) or {"OFFLINE", colors.lightGray}
+    local rc = math.abs(d.rpm - lim.targetRPM) <= lim.targetRPM * 0.05 and colors.green or colors.orange
+    return mode[1], mode[2], "Gen " .. monitor_utils.formatRF(d.produced or 0) .. " FE/t",
+        formatInt(d.rpm) .. " RPM", rc, d.rpm / lim.maxRPM, rc, d.produced or 0
+end
+
+function CARDS.storage(m)
+    local i = m.info
+    if not i then return "NO SIGNAL", colors.red, "--", "--", colors.gray, 0, colors.gray, 0 end
+    local c = pctColor(i.pct, 0.1, 0.25)
+    return "STORAGE", colors.lightBlue, "Stored " .. monitor_utils.formatRF(i.stored),
+        string.format("%.1f%%", i.pct * 100), c, i.pct, c, 0
+end
+
+local CARD_ROWS = 4             -- name/status, metric, bar, spacer
+
+local function buildOverview(units, w, h, view)
+    local page = newPage({})
+    local total, alarms = 0, {}
+    for _, m in ipairs(units) do
+        local fn = CARDS[m.kind]
+        if fn then total = total + (select(8, fn(m)) or 0) end
+        local a = m.controller and m.controller.alarms and m.controller.alarms[1]
+        if a then table.insert(alarms, m.name .. ": " .. a) end
+    end
+    page.add({kind = "lr", label = "Overview", value = "Total " .. monitor_utils.formatRF(total) .. " rf/t",
+              color = colors.lime})
+    page.gap(nil)
+
+    -- Rows: header + gap (2), cards (4 each, minus the last spacer),
+    -- footer (1), and gap + pager (2) when the cards need more than one
+    -- page: perPage * 4 - 1 + 3 <= h without a pager, + 2 with one.
+    local perPage = math.max(1, math.floor((h - 2) / CARD_ROWS))
+    if #units > perPage then perPage = math.max(1, math.floor((h - 4) / CARD_ROWS)) end
+    local pages = math.max(1, math.ceil(#units / perPage))
+    view.overviewPage = math.max(1, math.min(view.overviewPage or 1, pages))
+    local first = (view.overviewPage - 1) * perPage + 1
+    for n = first, math.min(#units, first + perPage - 1) do
+        local m = units[n]
+        local status, sc, line, value, vc, pct, bc = CARDS[m.kind](m)
+        local action = "nav:detail:" .. m.id
+        page.add({kind = "lr", label = m.name, value = status, color = sc, action = action})
+        page.add({kind = "lr", label = line, value = value, color = vc, action = action, dim = true})
+        page.add({kind = "bar", pct = pct, color = bc, action = action})
+        if n < first + perPage - 1 and n < #units then page.gap(nil) end
+    end
+    if pages > 1 then
+        page.gap(nil)
+        page.buttons({{"<", "ovr:prev", colors.gray},
+                      {string.format("%d/%d", view.overviewPage, pages), "noop", colors.blue},
+                      {">", "ovr:next", colors.gray}}, {3, nil, 3})
+    end
+    page.add({kind = "footer", alarms = alarms})
+    return page.items
+end
+
+------------------------------------------------------------
+-- SETTINGS PAGE
+------------------------------------------------------------
+local function buildSettings(model, w)
+    local page = newPage(model)
+    page.gap(TOP)
+    page.nav(model.name .. " Settings")
+    page.gap(HEADER)
+    for _, item in ipairs(model.settings or {}) do
+        page.add({kind = "setting", label = item.label, key = item.key,
+                  value = model.formatSetting(item, model.limits[item.key])})
+    end
+    page.gap(CONTROLS)
+    page.buttons({
+        {model.nav.pinned and "UNPIN" or "PIN HERE", "pin", model.nav.pinned and colors.orange or colors.blue},
+        {"RESET", "reset", colors.red}
+    })
+    page.add({kind = "footer"})
+    return page.items
+end
+
+------------------------------------------------------------
+-- GRAPHS
+------------------------------------------------------------
+local HISTORY_SIZE = 300
+local history = {}             -- unit id -> {metric index -> samples}
+
+-- Metrics per unit kind: {label, value, max (nil = autoscale), colour, fmt}
+local function metricsOf(m)
+    local lim = m.limits or {}
+    if m.kind == "draconic" then
+        local i, ctl = m.info, m.controller
+        return {
+            {"Temperature", i and i.temperature, lim.maxTemperature, colors.orange, "temp"},
+            {"Field", i and i.fieldPct, 1, colors.green, "pct"},
+            {"Saturation", i and i.satPct, 1, colors.blue, "pct"},
+            {"Output", ctl and ctl.outputRate, nil, colors.lime, "rate"}
+        }
+    elseif m.kind == "fission" then
+        local d = m.data or {}
+        local level, production = 0, 0
+        if d.activelyCooled then
+            level = (d.steamMax or 0) > 0 and d.steam / d.steamMax or 0
+            production = d.steamMade
+        else
+            level = (d.capacity or 0) > 0 and d.stored / d.capacity or 0
+            production = d.produced
+        end
+        return {
+            {d.activelyCooled and "Steam Tank" or "Buffer", m.data and level, 1, colors.green, "pct"},
+            {d.activelyCooled and "Steam mB/t" or "Generation", production, nil, colors.lime, "rate"},
+            {"Rods", d.rods, 100, colors.lightBlue, "int"}
+        }
+    elseif m.kind == "turbine" then
+        local d = m.data or {}
+        return {
+            {"Rotor RPM", d.rpm, lim.maxRPM, colors.green, "int"},
+            {"Generation", d.produced, nil, colors.lime, "rate"},
+            {"Steam Flow", d.flow, d.flowLimit, colors.lightBlue, "int"}
+        }
+    elseif m.kind == "storage" then
+        local i = m.info
+        return {
+            {"Charge", i and i.pct, 1, colors.green, "pct"},
+            {"Transfer", i and i.transfer, nil, colors.lime, "rate"}
+        }
+    end
+    return {}
+end
+
+-- Records one sample per metric for every unit (called on a timer).
+function monitor_utils.sample(units)
+    for _, m in ipairs(units) do
+        local h = history[m.id] or {}
+        history[m.id] = h
+        for i, metric in ipairs(metricsOf(m)) do
+            h[i] = h[i] or {}
+            table.insert(h[i], tonumber(metric[2]) or false)
+            if #h[i] > HISTORY_SIZE then table.remove(h[i], 1) end
+        end
+    end
+end
+
+local function fmtMetric(v, fmt)
+    if v == nil or v == false then return "--" end
+    if fmt == "temp" then return formatInt(v) .. "C" end
+    if fmt == "pct" then return string.format("%.1f%%", v * 100) end
+    if fmt == "rate" then return monitor_utils.formatRF(v) end
+    return formatInt(v)
+end
+
+local function buildGraphs(model, w, h)
+    local page = newPage(model)
+    page.gap(TOP)
+    page.nav(model.name .. " Graphs")
+    local metrics = metricsOf(model)
+    local hist = history[model.id] or {}
+    -- Fit as many charts as leave at least 3 rows each.
+    local free = h - 3                     -- top gap, nav, footer
+    local charts = math.max(1, math.min(#metrics, math.floor(free / 4)))
+    local rows = math.max(1, math.floor(free / charts) - 1)
+    local width = w - 2
+    for c = 1, charts do
+        local label, current, max, color, fmt = (table.unpack or unpack)(metrics[c])
+        local samples = {}
+        local series = hist[c] or {}
+        for k = math.max(1, #series - width + 1), #series do table.insert(samples, series[k]) end
+        local lo, hi = 0, max
+        for _, v in ipairs(samples) do
+            if v then
+                lo = math.min(lo, v)
+                if not max then hi = math.max(hi or v, v) end
+            end
+        end
+        if not hi or hi <= lo then hi = lo + 1 end
+        page.add({kind = "lr", label = label, value = fmtMetric(current, fmt), color = color})
+        for r = 1, rows do
+            page.add({kind = "graph", samples = samples, lo = lo, hi = hi, row = r,
+                      rows = rows, color = color, width = width})
+        end
+    end
+    page.add({kind = "footer"})
+    return page.items
+end
+
+------------------------------------------------------------
+-- DRAWING
+------------------------------------------------------------
+local function drawGraphRow(win, y, item)
+    -- Columns fill bottom-up; row 1 is the top row of the chart.
+    local offset = item.width - #item.samples
+    for x = 1, item.width do
+        local v = item.samples[x - offset]
+        local filled = false
+        if v then
+            local height = (v - item.lo) / (item.hi - item.lo) * item.rows
+            filled = height >= (item.rows - item.row + 0.5)
+        end
+        win.setCursorPos(x + 1, y)
+        win.setBackgroundColor(filled and item.color or (v and colors.black or colors.black))
+        win.write(" ")
+    end
+    win.setBackgroundColor(colors.black)
+end
+
+local function drawSetting(target, y, w, item)
+    local win = target.win
+    -- Label, one space, value, then the two 3-wide buttons.
+    local room = (w - 8 - #item.value) - 2 - 1
+    text(win, 2, y, item.label:sub(1, math.max(0, room)), colors.white)
+    text(win, w - 8 - #item.value, y, item.value, colors.lightBlue)
+    text(win, w - 7, y, " - ", colors.white, colors.gray)
+    text(win, w - 3, y, " + ", colors.white, colors.gray)
+    table.insert(target.buttons, {x1 = w - 7, x2 = w - 5, y = y, action = "set:" .. item.key .. ":-1"})
+    table.insert(target.buttons, {x1 = w - 3, x2 = w - 1, y = y, action = "set:" .. item.key .. ":1"})
+end
+
+local function drawItems(target, items, model)
+    local win = target.win
+    local w = win.getSize()
+    local ctl = model.controller
     for y, item in ipairs(items) do
         if item.kind == "lr" then
             labelValue(win, y, w, item.label, item.value, item.color)
@@ -485,9 +752,13 @@ local function drawDashboard(target, model)
             bar(win, y, w, item.pct, item.color)
         elseif item.kind == "buttons" then
             buttonRow(target, y, w, item.defs, item.widths)
+        elseif item.kind == "setting" then
+            drawSetting(target, y, w, item)
+        elseif item.kind == "graph" then
+            drawGraphRow(win, y, item)
         elseif item.kind == "footer" then
             -- Alarms beat the last action.
-            local alarm = ctl.alarms and ctl.alarms[1]
+            local alarm = item.alarms and item.alarms[1] or (ctl and ctl.alarms and ctl.alarms[1])
             if alarm then
                 win.setBackgroundColor(colors.red)
                 win.setCursorPos(1, y)
@@ -497,40 +768,107 @@ local function drawDashboard(target, model)
                 text(win, 2, y, model.events[1].message:sub(1, w - 2), colors.gray)
             end
         end
+        if item.action then
+            table.insert(target.buttons, {x1 = 1, x2 = w, y = y, action = item.action})
+        end
+    end
+end
+
+------------------------------------------------------------
+-- RENDER AND NAVIGATION
+------------------------------------------------------------
+local views = {}               -- monitor name -> {page, unit, overviewPage}
+
+local function findUnit(units, id)
+    for _, m in ipairs(units) do
+        if m.id == id then return m end
     end
 end
 
 --[[
 view = {
-  units  = list of reactor models (unit.model()), one page each,
-  core   = energy_core_utils.read() result or nil,
-  events = stat_utils.recent
+  units   = every unit model (unit.model()), including storage,
+  core    = energy core reading shown on Draconic pages, or nil,
+  events  = stat_utils.recent,
+  pins    = monitor name -> unit id,
+  formatSetting = persist.format
 }
-Every monitor remembers which reactor it is showing.
+Each monitor keeps its own page: overview, or a unit's detail /
+settings / graphs page. A pinned monitor stays on its unit.
 ]]
-function monitor_utils.render(view)
+local function pageFor(name, view)
     local units = view.units or {}
+    local v = views[name] or {page = "overview"}
+    views[name] = v
+    local pinned = view.pins and view.pins[name]
+    if pinned and findUnit(units, pinned) then
+        v.unit = pinned
+        if v.page == "overview" then v.page = "detail" end
+    else
+        pinned = nil
+    end
+    if v.page ~= "overview" and not findUnit(units, v.unit) then v.page = "overview" end
+    if #units == 1 and v.page == "overview" then
+        v.page, v.unit = "detail", units[1].id
+    end
+    return v, pinned
+end
+
+local function renderTarget(target, view)
+    local win = target.win
+    local w, h = win.getSize()
+    win.setBackgroundColor(colors.black)
+    win.clear()
+    target.buttons = {}
+    local units = view.units or {}
+    if #units == 0 then
+        text(win, 2, 2, "No reactor connected", colors.orange)
+        return
+    end
+    if w < MIN_WIDTH or h < MIN_HEIGHT then
+        text(win, 1, 1, "Screen too small", colors.red)
+        text(win, 1, 2, string.format("Need %dx%d", MIN_WIDTH, MIN_HEIGHT), colors.white)
+        return
+    end
+
+    local v, pinned = pageFor(target.name, view)
+    target.view = v
+    if v.page == "overview" then
+        drawItems(target, fitLayout(buildOverview(units, w, h, v), h) or {}, {events = view.events})
+        return
+    end
+
+    local model = {}
+    for k, val in pairs(findUnit(units, v.unit)) do model[k] = val end
+    model.core, model.events = view.core, view.events
+    model.formatSetting = view.formatSetting or function(_, val) return tostring(val) end
+    model.nav = {back = not pinned and #units > 1, pinned = pinned ~= nil, page = v.page}
+    if v.page == "settings" and not (model.settings and #model.settings > 0) then v.page = "detail" end
+
+    local items
+    if v.page == "settings" then
+        items = buildSettings(model, w)
+    elseif v.page == "graphs" then
+        items = buildGraphs(model, w, h)
+    else
+        model.nav.page = "detail"
+        items = buildLayout(model, w)
+    end
+    items = fitLayout(items, h)
+    if not items then
+        text(win, 1, 1, "Screen too small", colors.red)
+        return
+    end
+    drawItems(target, items, model)
+end
+
+function monitor_utils.render(view)
     for _, name in ipairs(order) do
         local target = targets[name]
         local ok, err = target == nil, nil
         if not ok then ok, err = pcall(function()
-            local count = #units
-            target.selected = math.max(1, math.min(target.selected or 1, math.max(count, 1)))
-            local model = {}
-            for k, v in pairs(units[target.selected] or {}) do model[k] = v end
-            model.core, model.events = view.core, view.events
-            model.tabs = {index = target.selected, count = count}
-            target.count = count
-            target.unitId = model.id
             target.win.setVisible(false)
-            if model.controller then
-                drawDashboard(target, model)
-            else
-                target.win.setBackgroundColor(colors.black)
-                target.win.clear()
-                target.buttons = {}
-                text(target.win, 2, 2, "No reactor connected", colors.orange)
-            end
+            renderTarget(target, view)
             target.win.setVisible(true)
         end) end
         if not ok then
@@ -549,27 +887,42 @@ function monitor_utils.render(view)
     end
 end
 
--- Returns the action under (x, y) on display `name` and the id of the
--- unit that display is showing, or nil. Paging is handled here.
+-- Handles a touch on display `name`. Navigation is handled here and
+-- returns "redraw"; anything else returns action, unit id, display name
+-- for the caller to apply. Returns nil when nothing was hit.
 function monitor_utils.handleTouch(name, x, y)
     local target = targets[name]
     if not target then return nil end
+    local v = views[name] or {page = "overview"}
+    views[name] = v
     for _, b in ipairs(target.buttons) do
         if y == b.y and x >= b.x1 and x <= b.x2 then
-            local count = target.count or 1
-            if b.action == "unit:next" then
-                target.selected = (target.selected or 1) % count + 1
-                return "redraw"
-            elseif b.action == "unit:prev" then
-                target.selected = ((target.selected or 1) - 2) % count + 1
-                return "redraw"
-            elseif b.action == "noop" then
+            local a = b.action
+            local unitId = a:match("^nav:detail:(.+)$")
+            if unitId then
+                v.page, v.unit = "detail", unitId
+            elseif a == "nav:overview" then
+                v.page = "overview"
+            elseif a == "nav:detail" or a == "nav:graphs" or a == "nav:settings" then
+                v.page = a:sub(5)
+            elseif a == "ovr:next" then
+                v.overviewPage = (v.overviewPage or 1) + 1
+            elseif a == "ovr:prev" then
+                v.overviewPage = math.max(1, (v.overviewPage or 1) - 1)
+            elseif a == "noop" then
                 return nil
+            else
+                return a, v.unit, name
             end
-            return b.action, target.unitId
+            return "redraw"
         end
     end
     return nil
+end
+
+-- Which page a display shows (for tests and diagnostics).
+function monitor_utils.viewOf(name)
+    return views[name]
 end
 
 monitor_utils.TERMINAL = TERMINAL

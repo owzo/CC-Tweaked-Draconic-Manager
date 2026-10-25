@@ -25,6 +25,10 @@ Draconic reactor. Every driver exposes the same contract:
   unit.act(action)      player input; returns true if handled
   unit.failSafe(reason) leave hardware safe when the program exits
   unit.record(extra)    append a stats row (rate limited)
+  unit.cfg              live settings (controllers read it every cycle)
+  unit.settings         editable settings schema (see persist.lua), or nil
+  unit.defaults         config.lua values, restored by RESET
+  ctx.overrides(id)     saved in-game changes to layer over the defaults
 
 Each reactor gets its own coroutine, so on DE 1.20 (one server tick per
 peripheral call) reactors do not slow each other down.
@@ -34,6 +38,23 @@ local driver = {id = "draconic", label = "Draconic Evolution"}
 
 local LINK_LOST_LIMIT = 10     -- consecutive failed reads before rediscovery
 local SLOW_CYCLE = 0.25        -- seconds; warn when the control loop is slower
+
+-- Settings players can change on the monitor (see persist.lua). Limits
+-- are linked so a target can never pass its trip.
+local SETTINGS = {
+    {key = "targetTemperature", label = "Target Temp", step = 100, fmt = "temp",
+     min = function(c) return c.safeTemperature + 500 end,
+     max = function(c) return c.maxTemperature - 100 end},
+    {key = "maxTemperature", label = "Trip Temp", step = 100, fmt = "temp",
+     min = function(c) return c.targetTemperature + 100 end, max = 9000},
+    {key = "targetField", label = "Target Field", step = 0.05, fmt = "pct",
+     min = function(c) return c.minField + 0.05 end, max = 0.9},
+    {key = "minField", label = "Trip Field", step = 0.01, fmt = "pct",
+     min = 0.05, max = function(c) return c.targetField - 0.05 end},
+    {key = "safeTemperature", label = "Restart At", step = 250, fmt = "temp",
+     min = 1000, max = function(c) return c.targetTemperature - 500 end},
+    {key = "autoRestart", label = "Auto Restart", fmt = "bool"}
+}
 
 local STATS_COLUMNS = {"status", "temperature", "field", "saturation", "fuel",
                        "generation", "input", "output", "core", "cycle_s"}
@@ -55,11 +76,16 @@ end
 local function newUnit(ctx, hw, spec, index, total)
     local reac_utils = ctx.import("reac_utils")
     local log = ctx.log
-    local cfg = merged(ctx.config.reactor, spec and spec.settings)
+    local id = "draconic:" .. hw.reactorName
+    local defaults = merged(ctx.config.reactor, spec and spec.settings)
+    -- Values changed on the monitor win over config.lua.
+    local cfg = merged(defaults, ctx.overrides and ctx.overrides(id))
     local name = hw.name or (total > 1 and ("Reactor " .. index) or "Reactor")
 
     local unit = {
-        id = "draconic:" .. hw.reactorName,
+        id = id,
+        settings = SETTINGS,
+        defaults = defaults,
         name = name,
         kind = "draconic",
         driver = driver.id,

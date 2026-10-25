@@ -17,7 +17,7 @@ local TICK = 0.05
 -- Everything the installers must ship; MODULE_FILES are loaded by
 -- main_control and must never call require themselves.
 PROGRAM_FILES = {"main_control.lua", "config.lua", "reac_utils.lua", "monitor_utils.lua",
-                 "stat_utils.lua", "energy_core_utils.lua", "er_utils.lua",
+                 "stat_utils.lua", "energy_core_utils.lua", "er_utils.lua", "persist.lua",
                  "drivers/draconic.lua", "drivers/extreme.lua", "drivers/energy_core.lua"}
 MODULE_FILES = {}
 for _, f in ipairs(PROGRAM_FILES) do
@@ -489,59 +489,6 @@ end)
 ------------------------------------------------------------
 -- END TO END: main_control.lua under the virtual scheduler
 ------------------------------------------------------------
-test("main_control: boot, prompt, START, regulate, Ctrl+T fail-safe", function()
-    cc.reset({inputs = {"1"}})
-    freshModules()
-    local sim = Sim.new()
-    wireSim(sim, "flow_gate")
-    local mon = cc.newScreen(29, 19)
-    cc.addPeripheral("monitor_0", "monitor", mon)
-    local pylon = {stored = 5e9}
-    pylon.getEnergyStored = function() return pylon.stored end
-    pylon.getMaxEnergyStored = function() return 1e10 end
-    cc.addPeripheral("draconic_rf_storage_0", "draconic_rf_storage", pylon)
-
-    local fn = assert((loadfile or load)("main_control.lua"))
-    -- Touch START once the dashboard has been drawn.
-    cc.schedule(3, "__touch_start")
-    local tick = advancer(sim)
-    local started = false
-    local ok, err = cc.run(function()
-        -- Translate the marker into a real touch at START's coordinates.
-        local realPull = os.pullEvent
-        os.pullEvent = function(filter)
-            while true do
-                local ev = {realPull(filter == "__touch_start" and nil or filter)}
-                if ev[1] == "__touch_start" then
-                    local x, y = mon.find("START")
-                    started = x ~= nil
-                    if x then os.queueEvent("monitor_touch", "monitor_0", x, y) end
-                elseif filter == nil or ev[1] == filter then
-                    return (table.unpack or unpack)(ev)
-                end
-            end
-        end
-        fn()
-        os.pullEvent = realPull
-    end, {untilTime = 1200, onAdvance = tick})
-
-    check(ok, "program crashed: %s\n%s", tostring(err), cc.outputText())
-    check(started, "START never appeared on monitor:\n%s", mon.text())
-    check(not cc.outputText():find("Fatal"), "fatal error:\n%s", cc.outputText())
-    check(not sim.exploded, "exploded")
-    check(sim.state == "running", "state %s\n%s", sim.state, cc.outputText())
-    check(math.abs(sim.temperature - 7000) < 150, "temperature %.0f", sim.temperature)
-    -- Ctrl+T leaves gates fail-safe.
-    check(sim.outFlow == 0, "output after exit %s", tostring(sim.outFlow))
-    check(sim.inFlow >= 2000000 and sim.inFlow < 2000000 * 2.5,
-          "input after exit %s", tostring(sim.inFlow))
-    check(cc.readFile("logs/draconic.log"):find("Program exiting"), "exit not logged")
-    local stats = cc.readFile("logs/reactor_stats.csv")
-    check(stats and select(2, stats:gsub("\n", "")) > 50, "stats not recorded")
-    check(mon.text():find("Energy Core") and mon.text():find("50.0%%"),
-          "core not displayed:\n%s", mon.text())
-end)
-
 ------------------------------------------------------------
 -- MULTI-REACTOR
 ------------------------------------------------------------
@@ -610,20 +557,58 @@ local function configureTwo(cfg)
     }
 end
 
+test("main_control: boot, prompt, overview, START, regulate, Ctrl+T fail-safe", function()
+    cc.reset({inputs = {"1"}})
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local pylon = {stored = 5e9}
+    pylon.getEnergyStored = function() return pylon.stored end
+    pylon.getMaxEnergyStored = function() return 1e10 end
+    cc.addPeripheral("draconic_rf_storage_0", "draconic_rf_storage", pylon)
+
+    local sawOverview = false
+    runProgram({sims = {sim}, untilTime = 1200, at = {
+        -- Reactor + energy core: the monitor opens on the overview.
+        {t = 3, fn = function()
+            sawOverview = mon.text():find("Overview") ~= nil
+            touchText(mon, "Reactor ")
+        end},
+        {t = 4, fn = function() touchText(mon, "START") end}
+    }})
+    check(sawOverview, "monitor did not open on the overview")
+    check(not sim.exploded, "exploded")
+    check(sim.state == "running", "state %s\n%s", sim.state, cc.outputText())
+    check(math.abs(sim.temperature - 7000) < 150, "temperature %.0f", sim.temperature)
+    -- Ctrl+T leaves gates fail-safe.
+    check(sim.outFlow == 0, "output after exit %s", tostring(sim.outFlow))
+    check(sim.inFlow >= 2000000 and sim.inFlow < 2000000 * 2.5,
+          "input after exit %s", tostring(sim.inFlow))
+    check(cc.readFile("logs/draconic.log"):find("Program exiting"), "exit not logged")
+    local stats = cc.readFile("logs/reactor_stats.csv")
+    check(stats and select(2, stats:gsub("\n", "")) > 50, "stats not recorded")
+    check(mon.text():find("Energy Core") and mon.text():find("50.0%%"),
+          "core not displayed:\n%s", mon.text())
+end)
+
 test("two reactors: independent control, per-reactor settings, paging", function()
     cc.reset()
     local a, b = twoReactors()
     local mon = cc.newScreen(29, 19)
     cc.addPeripheral("monitor_0", "monitor", mon)
-    local sawAlpha = false
+    local sawAlphaPage = false
     runProgram({sims = {a, b}, config = configureTwo, untilTime = 1200, at = {
-        {t = 5, fn = function()
-            sawAlpha = mon.text():find("Alpha 1/2") ~= nil
-            touchText(mon, ">  ")      -- the page-forward button
-        end}
+        {t = 5, fn = function() touchText(mon, "Alpha ") end},
+        {t = 6, fn = function()
+            sawAlphaPage = mon.text():find("Reactor Status") ~= nil and mon.text():find("Alpha") ~= nil
+            touchText(mon, " < ")      -- back to the overview
+        end},
+        {t = 7, fn = function() touchText(mon, "Beta ") end}
     }})
-    check(sawAlpha, "first page did not show Alpha")
-    check(mon.text():find("Beta 2/2"), "paging failed:\n%s", mon.text())
+    check(sawAlphaPage, "tapping Alpha's card did not open its page")
+    check(mon.text():find("Beta") and mon.text():find("Reactor Status"),
+          "navigation to Beta failed:\n%s", mon.text())
     check(a.state == "running" and b.state == "running", "states %s / %s", a.state, b.state)
     check(math.abs(a.temperature - 7000) < 150, "Alpha temperature %.0f", a.temperature)
     check(math.abs(b.temperature - 6500) < 150, "Beta override ignored: %.0f", b.temperature)
@@ -799,8 +784,15 @@ test("program runs Extreme Reactors alone (no Draconic installed)", function()
     wireEr(sim, "BigReactors-")
     local mon = cc.newScreen(29, 19)
     cc.addPeripheral("monitor_0", "monitor", mon)
+    local overview = ""
     runProgram({sims = {sim}, untilTime = 900,
-                config = function(cfg) cfg.extreme.autoStartOnBoot = true end})
+                config = function(cfg) cfg.extreme.autoStartOnBoot = true end,
+                at = {{t = 850, fn = function()
+                    overview = mon.text()
+                    touchText(mon, "Fission 1")
+                end}}})
+    check(overview:find("Overview") and overview:find("Turbine 2") and overview:find("1,800 RPM"),
+          "overview:\n%s", overview)
     check(cc.outputText():find("Running 3 unit"), "units:\n%s", cc.outputText())
     check(math.abs(sim.turbines[1].rpm - 1800) < 60, "turbine rpm %.0f", sim.turbines[1].rpm)
     check(mon.text():find("Reactor Status") and mon.text():find("ONLINE STEAM"),
@@ -822,12 +814,156 @@ test("program runs Draconic and Extreme side by side", function()
     runProgram({sims = {de, er}, untilTime = 900, config = function(cfg)
         cfg.reactor.autoStartOnBoot = true
         cfg.extreme.autoStartOnBoot = true
-    end, at = {{t = 5, fn = function() touchText(mon, ">  ") end}}})
+    end, at = {{t = 5, fn = function() touchText(mon, "Fission 1") end}}})
     check(cc.outputText():find("Running 2 unit"), "units:\n%s", cc.outputText())
     check(de.state == "running" and math.abs(de.temperature - 7000) < 150, "draconic %s %.0f", de.state, de.temperature)
     local level = er.stored / er.capacity
     check(level > 0.3 and level < 0.7, "fission buffer %.2f", level)
-    check(mon.text():find("Fission 1 2/2"), "paging to the fission page failed:\n%s", mon.text())
+    check(mon.text():find("Fission 1") and mon.text():find("Control Rods"),
+          "opening the fission page failed:\n%s", mon.text())
+end)
+
+------------------------------------------------------------
+-- MENUS, SETTINGS, PINS, GRAPHS
+------------------------------------------------------------
+-- Touches the - (dir < 0) or + button of the setting row `label`.
+local function touchSetting(mon, label, dir)
+    local _, y = mon.find(label)
+    check(y, "setting %q not on screen:\n%s", label, mon.text())
+    local w = mon.getSize()
+    os.queueEvent("monitor_touch", "monitor_0", dir > 0 and w - 2 or w - 6, y)
+end
+
+test("persist.adjust: steps, linked limits, booleans, no float drift", function()
+    cc.reset(); freshModules()
+    local persist = require("persist")
+    local schema = {
+        {key = "t", step = 100, min = 1000, max = function(c) return c.m - 100 end},
+        {key = "m", step = 100, min = function(c) return c.t + 100 end, max = 9000},
+        {key = "f", step = 0.05, min = 0.1, max = 0.9},
+        {key = "b", fmt = "bool"}
+    }
+    local cfg = {t = 7000, m = 8000, f = 0.5, b = true}
+    for _ = 1, 30 do persist.adjust(cfg, schema, "t", 1) end
+    check(cfg.t == 7900, "target passed trip: %s", tostring(cfg.t))
+    for _ = 1, 30 do persist.adjust(cfg, schema, "m", -1) end
+    check(cfg.m == 8000, "trip went below target: %s", tostring(cfg.m))
+    for _ = 1, 7 do persist.adjust(cfg, schema, "f", -1) end
+    check(math.abs(cfg.f - 0.15) < 1e-9, "fraction drifted: %.17g", cfg.f)
+    check(persist.format({fmt = "pct"}, cfg.f) == "15%", "pct format")
+    persist.adjust(cfg, schema, "b", 1)
+    check(cfg.b == false, "bool did not toggle")
+    check(persist.adjust(cfg, schema, "nope", 1) == nil, "unknown key accepted")
+end)
+
+local function oneReactorWithCore()
+    local sim = Sim.new({version = "1.20"})
+    wireSim(sim, "flow_gate")
+    settings.set("draconic.inputGate", "flow_gate_0")
+    settings.set("draconic.outputGate", "flow_gate_1")
+    local pylon = {getEnergyStored = function() return 5e9 end,
+                   getMaxEnergyStored = function() return 1e10 end}
+    cc.addPeripheral("draconic_rf_storage_0", "draconic_rf_storage", pylon)
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    return sim, mon
+end
+
+test("settings page: live change, persisted across restart, reset", function()
+    cc.reset()
+    local sim, mon = oneReactorWithCore()
+    local auto = function(cfg) cfg.reactor.autoStartOnBoot = true end
+    runProgram({sims = {sim}, config = auto, untilTime = 900, at = {
+        {t = 3, fn = function() touchText(mon, "Reactor ") end},
+        {t = 4, fn = function() touchText(mon, " S ") end},
+        -- Five presses of - on Target Temp: 7000 -> 6500.
+        {t = 5, fn = function() touchSetting(mon, "Target Temp", -1) end},
+        {t = 6, fn = function() touchSetting(mon, "Target Temp", -1) end},
+        {t = 7, fn = function() touchSetting(mon, "Target Temp", -1) end},
+        {t = 8, fn = function() touchSetting(mon, "Target Temp", -1) end},
+        {t = 9, fn = function() touchSetting(mon, "Target Temp", -1) end}
+    }})
+    check(mon.text():find("6,500C"), "settings page value:\n%s", mon.text())
+    check(math.abs(sim.temperature - 6500) < 150, "live change ignored: %.0f", sim.temperature)
+    check(cc.readFile("data/manager.db"):find("targetTemperature"), "override not saved")
+
+    -- Restart: the override must be back, then RESET returns to config.lua.
+    cc.output = {}
+    runProgram({sims = {sim}, config = auto, untilTime = 1800, at = {
+        {t = 905, fn = function() touchText(mon, "Reactor ") end},
+        {t = 906, fn = function() touchText(mon, " S ") end},
+        {t = 907, fn = function()
+            check(mon.text():find("6,500C"), "override lost on restart:\n%s", mon.text())
+            touchText(mon, "RESET")
+        end}
+    }})
+    check(mon.text():find("7,000C"), "reset did not restore config:\n%s", mon.text())
+    check(math.abs(sim.temperature - 7000) < 150, "reset not applied live: %.0f", sim.temperature)
+end)
+
+test("pinning a monitor keeps it on its unit across restarts", function()
+    cc.reset()
+    local sim, mon = oneReactorWithCore()
+    runProgram({sims = {sim}, untilTime = 10, at = {
+        {t = 3, fn = function() touchText(mon, "Reactor ") end},
+        {t = 4, fn = function() touchText(mon, " S ") end},
+        {t = 5, fn = function() touchText(mon, "PIN HERE") end},
+        {t = 6, fn = function() touchText(mon, " X ") end}
+    }})
+    check(mon.text():find("Reactor Status"), "not on the unit page:\n%s", mon.text())
+    check(mon.getLine(2):sub(1, 3) ~= " < ", "pinned monitor still offers the overview:\n%s", mon.text())
+    cc.output = {}
+    runProgram({sims = {sim}, untilTime = 20})
+    check(mon.text():find("Reactor Status") and not mon.text():find("Overview"),
+          "pin lost on restart:\n%s", mon.text())
+end)
+
+test("config.ui.monitorUnits pins a monitor by unit name", function()
+    cc.reset()
+    local sim, mon = oneReactorWithCore()
+    runProgram({sims = {sim}, untilTime = 5, config = function(cfg)
+        cfg.ui.monitorUnits = {monitor_0 = "Energy Core"}
+    end})
+    check(mon.text():find("Storage") and mon.text():find("Charge"), "not pinned to core:\n%s", mon.text())
+end)
+
+test("graphs page draws history charts", function()
+    cc.reset()
+    local sim, mon = oneReactorWithCore()
+    runProgram({sims = {sim}, untilTime = 300, config = function(cfg)
+        cfg.reactor.autoStartOnBoot = true
+        cfg.ui.graphInterval = 2
+    end, at = {
+        {t = 280, fn = function() touchText(mon, "Reactor ") end},
+        {t = 281, fn = function() touchText(mon, " G ") end}
+    }})
+    local text = mon.text()
+    check(text:find("Temperature") and text:find("Field"), "chart labels:\n%s", text)
+    local filled = 0
+    for y = 1, 19 do
+        for x = 2, 28 do
+            local bg = mon.bgRows[y][x]
+            if bg == colors.orange or bg == colors.green then filled = filled + 1 end
+        end
+    end
+    check(filled > 40, "charts look empty (%d filled cells):\n%s", filled, text)
+end)
+
+test("overview pages through many units", function()
+    cc.reset()
+    local sim = ErSim.new({activelyCooled = true, maxOutput = 9000, turbines = 6, turbineLoad = 2000})
+    wireEr(sim, "BigReactors-")
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local first = ""
+    runProgram({sims = {sim}, untilTime = 10, at = {
+        {t = 3, fn = function() first = mon.text(); touchText(mon, " > ") end}
+    }})
+    -- 7 units, 3 cards per page on a 3x3 monitor.
+    check(first:find("1/3") and first:find("Fission 1") and not first:find("Turbine 3"),
+          "first overview page:\n%s", first)
+    check(mon.text():find("2/3") and mon.text():find("Turbine 3") and not mon.text():find("Fission 1"),
+          "second page:\n%s", mon.text())
 end)
 
 test("modules never call require (os.loadAPI environments lack it)", function()

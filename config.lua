@@ -110,7 +110,14 @@ config.extreme = {
 config.ui = {
     textScale       = nil,          -- nil = choose automatically
     refreshInterval = 0.5,          -- Seconds between screen redraws
-    manualStep      = {1000, 10000, 100000}  -- Output button increments
+    manualStep      = {1000, 10000, 100000}, -- Output button increments
+    graphInterval   = 5,            -- Seconds between graph samples
+
+    -- Dedicate monitors to one unit each (by unit name or id). Monitors
+    -- not listed show the overview. "PIN HERE" on a unit's settings page
+    -- does the same from in game and is remembered.
+    -- monitorUnits = {monitor_1 = "Alpha", monitor_2 = "Turbine 1"},
+    monitorUnits    = {}
 }
 
 ------------------------------------------------------------

@@ -28,6 +28,7 @@ local requiredFiles = {
     "stat_utils.lua",
     "energy_core_utils.lua",
     "er_utils.lua",
+    "persist.lua",
     "drivers/draconic.lua",
     "drivers/extreme.lua",
     "drivers/energy_core.lua",
