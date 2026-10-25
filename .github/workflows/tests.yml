@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lua:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lua: ["5.2", "5.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua ${{ matrix.lua }}
+        run: sudo apt-get update && sudo apt-get install -y lua${{ matrix.lua }}
+      - name: Run test suite
+        run: lua${{ matrix.lua }} tests/run_tests.lua
+
+  syntax:
+    # CC:Tweaked's Cobalt VM is Lua 5.1-based (with some 5.2+ additions):
+    # every shipped file must at least parse as Lua 5.1 (no goto, no //).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua 5.1
+        run: sudo apt-get update && sudo apt-get install -y lua5.1
+      - name: Parse every program file
+        run: |
+          set -e
+          for f in $(git ls-files '*.lua' | grep -v '^tests/'); do
+            luac5.1 -p "$f"
+            echo "ok $f"
+          done

@@ -966,6 +966,132 @@ test("overview pages through many units", function()
           "second page:\n%s", mon.text())
 end)
 
+------------------------------------------------------------
+-- BACKLOG: RESUME, STALL DETECTION, MODES, HOT-PLUG, STEAM GROUPS
+------------------------------------------------------------
+test("temperature trip resumes from 'stopping' without a full cooldown", function()
+    local sim = Sim.new({version = "1.20", state = "running", temperature = 7000, sat = 0.2})
+    local ctl = newCtl(sim)
+    closedLoop(sim, ctl, 60)
+    sim.temperature = 8100                    -- force a trip
+    local states, resumed = {}, false
+    closedLoop(sim, ctl, 900, function(_, info, a)
+        if info then states[info.status] = true end
+        if a.command == "activate" and info and info.status == "stopping" then resumed = true end
+    end)
+    check(states.stopping, "never tripped")
+    check(resumed, "never resumed from stopping")
+    check(not states.cooling and not states.cold, "went through a full cooldown anyway")
+    check(sim.state == "running" and not sim.exploded, "state %s", sim.state)
+end)
+
+test("charging that makes no progress raises a wiring alarm", function()
+    local sim = Sim.new({version = "1.20"})
+    local ctl = newCtl(sim)
+    ctl:requestStart()
+    local reac = require("reac_utils")
+    -- The "input gate" goes nowhere: like a fluid gate or the wrong gate.
+    local dead = {getFlow = function() return 0 end, setFlowOverride = function() end,
+                  setOverrideEnabled = function() end, getOverrideEnabled = function() return true end}
+    local hw = {reactor = sim.reactor, input = reac.wrapGate("in", dead),
+                output = reac.wrapGate("out", sim.outGate)}
+    local t, warned, alarmed = 0, false, false
+    while t < 60 do
+        local actions = ctl:step(reac.readInfo(sim.reactor), t)
+        reac.apply(hw, actions)
+        for _, e in ipairs(actions.events) do
+            if e.message:find("input gate is not feeding") then warned = true end
+        end
+        for _, al in ipairs(ctl.alarms) do if al:find("CHARGING STALLED") then alarmed = true end end
+        for _ = 1, 2 do sim:tick() end
+        t = t + 0.1
+    end
+    check(warned and alarmed, "warned=%s alarmed=%s", tostring(warned), tostring(alarmed))
+end)
+
+test("gain settings are editable (Output / Rod / Flow Gain)", function()
+    cc.reset(); freshModules()
+    local persist = require("persist")
+    local cfg = require("config")
+    local function schemaOf(path, kind)
+        local src = assert(io.open(path)):read("*a")
+        return src:find(kind, 1, true) ~= nil
+    end
+    check(schemaOf("drivers/draconic.lua", "outputAggressiveness"), "Output Gain missing")
+    check(schemaOf("drivers/extreme.lua", "rodGain") and schemaOf("drivers/extreme.lua", "flowGain"),
+          "ER gains missing")
+    local c = {outputAggressiveness = 1}
+    persist.adjust(c, {{key = "outputAggressiveness", step = 0.1, min = 0.2, max = 3, fmt = "num"}},
+                   "outputAggressiveness", -1)
+    check(math.abs(c.outputAggressiveness - 0.9) < 1e-9, "gain %s", tostring(c.outputAggressiveness))
+    check(persist.format({fmt = "num"}, 0.9) == "0.9", "num format")
+    check(cfg.extreme.rodGain == 1 and cfg.extreme.flowGain == 1, "config defaults")
+end)
+
+test("manual output mode is remembered across a restart", function()
+    cc.reset()
+    local sim, mon = oneReactorWithCore()
+    runProgram({sims = {sim}, untilTime = 10, config = function(c) c.reactor.autoStartOnBoot = true end, at = {
+        {t = 3, fn = function() touchText(mon, "Reactor ") end},
+        {t = 4, fn = function() touchText(mon, "AU") end}
+    }})
+    check(mon.text():find("Output %(man%)"), "did not switch to manual:\n%s", mon.text())
+    cc.output = {}
+    runProgram({sims = {sim}, untilTime = 20, at = {
+        {t = 13, fn = function() touchText(mon, "Reactor ") end}
+    }})
+    check(mon.text():find("Output %(man%)") and mon.text():find(" MA "),
+          "manual mode lost on restart:\n%s", mon.text())
+end)
+
+test("a turbine connected while running is picked up (hot-plug)", function()
+    cc.reset()
+    local sim = ErSim.new({activelyCooled = true, maxOutput = 3000, turbines = 1, turbineLoad = 6000})
+    cc.addPeripheral("BigReactors-Reactor_0", "BigReactors-Reactor", sim.erReactor)
+    runProgram({sims = {sim}, untilTime = 600, config = function(c) c.extreme.autoStartOnBoot = true end, at = {
+        {t = 10, fn = function()
+            cc.addPeripheral("BigReactors-Turbine_0", "BigReactors-Turbine", sim.erTurbines[1])
+            os.queueEvent("peripheral", "BigReactors-Turbine_0")
+        end}
+    }})
+    check(cc.outputText():find("Running 1 unit"), "started with wrong unit count")
+    check(cc.readFile("logs/draconic.log"):find("New unit connected: Turbine 1"), "not picked up")
+    check(math.abs(sim.turbines[1].rpm - 1800) < 100, "hot-plugged turbine not controlled: %.0f RPM",
+          sim.turbines[1].rpm)
+end)
+
+test("separate steam groups keep their own steam demand", function()
+    cc.reset()
+    -- System A: 1 turbine. System B: 3 turbines on a bigger reactor.
+    local a = ErSim.new({activelyCooled = true, maxOutput = 3000, turbines = 1, turbineLoad = 6000})
+    local b = ErSim.new({activelyCooled = true, maxOutput = 9000, turbines = 3, turbineLoad = 6000})
+    cc.addPeripheral("BigReactors-Reactor_0", "BigReactors-Reactor", a.erReactor)
+    cc.addPeripheral("BigReactors-Turbine_0", "BigReactors-Turbine", a.erTurbines[1])
+    cc.addPeripheral("BigReactors-Reactor_1", "BigReactors-Reactor", b.erReactor)
+    for i = 1, 3 do
+        cc.addPeripheral("BigReactors-Turbine_" .. i, "BigReactors-Turbine", b.erTurbines[i])
+    end
+    local lo, hi = 1, 0
+    runProgram({sims = {a, b}, untilTime = 1500, config = function(c)
+        c.extreme.autoStartOnBoot = true
+        c.extreme.units = {
+            {peripheral = "BigReactors-Reactor_0", steamGroup = "A"},
+            {peripheral = "BigReactors-Turbine_0", steamGroup = "A"},
+            {peripheral = "BigReactors-Reactor_1", steamGroup = "B"},
+            {peripheral = "BigReactors-Turbine_1", steamGroup = "B"},
+            {peripheral = "BigReactors-Turbine_2", steamGroup = "B"},
+            {peripheral = "BigReactors-Turbine_3", steamGroup = "B"}
+        }
+    end, at = {{t = 1200, fn = function() end}}})
+    for _, sim in ipairs({a, b}) do
+        local level = sim.steam / sim.steamMax
+        check(level > 0.05 and level < 0.95, "steam tank %.2f", level)
+        for _, tb in ipairs(sim.turbines) do
+            check(math.abs(tb.rpm - 1800) < 100, "turbine rpm %.0f", tb.rpm)
+        end
+    end
+end)
+
 test("modules never call require (os.loadAPI environments lack it)", function()
     for _, f in ipairs(MODULE_FILES) do
         local h = assert(io.open(f, "r"))

@@ -22,6 +22,7 @@ function driver.discover(ctx)
     if not core then
         return {}, configured and ("Energy core: " .. tostring(why)) or nil
     end
+    if ctx.known and ctx.known("energy_core:" .. core.name) then return {} end
 
     local unit = {
         id = "energy_core:" .. core.name,

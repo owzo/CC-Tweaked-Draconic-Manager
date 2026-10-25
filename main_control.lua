@@ -54,8 +54,44 @@ local DRIVERS = {"drivers.draconic", "drivers.extreme", "drivers.energy_core"}
 
 local state = {
     units = {},                -- every discovered unit, in driver order
-    byId = {}
+    byId = {},
+    drivers = {},
+    rescanAt = nil             -- pending hot-plug rescan (os.clock time)
 }
+
+-- How long peripheral events must settle before a hot-plug rescan.
+local RESCAN_DELAY = 2
+
+------------------------------------------------------------
+-- TASK SCHEDULER
+------------------------------------------------------------
+-- Like parallel.waitForAny, but tasks can be added while running, so a
+-- reactor connected later gets its own control loop without a restart.
+local tasks = {}
+
+local function spawn(fn)
+    local task = {co = coroutine.create(fn)}
+    table.insert(tasks, task)
+    local ok, filter = coroutine.resume(task.co)
+    if not ok then error(filter, 0) end
+    task.filter = filter
+end
+
+local function runTasks()
+    while true do
+        local event = {os.pullEventRaw()}
+        -- Tasks spawned while handling this event start with the next one.
+        for i = 1, #tasks do
+            local task = tasks[i]
+            if coroutine.status(task.co) ~= "dead"
+                    and (task.filter == nil or task.filter == event[1] or event[1] == "terminate") then
+                local ok, filter = coroutine.resume(task.co, (table.unpack or unpack)(event))
+                if not ok then error(filter, 0) end
+                task.filter = filter
+            end
+        end
+    end
+end
 
 ------------------------------------------------------------
 -- CONFIG VALIDATION
@@ -191,10 +227,12 @@ local function describePeripherals()
     return lines
 end
 
+local function knownUnit(id) return state.byId[id] ~= nil end
+
 local function discoverUnits(drivers)
     local ctx = {config = config, log = stat_utils, import = import,
                  askGates = askGates, askUnits = askUnits,
-                 overrides = persist.overrides}
+                 overrides = persist.overrides, persist = persist, known = knownUnit}
     while true do
         local units, problems = {}, {}
         for _, drv in ipairs(drivers) do
@@ -318,6 +356,38 @@ local function eventLoop()
         elseif event == "peripheral" or event == "peripheral_detach"
                 or event == "monitor_resize" then
             setupDisplays()
+            if event == "peripheral" then state.rescanAt = os.clock() + RESCAN_DELAY end
+        end
+    end
+end
+
+local function addUnit(u)
+    table.insert(state.units, u)
+    state.byId[u.id] = u
+end
+
+-- Looks for units attached after start-up. Never prompts: a second
+-- Draconic reactor still needs the setup wizard (restart) or config.lua.
+local function hotplugLoop()
+    while true do
+        sleep(1)
+        if state.rescanAt and os.clock() >= state.rescanAt then
+            state.rescanAt = nil
+            local ctx = {config = config, log = stat_utils, import = import,
+                         overrides = persist.overrides, persist = persist, known = knownUnit}
+            for _, drv in ipairs(state.drivers) do
+                local ok, found, err = pcall(drv.discover, ctx)
+                if ok then
+                    for _, u in ipairs(found or {}) do
+                        addUnit(u)
+                        spawn(u.run)
+                        stat_utils.log("INFO", "New unit connected: " .. u.name)
+                    end
+                    if err then stat_utils.log("WARN", "Rescan: " .. tostring(err)) end
+                else
+                    stat_utils.log("WARN", "Rescan " .. drv.label .. ": " .. tostring(found))
+                end
+            end
         end
     end
 end
@@ -349,14 +419,16 @@ local function main()
 
     stat_utils.log("INFO", "Starting v" .. VERSION)
     persist.load()
-    state.units = discoverUnits(loadDrivers())
-    for _, u in ipairs(state.units) do state.byId[u.id] = u end
+    state.drivers = loadDrivers()
+    for _, u in ipairs(discoverUnits(state.drivers)) do addUnit(u) end
 
     setupDisplays()
     print(string.format("Running %d unit(s). Hold Ctrl+T to stop.", #state.units))
-    local loops = {uiLoop, eventLoop}
-    for _, u in ipairs(state.units) do table.insert(loops, u.run) end
-    parallel.waitForAny((table.unpack or unpack)(loops))
+    spawn(uiLoop)
+    spawn(eventLoop)
+    spawn(hotplugLoop)
+    for _, u in ipairs(state.units) do spawn(u.run) end
+    runTasks()
 end
 
 local ok, err = pcall(main)

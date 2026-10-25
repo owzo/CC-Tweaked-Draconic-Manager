@@ -21,7 +21,10 @@ shutdown on unsafe conditions.
   - temperature above `maxTemperature` (8000 °C)
   - field below `minField` (20%)
   - remaining fuel below `minFuel` (10%)
-- **Auto-restart**: after a temperature or field trip the reactor restarts once it has cooled below `safeTemperature`. This is capped at 3 restarts per hour, after which a person has to press START. A low-fuel trip never restarts on its own.
+- **Auto-restart**: after a temperature or field trip the reactor resumes as soon as it has cooled below `safeTemperature`, straight from its shutdown (Draconic Evolution allows re-activation above 2000 °C), so there is no full cooldown and recharge. This is capped at 3 restarts per hour, after which a person has to press START. A low-fuel trip never restarts on its own.
+- **Wiring check**: if charging makes no progress for 30 seconds, an alarm says the input gate isn't reaching the energy injector (wrong gate, a fluid gate, or no power behind it).
+- **Remembers manual modes**: manual output (Draconic) and manual rods (Extreme/Bigger Reactors) survive reboots.
+- **Hot-plug**: machines connected while the program runs are picked up within a few seconds, with no restart. A second Draconic reactor still needs the setup wizard (restart) or `config.lua`, because its gates have to be assigned.
 - **Fail-safe exit**: if the program stops (Ctrl+T, crash, reactor link lost), the output gate goes to 0 and the input gate to twice the last field demand. With output at 0, saturation climbs and field drain collapses, so that margin is wide.
 - **Plug-and-play detection**: peripherals are found by the methods they expose, not by their names. On DE 1.16 to 1.20 flux gates report the type `flow_gate`, not `flux_gate`. This breaks drmon and was one cause of [issue 5](https://github.com/owzo/CC-Tweaked-Draconic-Manager/issues/5). Detection works with any modem name. If two gates are found you are asked once which one is the input, and the answer is saved.
 - **Dashboard** (styled after drmon): shows status, generation, temperature, field, saturation, fuel, gate rates, an optional energy core readout and alarms. It redraws through a buffer, so there is no flicker. It works on any number of monitors and falls back to the computer screen when none are attached.
@@ -133,8 +136,25 @@ active (steam) cooling. Settings live in `config.extreme`.
 | Active (steam) reactor | Matches steam production to what the turbines are set to draw, and uses its steam tank level only as a trim. A steam tank holds only seconds of mismatch, too little to steer by on its own. |
 | Turbine | Spins up with the coils off (engaged coils brake the rotor; Bigger Reactors turbines start engaged), then a PI loop on steam flow holds `targetRPM` (1800, the efficiency peak in both mods). When the turbine's own buffer is full, the coils switch off and the rotor is kept at speed; they switch back on below `coilsOnBelow`. Steam is cut above `maxRPM`. |
 
-All steam-cooled reactors and turbines on the network are treated as one
-steam system (the usual build: reactors feed a shared pipe network).
+By default all steam-cooled reactors and turbines on the network are treated
+as one steam system (the usual build: reactors feed a shared pipe network).
+If you run separate steam systems, give each unit a `steamGroup`; only
+units in the same group share steam demand:
+
+```lua
+config.extreme.units = {
+    {peripheral = "BigReactors-Reactor_0", steamGroup = "A"},
+    {peripheral = "BigReactors-Turbine_0", steamGroup = "A"},
+    {peripheral = "BigReactors-Reactor_1", steamGroup = "B"},
+    {peripheral = "BigReactors-Turbine_1", steamGroup = "B"},
+}
+```
+
+**Tuning:** every control loop has a speed multiplier you can change live on
+the unit's `S` page: `Output Gain` (Draconic), `Rod Gain` (fission) and
+`Flow Gain` (turbines). Lower it if rods, output or flow keep hunting back
+and forth; raise it if the buffer, temperature or RPM drifts and recovers
+slowly. Changes are saved, and `RESET` returns to `config.lua`.
 
 **Neither mod can melt down or explode**, and turbines take no damage from
 overspeed. The worst outcome of bad control is wasted fuel or steam, so
@@ -324,6 +344,7 @@ watch `logs/reactor_stats.csv`.
 | `No reactor found` / `Need two flux gates` | Check the wiring (wired modems, right-clicked). The message lists every peripheral the computer can see; compare it with `peripherals`. |
 | Only `energy_storage` peripherals listed | Draconic Evolution build too old for CC. Update to 3.1.2.604+ (see Compatibility). |
 | `Control loop runs every …s` warning | Server lag. Keep conservative limits. |
+| `CHARGING STALLED - CHECK INPUT GATE` | The input gate isn't feeding the energy injector: the wrong gate was picked (run `set draconic.inputGate <name>`), it's a fluid gate, or the energy source is empty. |
 
 ## Development
 
@@ -342,7 +363,10 @@ offline_install.lua    floppy-disk installer
 tests/                 CC mock, reactor simulator, test suite
 ```
 
-Run the tests with any Lua 5.2+ interpreter from the repository root:
+Every push and pull request runs the tests automatically on GitHub (Lua 5.2
+and 5.4, plus a Lua 5.1 syntax check of every shipped file; see
+`.github/workflows/tests.yml`). To run them yourself, use any Lua 5.2+
+interpreter from the repository root:
 
 ```shell
 lua tests/run_tests.lua

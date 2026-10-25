@@ -349,7 +349,7 @@ function Buffer:step(d, now, demandHint)
     elseif not d.active then
         -- Idle reactors keep their last rods; nothing to regulate.
     else
-        local gain = d.activelyCooled and ROD_GAIN or ROD_GAIN_PASSIVE
+        local gain = (d.activelyCooled and ROD_GAIN or ROD_GAIN_PASSIVE) * (c.rodGain or 1)
         local maxStep = (d.activelyCooled and ROD_RATE_MAX or ROD_RATE_MAX_PASSIVE) * cycle
         local mid = (c.bufferLow + c.bufferHigh) / 2
         local step
@@ -466,8 +466,9 @@ function Turbine:step(d, now)
             -- Bumpless entry: start from the steam actually flowing.
             self.integral = clamp(d.flow or self.flow, 0, limit)
         end
-        self.integral = clamp(self.integral + FLOW_KI * size * err * dt, 0, limit)
-        self.flow = clamp(self.integral + FLOW_KP * size * err, 0, limit)
+        local tune = c.flowGain or 1
+        self.integral = clamp(self.integral + FLOW_KI * size * tune * err * dt, 0, limit)
+        self.flow = clamp(self.integral + FLOW_KP * size * tune * err, 0, limit)
         self.coils = self.mode == "run"
     end
     if d.active and (d.steam or 0) <= 0 and (d.flowSet or 0) > 0 then
