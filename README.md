@@ -29,6 +29,7 @@ shutdown on unsafe conditions.
 - **Fail-safe exit**: if the program stops (Ctrl+T, crash, reactor link lost), the output gate goes to 0 and the input gate to twice the last field demand. With output at 0, saturation climbs and field drain collapses, so that margin is wide.
 - **Plug-and-play detection**: peripherals are found by the methods they expose, not by their names. On DE 1.16 to 1.20 flux gates report the type `flow_gate`, not `flux_gate`. This breaks drmon and was one cause of [issue 5](https://github.com/owzo/CC-Tweaked-Draconic-Manager/issues/5). Detection works with any modem name. If two gates are found you are asked once which one is the input, and the answer is saved.
 - **Dashboard** (styled after drmon): shows status, generation, temperature, field, saturation, fuel, gate rates, an optional energy core readout and alarms. It redraws through a buffer, so there is no flicker. It works on any number of monitors and falls back to the computer screen when none are attached.
+- **Energy storage**: Draconic energy cores, Mekanism induction matrices and energy cubes, Flux Networks, Powah, EnderIO, Thermal and any Forge-energy block, with input/output/net flow, time to full/empty and an **Energy Network** view (generation, storage flow, consumption). See [Energy storage](#energy-storage).
 - **Logging**: events go to `logs/draconic.log` and a stats CSV to `logs/reactor_stats.csv`. Both rotate in size so the disk can never fill up. Optionally every line is also sent to a small collector on a real computer (see [Logs on a real computer](#logs-on-a-real-computer)).
 
 ## Requirements
@@ -39,7 +40,7 @@ shutdown on unsafe conditions.
   - **input gate**: energy source → gate → reactor **energy injector**
   - **output gate**: reactor **stabilizer** → gate → your storage (energy core)
 - An **Advanced Computer**
-- Optional: advanced monitors (3x3 recommended) and an energy core pylon
+- Optional: advanced monitors (3x3 recommended) and energy storage (energy core pylon, induction matrix, ...)
 
 ### Wiring (read this first)
 
@@ -179,6 +180,90 @@ unit in `config.extreme.units`.
 | Bigger Reactors has no battery when actively cooled, and object accessors (`battery()`, `rotor()`) | Hidden behind one adapter (`er_utils.lua`) |
 | Bigger Reactors turbine vents can't be set from CC | Not touched by the program in either mod |
 
+## Energy storage
+
+Energy stores on the network are found automatically and shown read-only
+next to the reactors, each with its own page (stored, capacity, input,
+output, net flow, time to full or empty, charge bar) and graphs. Storage is
+optional and works with any mix of reactor mods. Everything is shown in FE
+(= RF) per tick.
+
+| Mod / block | How it is detected | Flow figures |
+| --- | --- | --- |
+| Draconic Evolution energy core | Energy **pylon** (`draconic_rf_storage`) | Input / output per tick from the pylon (DE 1.18+), else its net transfer |
+| Mekanism induction matrix | **Induction Port** (`inductionPort`) | `getLastInput` / `getLastOutput` |
+| Mekanism energy cube | `basicEnergyCube` … `creativeEnergyCube` | Measured from the stored energy |
+| Flux Networks | Flux **Controller** with the [UnlimitedPeripheralWorks](https://github.com/SirEdvin/UnlimitedPeripheralWorks) addon (`flux_controller`): network energy and `getStatistic()` input/output. Flux Networks itself has no CC support on 1.20.1 | Network input / output |
+| Powah energy / ender cells | Advanced Peripherals (`energyCell`, `enderCell`), or CC's generic peripheral without it | Measured |
+| EnderIO capacitor banks, Thermal energy cells, anything else with Forge energy | CC:Tweaked's generic **`energy_storage`** peripheral (`getEnergy` / `getEnergyCapacity`) on a wired modem | Measured |
+| Advanced Peripherals **Energy Detector** (`energyDetector`) | Shown as an **Energy Meter**: the FE/t passing through it. Never changes its limit | Measured by the block |
+
+Notes from the mods' source:
+
+- **Mekanism reports Joules.** They are converted to FE with Mekanism's own
+  `mekanismEnergyHelper.joulesToFE` (so a server's custom conversion rate is
+  honoured), or 2.5 J = 1 FE when that API is missing.
+- CC's generic `energy_storage` returns 32-bit numbers, so a block holding
+  more than 2.1G FE reads as 2.1G (its page then says `OVER 2.1G`). Use the
+  mod's own peripheral where one exists (pylon, induction port).
+- CC only offers the generic peripheral for blocks **without** a peripheral
+  of their own, and per side: a side configured to "none" may show nothing.
+- Draconic tier-8 cores beyond the 64-bit range are read through the pylon's
+  `...InNotation` methods.
+
+**Nothing is counted twice:**
+
+- Peripherals other drivers control (Draconic reactors and flux gates,
+  Extreme/Bigger Reactors computer ports) are skipped.
+- Generic energy blocks of reactor mods (reactor/turbine power taps) and
+  Flux Networks plugs/points (only a small transfer buffer) are skipped.
+- Several ports of one induction matrix (same multiblock bounds), and several
+  blocks of one EnderIO capacitor bank or Powah ender network (same type and
+  identical readings at discovery), count once. Two separate stores of the
+  same type that read exactly the same at that moment would also be merged;
+  name them in `exclude`/`include` if that ever happens.
+
+### Flow math
+
+For each store the **net flow** (+ charging, − discharging) is
+`input − output` when the mod reports both, the mod's own net figure when
+it reports one, otherwise the change in stored energy over game time
+(`Δstored / Δticks`). Rates are smoothed with a 5-second exponential
+average. **Time to full** is `(capacity − stored) / net`, **time to empty**
+`stored / −net`.
+
+The **Energy Network** (its own card, page and graphs, plus a line under the
+Overview total) adds everything up:
+
+```text
+generation   = sum of producing units' output   (Draconic output gate, ER/BR FE)
+storage net  = sum of every store's net flow
+consumption  = generation − storage net          (includes the Draconic injector draw)
+```
+
+Example: a Draconic reactor outputs 60M RF/t into an energy core and the core
+gains 35M RF/t, so the base (injector included) uses 25M RF/t. Generation
+the program does not control (solar, other generators) is not counted, so
+consumption is a lower bound in that case. Stats go to
+`logs/storage_<name>.csv` and `logs/energy_network.csv`.
+
+### Configuration
+
+```lua
+config.storage = {
+    enabled = true,
+    include = {},     -- non-empty: use ONLY these peripherals (also forces skipped ones)
+    exclude = {},     -- never use these
+    names   = {inductionPort_0 = "Main Matrix"},
+    pollInterval = 1  -- seconds; every reading costs a server tick
+}
+```
+
+Entries are peripheral names as `peripherals` prints them; `*` matches
+anything (`"enderio:*"`). `config.peripherals.energyCore` still works: that
+peripheral becomes the **primary** store, the one shown on Draconic reactor
+pages (otherwise the first Draconic pylon, then the first other store).
+
 ## Mekanism
 
 Fission reactors, fusion reactors, industrial turbines and thermoelectric
@@ -244,7 +329,7 @@ Tap `[i] Overview` (the top row of the Overview) for the System page:
 
 ## Menus and monitors
 
-With more than one unit (reactor, turbine or energy core), every monitor
+With more than one unit (reactor, turbine or energy store), every monitor
 opens on the **Overview**. It has one card per unit (name, status, key
 reading and a bar) and total generation at the top. Tap a card to open
 that unit's page. If there are more cards than fit, `<` / `>` at the bottom
@@ -255,7 +340,7 @@ Every unit page has a navigation row at the top:
 | Button | Opens |
 | --- | --- |
 | `<` | Back to the Overview |
-| `G` | **Graphs**: history charts. Draconic: temperature, field, saturation, output. Fission: buffer, generation, rods. Turbine: RPM, generation, steam flow. One sample every `ui.graphInterval` seconds; a 3x3 monitor shows the last ~2 minutes. |
+| `G` | **Graphs**: history charts. Draconic: temperature, field, saturation, output. Fission: buffer, generation, rods. Turbine: RPM, generation, steam flow. Storage: charge, net flow, input, output. Energy Network: generation, consumption, storage net, charge. One sample every `ui.graphInterval` seconds; a 3x3 monitor shows the last ~2 minutes. |
 | `S` | **Settings**: the unit's tunable values, each with `-` / `+` |
 | `X` | Back to the unit page (from Graphs or Settings) |
 
@@ -322,6 +407,7 @@ above the target.
 | `reactor.maxOutflow` | 1,000,000,000 | Output cap (the regulator sets the real rate) |
 | `reactor.outputAggressiveness` | 1.0 | Temperature loop gain multiplier |
 | `reactor.controlInterval` | 0.05 | Seconds per control cycle (1 game tick) |
+| `storage.*` | see [Energy storage](#energy-storage) | Storage include/exclude/names, poll interval |
 | `ui.textScale` | auto | Monitor text scale |
 | `logging.statsInterval` | 10 | Seconds between CSV rows |
 | `logging.directory` | `logs` | Folder for every log and stats file |
@@ -601,10 +687,12 @@ alarms.lua             speaker / chat box / redstone alarm outputs, silence
 totals.lua             long-term energy totals (data/totals.db)
 updater.lua            update check and install from GitHub
 drivers/draconic.lua   Draconic reactor units (wraps reac_utils)
-drivers/energy_core.lua  read-only energy pylon units
+drivers/extreme.lua    Extreme / Bigger Reactors units (wraps er_utils)
+drivers/storage.lua    read-only energy storage, meter and Energy Network units
 reac_utils.lua         Draconic discovery, gate adapter, controller (pure logic)
 monitor_utils.lua      overview, unit pages, settings, graphs, navigation, touch hit-testing
-energy_core_utils.lua  energy pylon readout
+er_utils.lua           Extreme / Bigger Reactors adapters and controllers
+storage_utils.lua      storage adapters per mod API, J->FE, flow tracking, network aggregate
 stat_utils.lua         event log, per-unit stats CSV, rotation, sink hook
 log_shipper.lua        optional remote logging: bounded queue, batched HTTP POST, backoff
 config.lua             user settings

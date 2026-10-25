@@ -215,13 +215,29 @@ function peripheral.getNames()
     table.sort(names)
     return names
 end
+-- A peripheral's kind is a type name or a list {primary, additional...}
+-- (CC's generic peripherals: {"modid:block", "energy_storage"}).
+local function typesOf(entry)
+    if type(entry.kind) == "table" then return entry.kind end
+    return {entry.kind}
+end
 function peripheral.isPresent(name) return registry[name] ~= nil end
-function peripheral.getType(name) return registry[name] and registry[name].kind end
+function peripheral.getType(name)
+    if not registry[name] then return nil end
+    return (table.unpack or unpack)(typesOf(registry[name]))
+end
+function peripheral.hasType(name, kind)
+    if not registry[name] then return nil end
+    for _, t in ipairs(typesOf(registry[name])) do
+        if t == kind then return true end
+    end
+    return false
+end
 function peripheral.wrap(name) return registry[name] and registry[name].dev end
 function peripheral.find(kind)
     local out = {}
     for _, name in ipairs(peripheral.getNames()) do
-        if registry[name].kind == kind then table.insert(out, registry[name].dev) end
+        if peripheral.hasType(name, kind) then table.insert(out, registry[name].dev) end
     end
     return table.unpack and table.unpack(out) or unpack(out)
 end

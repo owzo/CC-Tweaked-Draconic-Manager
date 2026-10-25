@@ -37,7 +37,7 @@ config.peripherals = {
     reactor    = nil,   -- Reactor stabilizer (or injector) modem
     inputGate  = nil,   -- Flux gate feeding the reactor ENERGY INJECTOR
     outputGate = nil,   -- Flux gate taking power FROM a reactor STABILIZER
-    energyCore = nil,   -- Energy pylon (optional, display only)
+    energyCore = nil,   -- Primary energy store (optional, display only)
     monitors   = {}     -- Empty = use every attached monitor
 }
 
@@ -112,6 +112,24 @@ config.extreme = {
     -- units = {{peripheral = "BigReactors-Turbine_0", name = "Turbine A",
     --           settings = {targetRPM = 900}}},
     units = {}
+}
+
+------------------------------------------------------------
+-- ENERGY STORAGE (optional, display only)
+------------------------------------------------------------
+-- Energy stores on the network are found automatically: Draconic energy
+-- core pylons, Mekanism induction matrices and energy cubes, Flux
+-- Networks controllers (UnlimitedPeripheralWorks), Powah cells, Advanced
+-- Peripherals energy detectors, and any block CC:Tweaked shows as
+-- "energy_storage" (EnderIO capacitor banks, Thermal cells, ...).
+-- Names below are peripheral names; "*" matches anything
+-- ("mekanism*", "enderio:*_capacitor_bank_*").
+config.storage = {
+    enabled = true,
+    include = {},                   -- Non-empty: use ONLY these peripherals
+    exclude = {},                   -- Never use these
+    names   = {},                   -- e.g. {inductionPort_0 = "Main Matrix"}
+    pollInterval = 1                -- Seconds between readings
 }
 
 ------------------------------------------------------------

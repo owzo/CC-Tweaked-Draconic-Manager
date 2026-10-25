@@ -27,7 +27,7 @@ local files = {
     "reac_utils.lua",
     "monitor_utils.lua",
     "stat_utils.lua",
-    "energy_core_utils.lua",
+    "storage_utils.lua",
     "er_utils.lua",
     "mek_utils.lua",
     "persist.lua",
@@ -38,7 +38,7 @@ local files = {
     "drivers/draconic.lua",
     "drivers/extreme.lua",
     "drivers/mekanism.lua",
-    "drivers/energy_core.lua",
+    "drivers/storage.lua",
     "config.lua"
 }
 -- Never overwrite a player's tuned settings on update.

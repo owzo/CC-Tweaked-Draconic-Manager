@@ -11,15 +11,15 @@ local cc = require("mock_cc")
 local Sim = require("reactor_sim")
 
 local MODULES = {"config", "reac_utils", "monitor_utils", "stat_utils",
-                 "energy_core_utils", "log_shipper"}
+                 "storage_utils", "drivers.storage", "log_shipper"}
 local TICK = 0.05
 
 -- Everything the installers must ship; MODULE_FILES are loaded by
 -- main_control and must never call require themselves.
 PROGRAM_FILES = {"main_control.lua", "config.lua", "reac_utils.lua", "monitor_utils.lua",
-                 "stat_utils.lua", "energy_core_utils.lua", "er_utils.lua", "mek_utils.lua", "persist.lua",
+                 "stat_utils.lua", "storage_utils.lua", "er_utils.lua", "mek_utils.lua", "persist.lua",
                  "alarms.lua", "totals.lua", "updater.lua", "log_shipper.lua",
-                 "drivers/draconic.lua", "drivers/extreme.lua", "drivers/mekanism.lua", "drivers/energy_core.lua"}
+                 "drivers/draconic.lua", "drivers/extreme.lua", "drivers/mekanism.lua", "drivers/storage.lua"}
 MODULE_FILES = {}
 for _, f in ipairs(PROGRAM_FILES) do
     if f ~= "main_control.lua" then table.insert(MODULE_FILES, f) end
@@ -1348,6 +1348,295 @@ test("Mekanism settings: scram temperature can never reach the damage threshold"
                      min = function(c) return 400 + c.tempMargin end, max = 1150}}
     for _ = 1, 20 do persist.adjust(cfg, schema, "maxTemperature", 1) end
     check(cfg.maxTemperature == 1150, "cap %s", tostring(cfg.maxTemperature))
+end)
+
+------------------------------------------------------------
+-- ENERGY STORAGE
+------------------------------------------------------------
+-- Mock peripherals, one per supported API.
+local function genericStore(stored, capacity)
+    local d = {stored = stored, capacity = capacity}
+    d.getEnergy = function() return math.min(d.stored, 2147483647) end
+    d.getEnergyCapacity = function() return math.min(d.capacity, 2147483647) end
+    return d
+end
+
+local function pylonDev(stored, capacity, rates)
+    local d = {stored = stored, input = 0, output = 0}
+    d.getEnergyStored = function() return d.stored end
+    d.getMaxEnergyStored = function() return capacity end
+    if rates then
+        d.getInputPerTick = function() return d.input end
+        d.getOutputPerTick = function() return d.output end
+        d.getTransferPerTick = function() return d.input - d.output end
+    end
+    return d
+end
+
+-- Mekanism induction port: everything in Joules.
+local function matrixDev(storedJ, capacityJ, lo, hi)
+    local d = {stored = storedJ, inJ = 0, outJ = 0, formed = true}
+    d.isFormed = function() return d.formed end
+    d.getEnergy = function() return d.stored end
+    d.getMaxEnergy = function() return capacityJ end
+    d.getEnergyNeeded = function() return capacityJ - d.stored end
+    d.getEnergyFilledPercentage = function() return d.stored / capacityJ end
+    d.getLastInput = function() return d.inJ end
+    d.getLastOutput = function() return d.outJ end
+    d.getTransferCap = function() return 1e9 end
+    d.getMinPos = function() return lo or {x = 0, y = 64, z = 0} end
+    d.getMaxPos = function() return hi or {x = 4, y = 68, z = 4} end
+    return d
+end
+
+local function cubeDev(storedJ, capacityJ)
+    return {getEnergy = function() return storedJ end, getMaxEnergy = function() return capacityJ end,
+            getEnergyNeeded = function() return capacityJ - storedJ end,
+            getEnergyFilledPercentage = function() return storedJ / capacityJ end}
+end
+
+-- Flux Networks controller through UnlimitedPeripheralWorks.
+local function fluxDev(stored, capacity, input, output, id)
+    return {getEnergy = function() return stored end, getEnergyCapacity = function() return capacity end,
+            getEnergyUnit = function() return "FORGE" end,
+            getNetwork = function() return {id = id or 1, name = "Base"} end,
+            getStatistic = function() return {energyInput = input, energyOutput = output,
+                                               totalEnergy = stored, totalBuffer = 0} end}
+end
+
+local function detectorDev(rate)
+    return {getTransferRate = function() return rate end,
+            getTransferRateLimit = function() return 2147483647 end,
+            setTransferRateLimit = function() error("must not be called") end}
+end
+
+local function storageCtx(cfg, known)
+    local logged = {}
+    return {config = cfg, import = function(n) return require(n) end, known = known,
+            log = {log = function(_, m) table.insert(logged, m) end, recordRow = function() end},
+            logged = logged}
+end
+
+local function storageDriver()
+    freshModules()
+    return require("drivers.storage"), require("config")
+end
+
+local function byName(units)
+    local out = {}
+    for _, u in ipairs(units) do out[u.name] = u end
+    return out
+end
+
+local function namesOf(units)
+    local t = {}
+    for _, u in ipairs(units) do t[#t + 1] = u.name end
+    return table.concat(t, ", ")
+end
+
+test("storage: every API classified, other drivers' blocks and duplicates skipped", function()
+    cc.reset()
+    local sim = Sim.new()
+    wireSim(sim, "flow_gate")
+    local er = ErSim.new({})
+    wireEr(er, "BigReactors-")
+    cc.addPeripheral("monitor_0", "monitor", cc.newScreen(29, 19))
+    cc.addPeripheral("draconic_rf_storage_0", "draconic_rf_storage", pylonDev(5e9, 1e10, true))
+    -- Two ports of ONE induction matrix (same bounds) and a second matrix.
+    cc.addPeripheral("inductionPort_0", "inductionPort", matrixDev(2.5e9, 5e9))
+    cc.addPeripheral("inductionPort_1", "inductionPort", matrixDev(2.5e9, 5e9))
+    cc.addPeripheral("inductionPort_2", "inductionPort",
+                     matrixDev(1e6, 2e6, {x = 100, y = 0, z = 0}, {x = 103, y = 3, z = 3}))
+    cc.addPeripheral("ultimateEnergyCube_0", "ultimateEnergyCube", cubeDev(1e6, 2.56e8))
+    -- Two blocks of one EnderIO bank report the whole bank; Thermal cells
+    -- with the same numbers are different stores.
+    local bank = {"enderio:vibrant_capacitor_bank", "energy_storage"}
+    local cell = {"thermal:energy_cell", "energy_storage"}
+    cc.addPeripheral("enderio:vibrant_capacitor_bank_0", bank, genericStore(3e6, 2.5e7))
+    cc.addPeripheral("enderio:vibrant_capacitor_bank_1", bank, genericStore(3e6, 2.5e7))
+    cc.addPeripheral("thermal:energy_cell_0", cell, genericStore(3e6, 2.5e7))
+    cc.addPeripheral("thermal:energy_cell_1", cell, genericStore(3e6, 2.5e7))
+    -- Transit buffers and reactor power taps are not storage.
+    cc.addPeripheral("fluxnetworks:flux_point_0", {"fluxnetworks:flux_point", "energy_storage"}, genericStore(5, 100))
+    cc.addPeripheral("bigreactors:reactorpowertap_0", {"bigreactors:reactorpowertap", "energy_storage"},
+                     genericStore(1, 10))
+    cc.addPeripheral("fluxnetworks:flux_controller_0", {"fluxnetworks:flux_controller", "flux_controller"},
+                     fluxDev(4e9, 8e9, 3000, 1000))
+    cc.addPeripheral("energyDetector_0", "energyDetector", detectorDev(4096))
+
+    local drv, cfg = storageDriver()
+    local units = drv.discover(storageCtx(cfg))
+    local n = byName(units)
+    local kinds = {}
+    for _, u in ipairs(units) do kinds[u.kind] = (kinds[u.kind] or 0) + 1 end
+    check(kinds.storage == 8 and kinds.meter == 1 and kinds.network == 1,
+          "storage %s meter %s network %s: %s", tostring(kinds.storage), tostring(kinds.meter),
+          tostring(kinds.network), namesOf(units))
+    check(units[1].name == "Energy Core" and units[1].id == "energy_core:draconic_rf_storage_0",
+          "pylon is not the primary storage: %s", namesOf(units))
+    check(n["Induction Matrix"] and n["Induction Matrix 2"] and not n["Induction Matrix 3"],
+          "matrix ports not deduplicated: %s", namesOf(units))
+    check(n["Vibrant Capacitor"] and not n["Vibrant Capacitor 2"], "capacitor bank: %s", namesOf(units))
+    check(n["Energy Cell"] and n["Energy Cell 2"], "two Thermal cells merged: %s", namesOf(units))
+    check(n["Flux Network"] and n["Energy Meter"] and n["Energy Cube"], "flux/meter/cube missing")
+    for _, u in ipairs(units) do
+        local p = u.adapter and u.adapter.name or ""
+        check(not p:find("flux_point") and not p:find("powertap") and not p:find("flow_gate")
+              and not p:find("draconic_reactor") and not p:find("BigReactors"), "%s claimed", p)
+    end
+    local flux = n["Flux Network"].info
+    check(flux.input == 3000 and flux.output == 1000 and flux.net == 2000, "flux rates %s/%s/%s",
+          tostring(flux.input), tostring(flux.output), tostring(flux.net))
+    check(n["Energy Meter"].info.rate == 4096, "meter rate")
+    check(n["Energy Cube"].info.max == 2.56e8 / 2.5, "cube not converted to FE")
+end)
+
+test("storage: config include/exclude/names and energyCore", function()
+    cc.reset()
+    cc.addPeripheral("thermal:energy_cell_0", {"thermal:energy_cell", "energy_storage"}, genericStore(1, 10))
+    cc.addPeripheral("thermal:energy_cell_1", {"thermal:energy_cell", "energy_storage"}, genericStore(2, 10))
+    cc.addPeripheral("fluxnetworks:flux_plug_0", {"fluxnetworks:flux_plug", "energy_storage"}, genericStore(5, 100))
+    local drv, cfg = storageDriver()
+    cfg.storage.exclude = {"thermal:*_1"}
+    cfg.storage.names = {["thermal:energy_cell_0"] = "Cell A"}
+    local n = byName(drv.discover(storageCtx(cfg)))
+    check(n["Cell A"] and not n["Energy Cell"] and not n["Energy Cell 2"] and not n["Flux Plug"],
+          "exclude/names ignored")
+    cfg.storage.exclude, cfg.storage.include = {}, {"fluxnetworks:flux_plug_0"}
+    n = byName(drv.discover(storageCtx(cfg)))
+    check(n["Flux Plug"] and not n["Cell A"], "include did not whitelist / force")
+    cfg.storage.include = {}
+    cfg.storage.enabled = false
+    check(#drv.discover(storageCtx(cfg)) == 0, "disabled storage still found units")
+    cfg.storage.enabled = true
+    cfg.peripherals.energyCore = "thermal:energy_cell_1"
+    local units = drv.discover(storageCtx(cfg))
+    check(units[1].adapter.name == "thermal:energy_cell_1", "configured energyCore is not primary")
+    cfg.peripherals.energyCore = "missing_0"
+    local _, err = drv.discover(storageCtx(cfg))
+    check(err and err:find("not attached"), "err %s", tostring(err))
+end)
+
+test("storage: Mekanism Joules become FE (default 2.5 and server rate)", function()
+    cc.reset(); freshModules()
+    local su = require("storage_utils")
+    su.resetConversion()
+    local m = matrixDev(2.5e9, 5e9)
+    m.inJ, m.outJ = 25000, 5000
+    local a = su.wrap(su.classify("inductionPort_0", m, {"inductionPort"}), "inductionPort_0", m, "inductionPort")
+    local info = su.newTracker():update(a.read(), 0)
+    check(info.stored == 1e9 and info.max == 2e9, "stored %s max %s", tostring(info.stored), tostring(info.max))
+    check(info.input == 10000 and info.output == 2000 and info.net == 8000, "rates %s %s %s",
+          tostring(info.input), tostring(info.output), tostring(info.net))
+    m.formed = false
+    check(su.newTracker():update(a.read(), 1).formed == false, "unformed matrix not reported")
+    -- Server configured 4 J per FE: the in-game helper wins.
+    su.resetConversion()
+    mekanismEnergyHelper = {joulesToFE = function(j) return j / 4 end}
+    local c = cubeDev(4e6, 8e6)
+    local cube = su.wrap(su.classify("basicEnergyCube_0", c, {"basicEnergyCube"}), "basicEnergyCube_0", c,
+                         "basicEnergyCube")
+    local r = cube.read()
+    mekanismEnergyHelper = nil
+    su.resetConversion()
+    check(r.stored == 1e6 and r.capacity == 2e6, "helper rate ignored: %s", tostring(r.stored))
+end)
+
+test("storage: flow derived from stored energy over virtual time, ETA", function()
+    cc.reset()
+    local drv, cfg = storageDriver()
+    local store = genericStore(1e8, 1e9)
+    cc.addPeripheral("powah:energy_cell_0", {"powah:energy_cell", "energy_storage"}, store)
+    local unit = drv.discover(storageCtx(cfg))[1]
+    local rate = 1000                                   -- FE/t into the cell
+    local function feed(dt) store.stored = store.stored + rate * dt * 20 end
+    cc.run(unit.run, {untilTime = 60, onAdvance = feed})
+    local i = unit.info
+    check(math.abs(i.net - 1000) < 20, "derived net %.1f", i.net)
+    check(not i.measured and i.input == nil, "derived flow reported as measured")
+    local expect = (1e9 - i.stored) / (1000 * 20)
+    check(math.abs(i.timeToFull - expect) / expect < 0.03, "time to full %.0f vs %.0f", i.timeToFull, expect)
+    check(i.timeToEmpty == nil, "time to empty while charging")
+    rate = -2000
+    cc.run(unit.run, {untilTime = 120, onAdvance = feed})
+    i = unit.info
+    check(math.abs(i.net + 2000) < 60, "draining net %.1f", i.net)
+    local empty = i.stored / 40000
+    check(i.timeToFull == nil and math.abs(i.timeToEmpty - empty) < empty * 0.05,
+          "time to empty %s vs %.0f", tostring(i.timeToEmpty), empty)
+    -- 32-bit generic values saturate.
+    store.stored, store.capacity = 5e9, 6e9
+    check(unit.adapter.read().saturated, "int cap not flagged")
+end)
+
+test("storage: hot-plug rescan skips known units and known stores", function()
+    cc.reset()
+    local bank = {"enderio:basic_capacitor_bank", "energy_storage"}
+    cc.addPeripheral("enderio:basic_capacitor_bank_0", bank, genericStore(5e5, 1e6))
+    local drv, cfg = storageDriver()
+    local first = drv.discover(storageCtx(cfg))
+    check(#first == 2, "first discovery: %s", namesOf(first))
+    local ids = {}
+    for _, u in ipairs(first) do ids[u.id] = true end
+    local known = function(id) return ids[id] == true end
+    local again = drv.discover(storageCtx(cfg, known))
+    check(#again == 0, "known units rediscovered: %s", namesOf(again))
+    -- A second block of the same bank and a new matrix are hot-plugged.
+    cc.addPeripheral("enderio:basic_capacitor_bank_1", bank, genericStore(5e5, 1e6))
+    cc.addPeripheral("inductionPort_0", "inductionPort", matrixDev(1e6, 2e6))
+    local added = drv.discover(storageCtx(cfg, known))
+    check(#added == 1 and added[1].name == "Induction Matrix", "rescan added: %s", namesOf(added))
+end)
+
+test("energy network: Draconic reactor feeding a core, overview and network page on 29x19", function()
+    cc.reset()
+    local sim = Sim.new({version = "1.20"})
+    wireSim(sim, "flow_gate")
+    settings.set("draconic.inputGate", "flow_gate_0")
+    settings.set("draconic.outputGate", "flow_gate_1")
+    local LOAD = 2e6                                     -- base consumption, FE/t
+    local core = pylonDev(4e10, 1e13, true)
+    -- The core takes the output gate's flow and feeds the injector + load.
+    local coreSim = {tick = function()
+        core.input, core.output = sim.outFlow or 0, (sim.inFlow or 0) + LOAD
+        core.stored = core.stored + core.input - core.output
+    end}
+    cc.addPeripheral("draconic_rf_storage_0", "draconic_rf_storage", core)
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local overview, netPage, graphs, flows = "", "", "", nil
+    runProgram({sims = {sim, coreSim}, untilTime = 900, config = function(cfg)
+        cfg.reactor.autoStartOnBoot = true
+        cfg.ui.graphInterval = 2
+    end, at = {
+        {t = 840, fn = function()
+            overview = mon.text()
+            flows = {gen = sim.outFlow, use = sim.inFlow + LOAD}
+            touchText(mon, "Energy Network")
+        end},
+        {t = 841, fn = function() netPage = mon.text(); touchText(mon, " G ") end},
+        {t = 842, fn = function() graphs = mon.text() end}
+    }})
+    check(sim.state == "running", "reactor %s", sim.state)
+    -- Overview: total, network line, 3 cards (reactor, core, network) on one page.
+    check(overview:find("Overview") and overview:find("Use ") and overview:find("Energy Core")
+          and overview:find("Energy Network") and overview:find("Reactor") and not overview:find("1/2"),
+          "overview:\n%s", overview)
+    check(netPage:find("Generation") and netPage:find("Consumption") and netPage:find("Storage Net")
+          and netPage:find("CHARGING"), "network page:\n%s", netPage)
+    check(graphs:find("Generation") and graphs:find("Consumption"), "network graphs:\n%s", graphs)
+    -- Consumption = generation - net storage flow = injector draw + load.
+    local csv = cc.readFile("logs/energy_network.csv")
+    check(csv, "network stats missing")
+    local last = csv:match("([^\n]+)\n$")
+    local cells = {}
+    for c in (last .. ","):gmatch("([^,]*),") do table.insert(cells, tonumber(c) or false) end
+    local gen, use, net = cells[2], cells[3], cells[4]
+    check(gen and math.abs(gen - flows.gen) / flows.gen < 0.05, "generation %s vs %.0f", tostring(gen), flows.gen)
+    check(math.abs(use - flows.use) / flows.use < 0.1, "consumption %.0f, expected ~%.0f (gen %.0f net %.0f)",
+          use, flows.use, gen, net)
+    check(math.abs(net - (gen - use)) < 1, "net %.0f", net)
+    check(cc.readFile("logs/storage_energy_core.csv"), "storage stats missing")
 end)
 
 test("modules never call require (os.loadAPI environments lack it)", function()

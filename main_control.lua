@@ -56,7 +56,7 @@ local UPDATE_CONFIRM_SECONDS = 10
 
 -- Every driver is optional: a missing or broken driver file only removes
 -- that mod's support. Drivers whose mod is not attached find no units.
-local DRIVERS = {"drivers.draconic", "drivers.extreme", "drivers.mekanism", "drivers.energy_core"}
+local DRIVERS = {"drivers.draconic", "drivers.extreme", "drivers.mekanism", "drivers.storage"}
 
 local state = {
     units = {},                -- every discovered unit, in driver order
@@ -220,9 +220,12 @@ local function loadDrivers()
     return drivers
 end
 
+-- Read-only kinds (drivers/storage.lua) do not count as something to run.
+local PASSIVE = {storage = true, meter = true, network = true}
+
 local function controlsSomething(units)
     for _, u in ipairs(units) do
-        if u.kind ~= "storage" then return true end
+        if not PASSIVE[u.kind] then return true end
     end
     return false
 end
@@ -240,7 +243,8 @@ local function knownUnit(id) return state.byId[id] ~= nil end
 local function discoverUnits(drivers)
     local ctx = {config = config, log = stat_utils, import = import,
                  askGates = askGates, askUnits = askUnits,
-                 overrides = persist.overrides, persist = persist, known = knownUnit}
+                 overrides = persist.overrides, persist = persist, known = knownUnit,
+                 units = function() return state.units end}
     while true do
         local units, problems = {}, {}
         for _, drv in ipairs(drivers) do
@@ -472,7 +476,8 @@ local function hotplugLoop()
         if state.rescanAt and os.clock() >= state.rescanAt then
             state.rescanAt = nil
             local ctx = {config = config, log = stat_utils, import = import,
-                         overrides = persist.overrides, persist = persist, known = knownUnit}
+                         overrides = persist.overrides, persist = persist, known = knownUnit,
+                         units = function() return state.units end}
             for _, drv in ipairs(state.drivers) do
                 local ok, found, err = pcall(drv.discover, ctx)
                 if ok then
