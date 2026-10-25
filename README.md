@@ -13,6 +13,22 @@ For Draconic reactors it charges and starts them, holds the containment
 field and core temperature at their targets, and trips to a controlled
 shutdown on unsafe conditions.
 
+![Overview on a 3x3 monitor (simulated)](docs/ui/overview_57x38.png)
+
+**New here? Read the [illustrated walkthrough](docs/GUIDE.md)**: every
+screen, button and alarm, step by step.
+
+> [!WARNING]
+> **Not tested in game yet.** The screenshots in this README and the guide
+> come from running the program against simulated reactors
+> (`tools/screenshots/`), not from Minecraft. The control logic is covered
+> by automated tests against reactor simulators, but nothing here has been
+> verified on a real CC:Tweaked monitor or reactor. In game the rendering
+> may vary (font, colours, layout) or **may not work at all**, and the mods'
+> real behaviour can differ from the simulators. Try it in a creative or
+> test world first, keep backups, and set `config.ui.theme = "classic"` if
+> the colours look wrong. Bug reports are welcome.
+
 ## Features
 
 - **Field regulation**: input gate set to `fieldDrainRate / (1 - targetField)`, which holds the field at 50% by default.
@@ -335,7 +351,11 @@ Tap `[i] Overview` (the top row of the Overview) for the System page:
 
 ## Menus and monitors
 
-![Overview on a 3x3 monitor at text scale 0.5 (57x38)](docs/ui/overview_alarm_57x38.png)
+![Overview on a 3x3 monitor at text scale 0.5 (57x38), simulated](docs/ui/overview_alarm_57x38.png)
+
+> [!NOTE]
+> Screenshots are simulated (see the warning at the top). The
+> [walkthrough](docs/GUIDE.md) shows every page with what each part does.
 
 With more than one unit (reactor, turbine or energy store), every monitor
 opens on the **Overview**: total generation in the top bar (tap it for the
@@ -719,6 +739,10 @@ logging locally. The reactors are not affected either way.
 | `CHARGING STALLED - CHECK INPUT GATE` | The input gate isn't feeding the energy injector: the wrong gate was picked (run `set draconic.inputGate <name>`), it's a fluid gate, or the energy source is empty. |
 
 ## Development
+
+Screenshots in `docs/ui/` are generated: `python3 tools/screenshots/render.py`
+(needs Pillow and lupa) runs `tools/screenshots/scenes.lua`, which drives
+`main_control.lua` against the simulators and dumps the monitors.
 
 ```text
 main_control.lua       scheduler: loads drivers, one coroutine per unit, UI, input, fail-safe exit
