@@ -76,6 +76,35 @@ config.reactor = {
 }
 
 ------------------------------------------------------------
+-- EXTREME REACTORS / BIGGER REACTORS (optional)
+------------------------------------------------------------
+-- Used only when either mod's Computer Ports are on the network. Both
+-- mods are found automatically; neither can melt down, so these tune
+-- efficiency, not safety.
+config.extreme = {
+    -- Reactor rods keep a buffer between these fractions: the reactor's
+    -- own FE battery (passively cooled) or its steam tank (actively
+    -- cooled; the band's middle is the target).
+    bufferLow       = 0.30,
+    bufferHigh      = 0.70,
+    lowFuel         = 0.10,         -- Alarm below this fuel fraction
+
+    -- Turbines: efficiency peaks at ~1800 RPM in both mods.
+    targetRPM       = 1800,
+    maxRPM          = 2000,         -- Steam is cut above this
+    coilsOffAbove   = 0.95,         -- Turbine buffer full: coils off
+    coilsOnBelow    = 0.80,         -- ...and back on below this
+
+    autoStartOnBoot = false,        -- Activate reactors/turbines on start
+    controlInterval = 0.25,         -- Seconds per control cycle
+
+    -- Optional names and per-unit overrides, by peripheral name:
+    -- units = {{peripheral = "BigReactors-Turbine_0", name = "Turbine A",
+    --           settings = {targetRPM = 900}}},
+    units = {}
+}
+
+------------------------------------------------------------
 -- USER INTERFACE
 ------------------------------------------------------------
 config.ui = {
