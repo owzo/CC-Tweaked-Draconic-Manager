@@ -73,6 +73,17 @@ function reac_utils.describePeripherals()
     return lines
 end
 
+-- CC:Tweaked's generic energy peripheral (getEnergy/getEnergyCapacity).
+-- Draconic Evolution 1.20.1 builds before August 2024 (DE PR #1817) had
+-- broken CC integration, so their blocks only show up like this.
+local function isGenericEnergy(dev)
+    return hasMethod(dev, "getEnergy") and hasMethod(dev, "getEnergyCapacity")
+end
+
+local OLD_DE_HINT = " Blocks only expose CC's generic energy_storage peripheral:"
+    .. " your Draconic Evolution build predates its CC fix (Aug 2024)."
+    .. " Update to DE 3.1.2.604 or newer."
+
 local function findAll(predicate)
     local found = {}
     for _, name in ipairs(peripheral.getNames()) do
@@ -167,7 +178,9 @@ function reac_utils.discover(peripheralsCfg, chooseGates)
     if not reactorName then
         local reactors = findAll(reac_utils.isReactor)
         if #reactors == 0 then
-            return nil, "No reactor found. Connect a wired modem to a reactor stabilizer."
+            local hint = #findAll(isGenericEnergy) > 0 and OLD_DE_HINT or ""
+            return nil, "No reactor found. Connect a wired modem to a reactor stabilizer"
+                .. " or injector." .. hint
         elseif #reactors > 1 then
             return nil, "Several reactors found (" .. table.concat(reactors, ", ")
                 .. "). Set config.peripherals.reactor."
@@ -194,8 +207,9 @@ function reac_utils.discover(peripheralsCfg, chooseGates)
 
     if not inName or not outName then
         if #gates < 2 then
+            local hint = #findAll(isGenericEnergy) > 0 and OLD_DE_HINT or ""
             return nil, "Need two flux gates, found " .. #gates
-                .. ". Connect wired modems to both gates and right-click them (red ring)."
+                .. ". Connect wired modems to both gates and right-click them (red ring)." .. hint
         end
         if inName and #gates == 2 then
             outName = gates[1] == inName and gates[2] or gates[1]
@@ -603,14 +617,24 @@ end
 -- APPLY ACTIONS TO HARDWARE
 ------------------------------------------------------------
 -- Returns a list of error strings (empty on success).
+--
+-- On DE 1.20 each peripheral call waits for the next server tick, so the
+-- two gate writes run in parallel coroutines and share one tick instead
+-- of costing two.
 function reac_utils.apply(hw, actions)
     local errors = {}
     local function try(label, fn, ...)
         local ok, err = pcall(fn, ...)
         if not ok then table.insert(errors, label .. ": " .. tostring(err)) end
     end
-    try("input gate " .. hw.input.name, hw.input.set, actions.input)
-    try("output gate " .. hw.output.name, hw.output.set, actions.output)
+    local function setInput() try("input gate " .. hw.input.name, hw.input.set, actions.input) end
+    local function setOutput() try("output gate " .. hw.output.name, hw.output.set, actions.output) end
+    if parallel and coroutine.running() then
+        parallel.waitForAll(setInput, setOutput)
+    else
+        setInput()
+        setOutput()
+    end
     if actions.command == "charge" then
         try("chargeReactor", hw.reactor.chargeReactor)
     elseif actions.command == "activate" then

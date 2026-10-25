@@ -108,7 +108,7 @@ function stat_utils.log(level, message)
 end
 
 -- snapshot fields: status, temperature, fieldPct, satPct, fuelRemaining,
--- generationRate, inputRate, outputRate, corePct
+-- generationRate, inputRate, outputRate, corePct, cyclePeriod
 function stat_utils.recordStats(snapshot, force)
     local t = now()
     if not force and lastStatsAt
@@ -120,9 +120,9 @@ function stat_utils.recordStats(snapshot, force)
     local file = path("reactor_stats.csv")
     if not fs.exists(file) then
         append(file, "time,status,temperature,field,saturation,fuel,"
-                  .. "generation,input,output,core")
+                  .. "generation,input,output,core,cycle_s")
     end
-    append(file, string.format("%s,%s,%.1f,%.4f,%.4f,%.4f,%.0f,%.0f,%.0f,%s",
+    append(file, string.format("%s,%s,%.1f,%.4f,%.4f,%.4f,%.0f,%.0f,%.0f,%s,%s",
         timestamp(),
         tostring(snapshot.status),
         snapshot.temperature or 0,
@@ -132,7 +132,8 @@ function stat_utils.recordStats(snapshot, force)
         snapshot.generationRate or 0,
         snapshot.inputRate or 0,
         snapshot.outputRate or 0,
-        snapshot.corePct and string.format("%.4f", snapshot.corePct) or ""))
+        snapshot.corePct and string.format("%.4f", snapshot.corePct) or "",
+        snapshot.cyclePeriod and string.format("%.3f", snapshot.cyclePeriod) or ""))
     return true
 end
 

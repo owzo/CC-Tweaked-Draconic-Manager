@@ -28,6 +28,7 @@ local energy_core_utils = require("energy_core_utils")
 
 local VERSION = "3.0"
 local LINK_LOST_LIMIT = 10     -- consecutive failed reads before rediscovery
+local SLOW_CYCLE = 0.25        -- seconds; warn when the control loop is slower
 
 local state = {
     hw         = nil,          -- reac_utils.discover() result
@@ -35,7 +36,9 @@ local state = {
     info       = nil,
     core       = nil,          -- energy core handle
     coreInfo   = nil,
-    failedReads = 0
+    failedReads = 0,
+    cyclePeriod = nil,         -- smoothed real control period (seconds)
+    slowWarned = false
 }
 
 ------------------------------------------------------------
@@ -177,6 +180,17 @@ local function controlLoop()
         if remaining > 0 then
             sleep(remaining)
         end
+
+        -- Track the real period: server lag stretches it and shrinks the
+        -- time the controller has to react to field loss.
+        local period = os.clock() - cycleStart
+        state.cyclePeriod = state.cyclePeriod and (state.cyclePeriod * 0.9 + period * 0.1) or period
+        if state.cyclePeriod > SLOW_CYCLE and not state.slowWarned then
+            state.slowWarned = true
+            stat_utils.log("WARN", string.format(
+                "Control loop runs every %.2fs (server lag?); keep conservative limits",
+                state.cyclePeriod))
+        end
     end
 end
 
@@ -197,7 +211,8 @@ local function uiLoop()
                 fieldPct = i.fieldPct, satPct = i.satPct,
                 fuelRemaining = i.fuelRemaining, generationRate = i.generationRate,
                 inputRate = ctl.inputRate, outputRate = ctl.outputRate,
-                corePct = state.coreInfo and state.coreInfo.pct
+                corePct = state.coreInfo and state.coreInfo.pct,
+                cyclePeriod = state.cyclePeriod
             })
         end
         sleep(config.ui.refreshInterval)

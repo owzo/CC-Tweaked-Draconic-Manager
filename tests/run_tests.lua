@@ -417,6 +417,41 @@ test("discovery explains a missing gate", function()
     check(not hw and err:find("two flux gates"), "err %s", tostring(err))
 end)
 
+test("old DE build (generic energy_storage only) gets an update hint", function()
+    cc.reset(); freshModules()
+    local generic = {getEnergy = function() return 0 end,
+                     getEnergyCapacity = function() return 1 end}
+    cc.addPeripheral("energy_storage_0", "energy_storage", generic)
+    cc.addPeripheral("energy_storage_1", "energy_storage", generic)
+    local _, err = require("reac_utils").discover({}, nil)
+    check(err and err:find("3.1.2.604"), "err %s", tostring(err))
+end)
+
+test("gate writes share one server tick (main-thread call cost)", function()
+    cc.reset(); freshModules()
+    local reac = require("reac_utils")
+    local function slowGate()
+        -- Mimic DE 1.20: every call waits for the next server tick.
+        local g = {override = true}
+        g.getFlow = function() sleep(0.05); return 0 end
+        g.getOverrideEnabled = function() sleep(0.05); return true end
+        g.setFlowOverride = function() sleep(0.05) end
+        return g
+    end
+    local hw = {input = reac.wrapGate("in", slowGate()),
+                output = reac.wrapGate("out", slowGate()),
+                reactor = {}}
+    -- Prime the override check so only the writes are timed.
+    local ok, err = cc.run(function()
+        reac.apply(hw, {input = 1, output = 1, events = {}})
+        local t0 = os.clock()
+        reac.apply(hw, {input = 2, output = 2, events = {}})
+        cc.elapsed = os.clock() - t0
+    end)
+    check(ok, "crashed: %s", tostring(err))
+    check(math.abs(cc.elapsed - 0.05) < 1e-6, "two writes took %.2fs", cc.elapsed)
+end)
+
 test("config names win and are validated", function()
     cc.reset(); freshModules()
     local sim = Sim.new()

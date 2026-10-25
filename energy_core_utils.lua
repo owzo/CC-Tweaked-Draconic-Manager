@@ -13,8 +13,10 @@ core is found the UI simply shows "Core: not connected".
   energy_core_utils.discover(name)  Wrap a configured or detected core
   energy_core_utils.read(core)      {stored, max, pct, transfer}
 
-The transfer rate comes from getTransferPerTick() when the pylon offers
-it, otherwise it is estimated from the change in stored energy.
+The transfer rate comes from getInputPerTick()/getOutputPerTick() (DE
+1.18+) or getTransferPerTick() when the pylon offers them, otherwise it
+is estimated from the change in stored energy. Only the pylon
+(type draconic_rf_storage) is a peripheral; the core block is not.
 ]]
 
 local energy_core_utils = {}
@@ -73,7 +75,15 @@ function energy_core_utils.read(core, now)
     end
 
     local transfer = nil
-    if hasMethod(core.dev, "getTransferPerTick") then
+    if hasMethod(core.dev, "getInputPerTick") and hasMethod(core.dev, "getOutputPerTick") then
+        -- DE 1.18+: measured rates rather than a single net figure.
+        local okI, input = pcall(core.dev.getInputPerTick)
+        local okO, output = pcall(core.dev.getOutputPerTick)
+        if okI and okO and type(input) == "number" and type(output) == "number" then
+            transfer = input - output
+        end
+    end
+    if transfer == nil and hasMethod(core.dev, "getTransferPerTick") then
         local okT, value = pcall(core.dev.getTransferPerTick)
         if okT and type(value) == "number" then
             transfer = value
