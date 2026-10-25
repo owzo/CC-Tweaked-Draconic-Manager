@@ -29,7 +29,7 @@ shutdown on unsafe conditions.
 - **Fail-safe exit**: if the program stops (Ctrl+T, crash, reactor link lost), the output gate goes to 0 and the input gate to twice the last field demand. With output at 0, saturation climbs and field drain collapses, so that margin is wide.
 - **Plug-and-play detection**: peripherals are found by the methods they expose, not by their names. On DE 1.16 to 1.20 flux gates report the type `flow_gate`, not `flux_gate`. This breaks drmon and was one cause of [issue 5](https://github.com/owzo/CC-Tweaked-Draconic-Manager/issues/5). Detection works with any modem name. If two gates are found you are asked once which one is the input, and the answer is saved.
 - **Dashboard** (styled after drmon): shows status, generation, temperature, field, saturation, fuel, gate rates, an optional energy core readout and alarms. It redraws through a buffer, so there is no flicker. It works on any number of monitors and falls back to the computer screen when none are attached.
-- **Logging**: events go to `logs/draconic.log` and a stats CSV to `logs/reactor_stats.csv`. Both rotate in size so the disk can never fill up.
+- **Logging**: events go to `logs/draconic.log` and a stats CSV to `logs/reactor_stats.csv`. Both rotate in size so the disk can never fill up. Optionally every line is also sent to a small collector on a real computer (see [Logs on a real computer](#logs-on-a-real-computer)).
 
 ## Requirements
 
@@ -324,6 +324,12 @@ above the target.
 | `reactor.controlInterval` | 0.05 | Seconds per control cycle (1 game tick) |
 | `ui.textScale` | auto | Monitor text scale |
 | `logging.statsInterval` | 10 | Seconds between CSV rows |
+| `logging.directory` | `logs` | Folder for every log and stats file |
+| `logging.remote.enabled` | false | Send all logs to `tools/log_collector.py` (see [Logs on a real computer](#logs-on-a-real-computer)) |
+| `logging.remote.url` / `token` | | Collector URL (`.../ingest`) and its `--token` |
+| `logging.remote.batchSeconds` | 5 | Seconds between batches |
+| `logging.remote.maxQueue` | 1000 | Lines kept while the collector is unreachable |
+| `logging.remote.timeout` | 10 | Seconds per HTTP request |
 
 The program checks the config at startup and refuses to run with
 inconsistent limits (for example a target above the trip temperature).
@@ -406,6 +412,168 @@ watch `logs/reactor_stats.csv`.
 - A full energy core is safe. The reactor can't output, so saturation rises
   and the temperature falls.
 
+## Logs on a real computer
+
+Everything the program logs goes through one place (`stat_utils.lua`) into
+`config.logging.directory` (`logs/` by default):
+
+| File | Content |
+| --- | --- |
+| `draconic.log` | Every event (all levels), all units |
+| `reactor_stats.csv` / `draconic_<name>.csv` | Draconic reactor stats, one row per `statsInterval` |
+| `extreme_<name>.csv` | Extreme/Bigger Reactors reactor and turbine stats |
+| `*.old` | The previous copy after a file passed `maxFileBytes` |
+
+There are two ways to read them outside Minecraft.
+
+### Option 1: read the files on the host disk
+
+ComputerCraft keeps each computer's files as plain files in the world
+save, under `computercraft/computer/<computer id>/`. Run `id` in the
+computer's shell to get its id. The log folder is then:
+
+| Where the world runs | Log folder |
+| --- | --- |
+| Singleplayer (or Open to LAN) | `.minecraft/saves/<world>/computercraft/computer/<id>/logs/` |
+| Dedicated server | `<server folder>/<level-name>/computercraft/computer/<id>/logs/` (`<level-name>` is `world` unless `server.properties` changes it) |
+
+You can open or tail these files while the game runs. A computer's disk
+is limited (`computer_space_limit`, 1,000,000 bytes by default), which is
+why the files rotate. This only works when you can reach the machine
+Minecraft runs on.
+
+### Option 2: send the logs to a collector (any PC or server)
+
+The program can also POST every log line and every CSV row, including the
+CSV headers, to `tools/log_collector.py`. The collector writes real files,
+one folder per in-game computer:
+
+```text
+cc-logs/computer-7-Reactors/draconic.log
+cc-logs/computer-7-Reactors/reactor_stats.csv
+```
+
+The folder is `computer-<id>`, plus `-<label>` when the computer has a
+label (unsafe characters become `_`). If you change the label, a new
+folder is started.
+
+Shipping runs in its own coroutine. It never blocks reactor control. Lines
+wait in a bounded queue (`maxQueue`, 1000 by default) while the collector
+is down. When the queue is full the oldest lines are dropped. The drop
+count is written to the local log and sent with the next batch. Failed
+sends are retried with exponential backoff, up to one attempt a minute.
+Messages from startup are buffered (last 200 lines) and sent once the
+controller is running. Lines logged during shutdown are only kept locally.
+
+**1. Run the collector.** You need Python 3.8 or newer and no extra packages:
+
+```shell
+python3 -c "import secrets; print(secrets.token_urlsafe(24))"   # make a token
+python3 tools/log_collector.py --token <token> --bind 0.0.0.0 --port 8780 --root cc-logs
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--token` | `$CC_LOG_TOKEN` | Shared secret (required) |
+| `--bind` | `127.0.0.1` | Listen address. Use `0.0.0.0` (or the PC's LAN IP) when Minecraft runs on another machine |
+| `--port` | 8780 | TCP port |
+| `--root` | `./cc-logs` | Where the files go |
+| `--max-bytes` | 10 MiB | Rotate a file to `.1` … `.N` beyond this size |
+| `--backups` | 5 | Rotated copies kept per file |
+| `--max-request` | 4 MiB | Largest accepted request body |
+
+`GET /health` answers `{"ok": true}` so you can check that the collector is reachable.
+
+**2. Allow the collector's address in CC:Tweaked.** By default CC:Tweaked
+blocks every private address: localhost (127.0.0.0/8, ::1), LAN ranges
+(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), link-local, 100.64.0.0/10
+and others. The default rules are:
+
+```toml
+[[http.rules]]
+    host = "$private"
+    action = "deny"
+[[http.rules]]
+    host = "*"
+    action = "allow"
+    max_download = 16777216
+    max_upload = 4194304
+    max_websocket_message = 131072
+    use_proxy = false
+```
+
+Rules are checked in order and the first matching rule that sets `action`
+wins. Add an allow rule for your collector **above** the `$private` rule in
+`computercraft-server.toml`:
+
+```toml
+[[http.rules]]
+    host = "192.168.1.50"     # collector PC; "127.0.0.1" if it runs on the Minecraft machine
+    port = 8780               # optional: only this port
+    action = "allow"
+[[http.rules]]
+    host = "$private"
+    action = "deny"
+[[http.rules]]
+    host = "*"
+    action = "allow"
+    max_download = 16777216
+    max_upload = 4194304
+    max_websocket_message = 131072
+    use_proxy = false
+```
+
+`host` also accepts a CIDR range such as `"192.168.1.0/24"`. Keep
+`[http] enabled = true`. If a rule is malformed, CC:Tweaked logs an error
+and denies **all** HTTP, so check the game log after editing.
+
+`computercraft-server.toml` is a per-world server config:
+
+| Where the world runs | File |
+| --- | --- |
+| Singleplayer | `.minecraft/saves/<world>/serverconfig/computercraft-server.toml` (copy it to `.minecraft/defaultconfigs/` to apply it to new worlds) |
+| Dedicated server | `<server folder>/<level-name>/serverconfig/computercraft-server.toml` |
+
+Restart the world or server after editing it. A public `https://` URL,
+for example the collector behind a reverse proxy with TLS, is allowed by
+the default rules and needs no change.
+
+**3. Turn it on in `config.lua`:**
+
+```lua
+config.logging = {
+    ...
+    remote = {
+        enabled      = true,
+        url          = "http://192.168.1.50:8780/ingest",
+        token        = "<token>",
+        batchSeconds = 5,       -- seconds between batches
+        maxQueue     = 1000,    -- lines kept while the collector is down
+        timeout      = 10       -- seconds per HTTP request
+    }
+}
+```
+
+Restart the program. At startup it checks that the `http` API exists, that
+the URL is allowed (`http.checkURL`) and that a token is set. If any check
+fails it logs a `WARN` explaining why, turns remote logging off, and keeps
+logging locally. The reactors are not affected either way.
+
+**Security notes**
+
+- The token is the only thing stopping anyone who can reach the port from
+  writing files into `--root`. Use a long random token. Anyone who can read
+  `config.lua` on the computer can see it.
+- Plain `http://` sends the token and the logs unencrypted. That is fine on
+  your own LAN or on the same machine. **Don't expose the collector to the
+  internet directly.** Put it behind a reverse proxy with TLS
+  (Caddy, nginx) and use the `https://` URL, or use a VPN.
+- Bind to `127.0.0.1` when Minecraft and the collector share a machine.
+  Otherwise bind to the LAN address and firewall the port.
+- The collector only writes `*.log`, `*.csv` and `*.txt` files with simple
+  names inside its own folder. It rejects path traversal, absolute paths
+  and symlinked folders.
+
 ## Troubleshooting
 
 | Error | Cause and fix |
@@ -414,6 +582,12 @@ watch `logs/reactor_stats.csv`.
 | `No reactor found` / `Need two flux gates` | Check the wiring (wired modems, right-clicked). The message lists every peripheral the computer can see; compare it with `peripherals`. |
 | Only `energy_storage` peripherals listed | Draconic Evolution build too old for CC. Update to 3.1.2.604+ (see Compatibility). |
 | `Control loop runs every …s` warning | Server lag. Keep conservative limits. |
+| `Remote log: http://… is blocked: Domain not permitted` | CC:Tweaked denies private/LAN/localhost addresses by default. Add an allow rule for the collector above the `$private` rule in `computercraft-server.toml`, then restart the world or server (see [Logs on a real computer](#logs-on-a-real-computer)). |
+| `Remote log: the http API is not available` | `[http] enabled = false` in `computercraft-server.toml`. Turn it on, or read the files on the host disk instead. |
+| `Remote log: collector unreachable: Connection refused` | The collector is not running, or it listens on `127.0.0.1` while Minecraft runs on another machine (use `--bind 0.0.0.0`), or a firewall blocks the port. Lines wait in the queue and are retried. |
+| `Remote log: collector unreachable: … (HTTP 401)` | `config.logging.remote.token` does not match the collector's `--token`. |
+| `Remote log: N entries were dropped` | The collector was down long enough to fill `maxQueue`. Raise it, or fix the collector sooner. The full log is still on the computer. |
+| Collector folder is missing a computer | The folder is `computer-<id>-<label>`. Run `id` on the computer, and check the collector output: it logs every batch and every rejected request. |
 | `CHARGING STALLED - CHECK INPUT GATE` | The input gate isn't feeding the energy injector: the wrong gate was picked (run `set draconic.inputGate <name>`), it's a fluid gate, or the energy source is empty. |
 
 ## Development
@@ -431,11 +605,13 @@ drivers/energy_core.lua  read-only energy pylon units
 reac_utils.lua         Draconic discovery, gate adapter, controller (pure logic)
 monitor_utils.lua      overview, unit pages, settings, graphs, navigation, touch hit-testing
 energy_core_utils.lua  energy pylon readout
-stat_utils.lua         event log, per-unit stats CSV, rotation
+stat_utils.lua         event log, per-unit stats CSV, rotation, sink hook
+log_shipper.lua        optional remote logging: bounded queue, batched HTTP POST, backoff
 config.lua             user settings
 install.lua            online installer
 offline_install.lua    floppy-disk installer
 tests/                 CC mock, reactor simulator, test suite
+tools/log_collector.py remote log collector (Python 3.8+, standard library only)
 ```
 
 Every push and pull request runs the tests automatically on GitHub (Lua 5.2
@@ -445,6 +621,7 @@ interpreter from the repository root:
 
 ```shell
 lua tests/run_tests.lua
+python3 -m unittest discover -s tools -p "test_*.py"   # log collector
 ```
 
 The suite has controller unit tests and closed-loop runs against an
