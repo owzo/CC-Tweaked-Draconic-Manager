@@ -235,6 +235,10 @@ function M.removePeripheral(name) registry[name] = nil end
 local queue, timers, nextTimer
 
 function os.clock() return M.time end
+-- Real-world clock (ms); starts at a fixed date and follows virtual time.
+function os.epoch() return 1.7e12 + M.time * 1000 end
+-- CC never returns from a reboot; end the program like Ctrl+T would.
+function os.reboot() M.rebooted = true; error("Terminated", 0) end
 function os.day() return 1 end
 function os.startTimer(delay)
     nextTimer = nextTimer + 1
@@ -344,6 +348,10 @@ function M.reset(opts)
                         {__index = function(_, k) return M.terminal[k] end})
     http = opts.http
     shell = opts.shell
+    M.redstone = {}
+    redstone = {setOutput = function(side, on) M.redstone[side] = on end,
+                getOutput = function(side) return M.redstone[side] or false end}
+    rs = redstone
 end
 
 function M.capture(...)

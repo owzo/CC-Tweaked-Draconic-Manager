@@ -18,6 +18,7 @@ local TICK = 0.05
 -- main_control and must never call require themselves.
 PROGRAM_FILES = {"main_control.lua", "config.lua", "reac_utils.lua", "monitor_utils.lua",
                  "stat_utils.lua", "energy_core_utils.lua", "er_utils.lua", "persist.lua",
+                 "alarms.lua", "totals.lua", "updater.lua",
                  "drivers/draconic.lua", "drivers/extreme.lua", "drivers/energy_core.lua"}
 MODULE_FILES = {}
 for _, f in ipairs(PROGRAM_FILES) do
@@ -1090,6 +1091,132 @@ test("separate steam groups keep their own steam demand", function()
             check(math.abs(tb.rpm - 1800) < 100, "turbine rpm %.0f", tb.rpm)
         end
     end
+end)
+
+------------------------------------------------------------
+-- ALARMS, WASTE, TOTALS, UPDATER
+------------------------------------------------------------
+local function alarmPeripherals()
+    local log = {notes = 0, chat = {}}
+    cc.addPeripheral("speaker_0", "speaker", {playNote = function() log.notes = log.notes + 1 end})
+    cc.addPeripheral("chatBox_0", "chatBox", {sendMessage = function(msg) table.insert(log.chat, msg) end})
+    return log
+end
+
+test("alarms: edge-triggered chat, repeating bell, silence, redstone", function()
+    cc.reset(); freshModules()
+    local log = alarmPeripherals()
+    local alarms = require("alarms")
+    alarms.init({redstoneSide = "top", repeatSeconds = 10})
+    alarms.update({{unit = "Alpha", text = "LOW FUEL 18%"}}, 0)
+    check(#log.chat == 1 and log.notes == 1 and cc.redstone.top, "first raise")
+    alarms.update({{unit = "Alpha", text = "LOW FUEL 17%"}}, 5)
+    check(#log.chat == 1 and log.notes == 1, "changed number counted as a new alarm")
+    alarms.update({{unit = "Alpha", text = "LOW FUEL 17%"}}, 11)
+    check(log.notes == 2, "bell did not repeat")
+    alarms.silence()
+    alarms.update({{unit = "Alpha", text = "LOW FUEL 17%"}}, 30)
+    check(log.notes == 2, "silenced bell still rang")
+    alarms.update({{unit = "Alpha", text = "LOW FUEL 17%"}, {unit = "Beta", text = "TRIP"}}, 31)
+    check(log.notes == 3 and #log.chat == 2, "new alarm did not override silence")
+    alarms.update({}, 40)
+    check(log.chat[3] == "All alarms cleared" and not cc.redstone.top, "clear not reported")
+end)
+
+test("program sounds alarms and the alarm bar silences them", function()
+    cc.reset()
+    local log = alarmPeripherals()
+    local sim = ErSim.new({load = 1000})
+    sim.fuel = 3000                 -- 5% of the tank: LOW FUEL
+    cc.addPeripheral("BigReactors-Reactor_0", "BigReactors-Reactor", sim.erReactor)
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local beforeSilence
+    runProgram({sims = {sim}, untilTime = 120, at = {
+        {t = 30, fn = function()
+            beforeSilence = log.notes
+            touchText(mon, "LOW FUEL")
+        end}
+    }})
+    check(#log.chat >= 1 and log.chat[1]:find("LOW FUEL"), "no chat message: %s", table.concat(log.chat, " | "))
+    check(beforeSilence >= 2, "bell did not repeat before silence (%d)", beforeSilence)
+    check(log.notes <= beforeSilence + 1, "bell kept ringing after silence (%d -> %d)", beforeSilence, log.notes)
+    check(cc.readFile("logs/draconic.log"):find("ALARM Fission 1: LOW FUEL"), "alarm not logged")
+end)
+
+test("waste is ejected on both mods' APIs", function()
+    for _, mod in ipairs({"er", "br"}) do
+        local er = erUtils()
+        local sim = ErSim.new({load = 10000})
+        sim.waste = 15000           -- ~23% of a 64000 mB tank
+        ER_CFG.wasteEjectAt = 0.2
+        erLoop(er, sim, mod, 10)
+        ER_CFG.wasteEjectAt = nil
+        check((sim.ejections or 0) >= 1, "%s: waste not ejected", mod)
+    end
+end)
+
+test("long-term totals integrate generation and survive a restart", function()
+    cc.reset()
+    local sim = ErSim.new({load = 10000})
+    cc.addPeripheral("BigReactors-Reactor_0", "BigReactors-Reactor", sim.erReactor)
+    local auto = function(c) c.extreme.autoStartOnBoot = true end
+    runProgram({sims = {sim}, untilTime = 600, config = auto})
+    check(cc.readFile("data/totals.db"), "totals not saved")
+    freshModules()
+    local totals = require("totals")
+    totals.load()
+    local _, lifetime = totals.network(24)
+    -- ~10 kFE/t for most of 600 s = ~1.2e8 FE.
+    check(lifetime > 0.8e8 and lifetime < 1.5e8, "lifetime %.3g FE", lifetime)
+    cc.output = {}
+    runProgram({sims = {sim}, untilTime = 1200, config = auto})
+    totals.load()
+    local _, after = totals.network(24)
+    check(after > lifetime * 1.6, "totals did not continue after restart: %.3g -> %.3g", lifetime, after)
+end)
+
+test("updater: version compare", function()
+    cc.reset(); freshModules()
+    local u = require("updater")
+    check(u.newer("4.10", "4.9") and u.newer("5", "4.9.9") and not u.newer("4.1", "4.1")
+          and not u.newer("4.0", "4.1"), "version ordering")
+end)
+
+test("System page: check, two-tap update, install and reboot", function()
+    local served = {}
+    cc.reset({http = {get = function(url)
+        local name = url:match("/main/(.+)$")
+        local ok, body = pcall(readRepoFileEarly, name)
+        if not ok then return nil, "404" end
+        if name == "main_control.lua" then body = body:gsub('local VERSION = "[^"]+"', 'local VERSION = "9.9"') end
+        served[name] = true
+        return {getResponseCode = function() return 200 end,
+                readAll = function() return body end, close = function() end}
+    end}, shell = {run = function(path)
+        local fn = assert((loadstring or load)(cc.readFile(path)))
+        fn()
+        return true
+    end}})
+    local sim = ErSim.new({load = 1000})
+    cc.addPeripheral("BigReactors-Reactor_0", "BigReactors-Reactor", sim.erReactor)
+    local turbineSim = ErSim.new({turbines = 1})
+    cc.addPeripheral("BigReactors-Turbine_0", "BigReactors-Turbine", turbineSim.erTurbines[1])
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local sysScreen, armed = "", ""
+    runProgram({sims = {sim}, untilTime = 120, at = {
+        {t = 3, fn = function() touchText(mon, "[i] Overview") end},
+        {t = 4, fn = function() touchText(mon, "CHECK") end},
+        {t = 6, fn = function() sysScreen = mon.text(); touchText(mon, "UPDATE") end},
+        {t = 7, fn = function() armed = mon.text(); touchText(mon, "CONFIRM") end}
+    }})
+    check(sysScreen:find("v4%.1") and sysScreen:find("v9%.9 available"), "system page:\n%s", sysScreen)
+    check(armed:find("CONFIRM"), "update did not ask for confirmation:\n%s", armed)
+    check(cc.rebooted, "did not reboot after installing")
+    check(served["install.lua"] and served["persist.lua"], "installer did not run")
+    check(cc.readFile("main_control.lua"):find('VERSION = "9.9"'), "new version not written")
+    check(cc.readFile("logs/draconic.log"):find("Update installed"), "install not logged")
 end)
 
 test("modules never call require (os.loadAPI environments lack it)", function()

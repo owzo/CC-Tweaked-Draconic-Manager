@@ -160,6 +160,12 @@ slowly. Changes are saved, and `RESET` returns to `config.lua`.
 overspeed. The worst outcome of bad control is wasted fuel or steam, so
 these controllers aim for efficiency rather than safety margins.
 
+**Waste and fuel:** waste shares the fuel tank, so once it passes
+`wasteEjectAt` (20% of the tank) the program ejects it. That needs a reactor
+access port set to output. If waste keeps piling up past `wasteAlarmAt`
+anyway, an alarm says to check the access port. Fission pages show fuel and
+waste side by side, and low fuel raises an alarm.
+
 Each page has `START` / `STOP` (activate or deactivate). Reactor pages also
 have `-10 -1 AU +1 +10`, where `AU`/`MA` toggles automatic rod control and
 the other buttons set the rods by hand. Name units or override settings per
@@ -171,6 +177,34 @@ unit in `config.extreme.units`.
 | Bigger Reactors reports temperatures in Kelvin | Converted to °C |
 | Bigger Reactors has no battery when actively cooled, and object accessors (`battery()`, `rotor()`) | Hidden behind one adapter (`er_utils.lua`) |
 | Bigger Reactors turbine vents can't be set from CC | Not touched by the program in either mod |
+
+## Alarms
+
+Every unit alarm (trip, low fuel, waste, link lost, charging stalled,
+overspeed, no steam...) can reach players away from the monitor:
+
+| Output | Needs | Behaviour |
+| --- | --- | --- |
+| Bell | Any speaker on the network | Rings on a new alarm, then every `repeatSeconds` while it lasts |
+| Chat | Advanced Peripherals **Chat Box** | One message per new alarm, and one when everything has cleared |
+| Redstone | `redstoneSide` (computer side) or an AP **Redstone Integrator** | On while any alarm is active: lamps, sirens, or wire it into a hardware shutdown |
+
+**Tap the red alarm bar** at the bottom of any page (or `SILENCE` on the
+System page) to stop the bell until a new alarm appears. Alarms are also
+written to the log (`ALARM <unit>: <text>`). Settings are in `config.alarms`.
+
+## System page, updates and totals
+
+Tap `[i] Overview` (the top row of the Overview) for the System page:
+
+- **Version** and **update check**. `CHECK` asks GitHub for the latest
+  version; `UPDATE`, then `CONFIRM` within 10 seconds, puts every reactor in
+  its fail-safe state, runs the official installer (which keeps your
+  `config.lua`) and reboots into the new version. Source: `config.update.repoBase`.
+- **Energy totals**: energy produced in the last 24 hours, lifetime total,
+  and a per-hour bar chart, kept across reboots in `data/totals.db`. Each
+  unit's Graphs page also starts with its own energy-per-hour chart.
+- **Alarm status** and `SILENCE`.
 
 ## Menus and monitors
 
@@ -351,6 +385,9 @@ watch `logs/reactor_stats.csv`.
 ```text
 main_control.lua       scheduler: loads drivers, one coroutine per unit, UI, input, fail-safe exit
 persist.lua            saved in-game settings and monitor pins (data/manager.db), settings schema
+alarms.lua             speaker / chat box / redstone alarm outputs, silence
+totals.lua             long-term energy totals (data/totals.db)
+updater.lua            update check and install from GitHub
 drivers/draconic.lua   Draconic reactor units (wraps reac_utils)
 drivers/energy_core.lua  read-only energy pylon units
 reac_utils.lua         Draconic discovery, gate adapter, controller (pure logic)

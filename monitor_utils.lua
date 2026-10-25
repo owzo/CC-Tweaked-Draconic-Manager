@@ -164,6 +164,9 @@ local function bar(win, y, width, pct, color)
 end
 
 local function labelValue(win, y, width, label, value, color)
+    -- The value wins: a long label is cut rather than overlapped.
+    local room = width - #value - 3
+    if #label > room then label = label:sub(1, math.max(0, room)) end
     text(win, 2, y, label, colors.white)
     text(win, width - #value, y, value, color or colors.white)
 end
@@ -403,8 +406,9 @@ function LAYOUTS.fission(model, w)
     gap(BARS, "bars")
 
     local fuel = ok and (d.fuelMax or 0) > 0 and d.fuel / d.fuelMax or 0
+    local waste = ok and (d.fuelMax or 0) > 0 and (d.waste or 0) / d.fuelMax or 0
     local fuelC = pctColor(fuel, lim.lowFuel or 0.1, (lim.lowFuel or 0.1) * 3)
-    lr("Fuel", string.format("%.1f%%", fuel * 100), fuelC)
+    lr(string.format("Fuel  Waste %.0f%%", waste * 100), string.format("%.1f%%", fuel * 100), fuelC)
     bar(fuel, fuelC)
     return page.controls()
 end
@@ -553,8 +557,9 @@ local function buildOverview(units, w, h, view)
         local a = m.controller and m.controller.alarms and m.controller.alarms[1]
         if a then table.insert(alarms, m.name .. ": " .. a) end
     end
-    page.add({kind = "lr", label = "Overview", value = "Total " .. monitor_utils.formatRF(total) .. " rf/t",
-              color = colors.lime})
+    -- Tap the header for the System page (version, updates, totals, alarms).
+    page.add({kind = "lr", label = "[i] Overview", value = monitor_utils.formatRF(total) .. " rf/t",
+              color = colors.lime, action = "nav:system"})
     page.gap(nil)
 
     -- Rows: header + gap (2), cards (4 each, minus the last spacer),
@@ -681,6 +686,14 @@ local function buildGraphs(model, w, h)
     page.nav(model.name .. " Graphs")
     local metrics = metricsOf(model)
     local hist = history[model.id] or {}
+    -- Energy per hour over the last day, from the long-term totals.
+    if model.hourly then
+        local hourly = {}
+        for i, v in ipairs(model.hourly) do hourly[i] = v end
+        table.insert(metrics, 1, {"Energy/h (24h)", hourly[#hourly], nil, colors.yellow, "rate"})
+        hist = {hourly}
+        for i, series in pairs(history[model.id] or {}) do hist[i + 1] = series end
+    end
     -- Fit as many charts as leave at least 3 rows each.
     local free = h - 3                     -- top gap, nav, footer
     local charts = math.max(1, math.min(#metrics, math.floor(free / 4)))
@@ -705,6 +718,49 @@ local function buildGraphs(model, w, h)
                       rows = rows, color = color, width = width})
         end
     end
+    page.add({kind = "footer"})
+    return page.items
+end
+
+------------------------------------------------------------
+-- SYSTEM PAGE
+------------------------------------------------------------
+--[[
+view.system = {
+  version, update = {text, color, confirm}, alarms = {count, silenced},
+  hourly = network energy per hour (oldest first), lifetime
+}
+]]
+local function buildSystem(view, w, h)
+    local sys = view.system or {}
+    local page = newPage({nav = {back = true, page = "system"}, name = "System"})
+    page.gap(TOP)
+    page.buttons({{"<", "nav:overview", colors.gray}, {"System", "noop", colors.blue}}, {3, nil})
+    page.lr("Version", "v" .. tostring(sys.version or "?"), colors.white)
+    local upd = sys.update or {}
+    page.lr("Update", upd.text or "not checked", upd.color or colors.lightGray)
+    page.buttons({{"CHECK", "sys:check", colors.gray},
+                  {upd.confirm and "CONFIRM" or "UPDATE", "sys:update",
+                   upd.confirm and colors.orange or colors.blue}})
+    page.gap(BARS)
+    local hourly = sys.hourly or {}
+    local today = 0
+    for _, v in ipairs(hourly) do today = today + v end
+    page.lr("Energy 24h", monitor_utils.formatRF(today), colors.lime)
+    page.lr("Lifetime", monitor_utils.formatRF(sys.lifetime or 0), colors.lime)
+    local hi = 1
+    for _, v in ipairs(hourly) do hi = math.max(hi, v) end
+    local rows = math.max(1, math.min(4, h - 13))
+    for r = 1, rows do
+        page.add({kind = "graph", samples = hourly, lo = 0, hi = hi, row = r, rows = rows,
+                  color = colors.yellow, width = w - 2})
+    end
+    page.gap(BARS)
+    local al = sys.alarms or {}
+    page.lr("Alarms", (al.count or 0) == 0 and "none"
+            or (tostring(al.count) .. (al.silenced and " (silenced)" or " active")),
+            (al.count or 0) == 0 and colors.green or colors.red)
+    page.buttons({{"SILENCE", "alarm:silence", colors.gray}})
     page.add({kind = "footer"})
     return page.items
 end
@@ -764,6 +820,8 @@ local function drawItems(target, items, model)
                 win.setCursorPos(1, y)
                 win.write(string.rep(" ", w))
                 centered(win, y, alarm:sub(1, w), colors.white, colors.red, w)
+                -- Tapping the alarm bar silences repeating alarm sounds.
+                table.insert(target.buttons, {x1 = 1, x2 = w, y = y, action = "alarm:silence"})
             elseif model.events and model.events[1] then
                 text(win, 2, y, model.events[1].message:sub(1, w - 2), colors.gray)
             end
@@ -807,8 +865,10 @@ local function pageFor(name, view)
     else
         pinned = nil
     end
-    if v.page ~= "overview" and not findUnit(units, v.unit) then v.page = "overview" end
-    if #units == 1 and v.page == "overview" then
+    if v.page ~= "overview" and v.page ~= "system" and not findUnit(units, v.unit) then
+        v.page = "overview"
+    end
+    if #units == 1 and v.page == "overview" and not v.chosenOverview then
         v.page, v.unit = "detail", units[1].id
     end
     return v, pinned
@@ -833,6 +893,10 @@ local function renderTarget(target, view)
 
     local v, pinned = pageFor(target.name, view)
     target.view = v
+    if v.page == "system" then
+        drawItems(target, fitLayout(buildSystem(view, w, h), h) or {}, {events = view.events})
+        return
+    end
     if v.page == "overview" then
         drawItems(target, fitLayout(buildOverview(units, w, h, v), h) or {}, {events = view.events})
         return
@@ -841,8 +905,9 @@ local function renderTarget(target, view)
     local model = {}
     for k, val in pairs(findUnit(units, v.unit)) do model[k] = val end
     model.core, model.events = view.core, view.events
+    model.hourly = view.hourlyFor and view.hourlyFor(model.id) or nil
     model.formatSetting = view.formatSetting or function(_, val) return tostring(val) end
-    model.nav = {back = not pinned and #units > 1, pinned = pinned ~= nil, page = v.page}
+    model.nav = {back = not pinned, pinned = pinned ~= nil, page = v.page}
     if v.page == "settings" and not (model.settings and #model.settings > 0) then v.page = "detail" end
 
     local items
@@ -903,6 +968,9 @@ function monitor_utils.handleTouch(name, x, y)
                 v.page, v.unit = "detail", unitId
             elseif a == "nav:overview" then
                 v.page = "overview"
+                v.chosenOverview = true
+            elseif a == "nav:system" then
+                v.page = "system"
             elseif a == "nav:detail" or a == "nav:graphs" or a == "nav:settings" then
                 v.page = a:sub(5)
             elseif a == "ovr:next" then

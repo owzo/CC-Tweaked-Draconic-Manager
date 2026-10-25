@@ -145,7 +145,8 @@ function Sim:buildFacades()
         setAllControlRodLevels = function(v)
             v = math.floor(v + 0.5)
             if v >= 0 and v <= 100 then sim.rods = v end
-        end
+        end,
+        doEjectWaste = function() sim.waste = 0; sim.ejections = (sim.ejections or 0) + 1 end
     }
 
     -- Bigger Reactors ---------------------------------------------------
@@ -170,7 +171,8 @@ function Sim:buildFacades()
         fuelTank = function()
             return {capacity = function() return sim.fuelMax end, fuel = function() return sim.fuel end,
                     waste = function() return sim.waste end, fuelReactivity = function() return 1.05 end,
-                    burnedLastTick = function() return 0.1 end, totalReactant = function() return sim.fuel end}
+                    burnedLastTick = function() return 0.1 end, totalReactant = function() return sim.fuel end,
+                    ejectWaste = function() sim.waste = 0; sim.ejections = (sim.ejections or 0) + 1 end}
         end,
         fuelTemperature = function() return sim:fuelTemp() + KELVIN end,
         stackTemperature = function() return sim:caseTemp() + KELVIN end,
