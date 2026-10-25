@@ -98,6 +98,12 @@ config.extreme = {
     autoStartOnBoot = false,        -- Activate reactors/turbines on start
     controlInterval = 0.25,         -- Seconds per control cycle
 
+    -- Control loop speed multipliers (1.0 = tested default). Lower one if
+    -- rods or steam flow keep hunting back and forth; raise it if the
+    -- buffer or RPM drifts and recovers slowly. Also on the S page.
+    rodGain         = 1.0,
+    flowGain        = 1.0,
+
     -- Optional names and per-unit overrides, by peripheral name:
     -- units = {{peripheral = "BigReactors-Turbine_0", name = "Turbine A",
     --           settings = {targetRPM = 900}}},

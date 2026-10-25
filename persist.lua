@@ -11,26 +11,29 @@ chunk reloads, in one file (data/manager.db, textutils-serialised):
 
   overrides  unit id -> {setting = value}  (layered over config.lua)
   pins       monitor name -> unit id        (monitor shows only that unit)
+  state      unit id -> {key = value}       (operating modes, e.g. manual
+                                             output, remembered on reboot)
 
 Settings schema
   Drivers describe their editable settings as a list of
     {key, label, step, min, max, fmt}
   where min/max may be functions of the unit's current cfg, so linked
   limits stay consistent (a target can never be set above its trip).
-  fmt is "temp" (C), "pct" (fraction shown as %), "rpm" or "bool".
+  fmt is "temp" (C), "pct" (fraction shown as %), "rpm", "num" (one
+  decimal) or "bool".
 ]]
 
 local persist = {}
 
 local path = "data/manager.db"
-local data = {overrides = {}, pins = {}}
+local data = {overrides = {}, pins = {}, state = {}}
 
 ------------------------------------------------------------
 -- FILE
 ------------------------------------------------------------
 function persist.load(file)
     path = file or path
-    data = {overrides = {}, pins = {}}
+    data = {overrides = {}, pins = {}, state = {}}
     if not fs.exists(path) then return end
     local handle = fs.open(path, "r")
     if not handle then return end
@@ -40,6 +43,7 @@ function persist.load(file)
     if ok and type(loaded) == "table" then
         data.overrides = type(loaded.overrides) == "table" and loaded.overrides or {}
         data.pins = type(loaded.pins) == "table" and loaded.pins or {}
+        data.state = type(loaded.state) == "table" and loaded.state or {}
     end
 end
 
@@ -68,6 +72,16 @@ end
 
 function persist.clearOverrides(unitId)
     data.overrides[unitId] = nil
+    persist.save()
+end
+
+function persist.state(unitId)
+    return data.state[unitId] or {}
+end
+
+function persist.setState(unitId, values)
+    data.state[unitId] = data.state[unitId] or {}
+    for k, v in pairs(values) do data.state[unitId][k] = v end
     persist.save()
 end
 
@@ -128,6 +142,7 @@ function persist.format(item, value)
     if item.fmt == "bool" then return value and "ON" or "OFF" end
     if item.fmt == "pct" then return string.format("%d%%", math.floor(value * 100 + 0.5)) end
     if item.fmt == "temp" then return int(value) .. "C" end
+    if item.fmt == "num" then return string.format("%.1f", value) end
     return int(value)
 end
 
