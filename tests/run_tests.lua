@@ -17,8 +17,8 @@ local TICK = 0.05
 -- Everything the installers must ship; MODULE_FILES are loaded by
 -- main_control and must never call require themselves.
 PROGRAM_FILES = {"main_control.lua", "config.lua", "reac_utils.lua", "monitor_utils.lua",
-                 "stat_utils.lua", "energy_core_utils.lua",
-                 "drivers/draconic.lua", "drivers/energy_core.lua"}
+                 "stat_utils.lua", "energy_core_utils.lua", "er_utils.lua",
+                 "drivers/draconic.lua", "drivers/extreme.lua", "drivers/energy_core.lua"}
 MODULE_FILES = {}
 for _, f in ipairs(PROGRAM_FILES) do
     if f ~= "main_control.lua" then table.insert(MODULE_FILES, f) end
@@ -658,6 +658,176 @@ test("setup wizard assigns gates per reactor and skips duplicates", function()
     check(units[1].name == "Alpha" and units[1].inputGate == "flow_gate_0", "Alpha wrong")
     check(units[2].name == "Reactor 2" and units[2].outputGate == "flow_gate_3", "Reactor 2 wrong")
     check(cc.outputText():find("Running 2 unit"), "did not start 2 units:\n%s", cc.outputText())
+end)
+
+------------------------------------------------------------
+-- EXTREME / BIGGER REACTORS
+------------------------------------------------------------
+local ErSim = require("er_sim")
+
+local ER_CFG = {bufferLow = 0.3, bufferHigh = 0.7, lowFuel = 0.1, targetRPM = 1800,
+                maxRPM = 2000, coilsOffAbove = 0.95, coilsOnBelow = 0.8,
+                autoStartOnBoot = true, controlInterval = 0.25}
+
+local function erUtils() cc.reset(); freshModules(); return require("er_utils") end
+
+-- Runs reactor + turbine controllers against the sim, steam-coupled the
+-- same way drivers/extreme.lua couples them.
+local function erLoop(er, sim, mod, seconds, onCycle)
+    local units = {{a = er.wrap(mod .. "_reactor", "r", sim[mod .. "Reactor"]),
+                    c = er.newBufferController(ER_CFG), last = {}}}
+    for i, t in ipairs(sim[mod .. "Turbines"]) do
+        table.insert(units, {a = er.wrap(mod .. "_turbine", "t" .. i, t),
+                             c = er.newTurbineController(ER_CFG), last = {}})
+    end
+    local t = 0
+    while t < seconds do
+        local hint = nil
+        if #units > 1 then
+            hint = 0
+            for i = 2, #units do hint = hint + (units[i].c.flow or 0) end
+        end
+        for i, u in ipairs(units) do
+            local d = er.read(u.a)
+            local out = u.c:step(d, t, i == 1 and sim.activelyCooled and hint or nil)
+            local errs = er.apply(u.a, out, u.last)
+            check(#errs == 0, "apply: %s", table.concat(errs, "; "))
+        end
+        for _ = 1, 5 do sim:tick() end
+        t = t + 0.25
+        if onCycle then onCycle(t, units) end
+    end
+    return units
+end
+
+test("ER/BR adapters normalise both APIs (Kelvin, battery vs steam, unassembled)", function()
+    local er = erUtils()
+    for _, mod in ipairs({"er", "br"}) do
+        local sim = ErSim.new({active = true, rods = 50})
+        for _ = 1, 400 do sim:tick() end
+        local d = er.read(er.wrap(mod .. "_reactor", "r", sim[mod .. "Reactor"]))
+        check(d.assembled and d.active and not d.activelyCooled, "%s flags", mod)
+        check(math.abs(d.fuelTemp - sim:fuelTemp()) < 0.01, "%s fuel temp %.2f (Kelvin?)", mod, d.fuelTemp)
+        check(math.abs(d.rods - 50) < 0.01 and d.capacity == sim.capacity, "%s rods/battery", mod)
+        local steam = ErSim.new({activelyCooled = true})
+        local ds = er.read(er.wrap(mod .. "_reactor", "r", steam[mod .. "Reactor"]))
+        check(ds.activelyCooled and ds.steamMax == steam.steamMax and ds.capacity == nil, "%s steam mode", mod)
+        local broken = ErSim.new({assembled = false})
+        local du = er.read(er.wrap(mod .. "_reactor", "r", broken[mod .. "Reactor"]))
+        check(du and du.assembled == false, "%s unassembled not reported", mod)
+    end
+end)
+
+test("passive ER/BR reactor holds its FE buffer through load changes", function()
+    for _, mod in ipairs({"er", "br"}) do
+        local er = erUtils()
+        local sim = ErSim.new({load = 10000})
+        local lo, hi, rlo, rhi = 1, 0, 100, 0
+        erLoop(er, sim, mod, 1200, function(t)
+            if t == 400 then sim.load = 18000 elseif t == 700 then sim.load = 3000 end
+            if t > 300 then
+                local l = sim.stored / sim.capacity
+                lo, hi = math.min(lo, l), math.max(hi, l)
+            end
+            if t > 1000 then rlo, rhi = math.min(rlo, sim.rods), math.max(rhi, sim.rods) end
+        end)
+        check(lo > 0.3 and hi < 0.7, "%s buffer left band: %.2f-%.2f", mod, lo, hi)
+        check(rhi - rlo <= 6, "%s rods chatter in steady state: %.1f-%.1f", mod, rlo, rhi)
+    end
+end)
+
+test("idle passive reactor with full buffer pushes rods in (saves fuel)", function()
+    local er = erUtils()
+    local sim = ErSim.new({load = 0, rods = 0, stored = 9500000})
+    erLoop(er, sim, "er", 60)
+    check(sim.rods == 100, "rods %s", tostring(sim.rods))
+end)
+
+test("steam reactor + 2 turbines: 1800 RPM, tank in band, no overspeed", function()
+    for _, mod in ipairs({"er", "br"}) do
+        local er = erUtils()
+        local sim = ErSim.new({activelyCooled = true, maxOutput = 3000, turbines = 2,
+                               turbineLoad = 6000, coilsEngaged = (mod == "br")})
+        local lo, hi, rlo, rhi = 1, 0, 1e9, 0
+        erLoop(er, sim, mod, 1200, function(t)
+            if t > 600 then
+                local l = sim.steam / sim.steamMax
+                lo, hi = math.min(lo, l), math.max(hi, l)
+                for _, tb in ipairs(sim.turbines) do
+                    rlo, rhi = math.min(rlo, tb.rpm), math.max(rhi, tb.rpm)
+                end
+            end
+        end)
+        check(rlo > 1750 and rhi < 1850, "%s RPM %.0f-%.0f", mod, rlo, rhi)
+        check(lo > 0.1 and hi < 0.9, "%s steam tank %.2f-%.2f", mod, lo, hi)
+        for _, tb in ipairs(sim.turbines) do
+            check(tb.maxRPMSeen < ER_CFG.maxRPM + 50, "%s overspeed %.0f", mod, tb.maxRPMSeen)
+            check(tb.coils, "%s coils not engaged at speed", mod)
+        end
+    end
+end)
+
+test("turbine with a full buffer idles: coils off, speed held", function()
+    local er = erUtils()
+    local sim = ErSim.new({activelyCooled = true, maxOutput = 3000, turbines = 1, turbineLoad = 0})
+    local units = erLoop(er, sim, "er", 1500)
+    local tb = sim.turbines[1]
+    check(units[2].c.mode == "idle", "mode %s", tostring(units[2].c.mode))
+    check(not tb.coils, "coils still engaged with a full buffer")
+    check(tb.rpm > 1700 and tb.maxRPMSeen < 2050, "rpm %.0f, peak %.0f", tb.rpm, tb.maxRPMSeen)
+end)
+
+test("Bigger Reactors turbine: default-engaged coils are released to spin up", function()
+    local er = erUtils()
+    local sim = ErSim.new({activelyCooled = true, maxOutput = 3000, turbines = 1,
+                           turbineLoad = 6000, coilsEngaged = true})
+    local sawRelease = false
+    erLoop(er, sim, "br", 30, function() if not sim.turbines[1].coils then sawRelease = true end end)
+    check(sawRelease, "coils never disengaged for spin-up")
+end)
+
+local function wireEr(sim, prefix)
+    cc.addPeripheral(prefix .. "Reactor_0", "BigReactors-Reactor", sim.erReactor)
+    for i, t in ipairs(sim.erTurbines) do
+        cc.addPeripheral(prefix .. "Turbine_" .. (i - 1), "BigReactors-Turbine", t)
+    end
+end
+
+test("program runs Extreme Reactors alone (no Draconic installed)", function()
+    cc.reset()
+    local sim = ErSim.new({activelyCooled = true, maxOutput = 3000, turbines = 2, turbineLoad = 6000})
+    wireEr(sim, "BigReactors-")
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    runProgram({sims = {sim}, untilTime = 900,
+                config = function(cfg) cfg.extreme.autoStartOnBoot = true end})
+    check(cc.outputText():find("Running 3 unit"), "units:\n%s", cc.outputText())
+    check(math.abs(sim.turbines[1].rpm - 1800) < 60, "turbine rpm %.0f", sim.turbines[1].rpm)
+    check(mon.text():find("Reactor Status") and mon.text():find("ONLINE STEAM"),
+          "fission page:\n%s", mon.text())
+    check(cc.readFile("logs/extreme_fission_1.csv"), "reactor stats missing")
+    check(cc.readFile("logs/extreme_turbine_2.csv"), "turbine stats missing")
+end)
+
+test("program runs Draconic and Extreme side by side", function()
+    cc.reset()
+    local de = Sim.new({version = "1.20"})
+    wireSim(de, "flow_gate")
+    settings.set("draconic.inputGate", "flow_gate_0")
+    settings.set("draconic.outputGate", "flow_gate_1")
+    local er = ErSim.new({load = 10000})
+    wireEr(er, "BigReactors-")
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    runProgram({sims = {de, er}, untilTime = 900, config = function(cfg)
+        cfg.reactor.autoStartOnBoot = true
+        cfg.extreme.autoStartOnBoot = true
+    end, at = {{t = 5, fn = function() touchText(mon, ">  ") end}}})
+    check(cc.outputText():find("Running 2 unit"), "units:\n%s", cc.outputText())
+    check(de.state == "running" and math.abs(de.temperature - 7000) < 150, "draconic %s %.0f", de.state, de.temperature)
+    local level = er.stored / er.capacity
+    check(level > 0.3 and level < 0.7, "fission buffer %.2f", level)
+    check(mon.text():find("Fission 1 2/2"), "paging to the fission page failed:\n%s", mon.text())
 end)
 
 test("modules never call require (os.loadAPI environments lack it)", function()

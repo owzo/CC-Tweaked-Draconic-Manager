@@ -210,10 +210,11 @@ end
 monitor_utils.formatInt = formatInt
 
 -- Full figure when it fits beside its label, compact (53.0M) otherwise.
-local function fitRate(label, value, width)
-    local full = formatInt(value) .. " rf/t"
+local function fitRate(label, value, width, unit)
+    unit = unit or " rf/t"
+    local full = formatInt(value) .. unit
     if #label + #full + 3 <= width then return full end
-    return monitor_utils.formatRF(value) .. " rf/t"
+    return monitor_utils.formatRF(value) .. unit
 end
 
 ------------------------------------------------------------
@@ -233,36 +234,58 @@ monitor: spacer rows (and the optional energy core block) carry a
 priority and the lowest are dropped first when space runs out. A 3x3
 monitor at scale 1 (29x19) shows everything except some spacers.
 ]]
-local function buildLayout(model, w)
+-- Spacer priorities: the top margin goes first, then all spacers between
+-- the bar sections together (so they stay evenly spaced), then the one
+-- above the controls, then the one under the status.
+local TOP, BARS, CONTROLS, HEADER = 1, 2, 3, 4
+
+-- Shared page scaffolding: tab row, status line, controls and footer.
+local function newPage(model)
+    local page = {items = {}}
+    function page.add(item) table.insert(page.items, item); return item end
+    function page.gap(priority, group) page.add({kind = "gap", priority = priority, group = group}) end
+    function page.lr(label, value, color) page.add({kind = "lr", label = label, value = value, color = color}) end
+    function page.bar(pct, color) page.add({kind = "bar", pct = pct, color = color}) end
+    function page.buttons(defs, widths) page.add({kind = "buttons", defs = defs, widths = widths}) end
+
+    function page.header(label, status, color)
+        page.gap(TOP)
+        if model.tabs and model.tabs.count > 1 then
+            -- Several units: each monitor pages through them on its own.
+            page.buttons({
+                {"<", "unit:prev", colors.gray},
+                {string.format("%s %d/%d", model.name or "Unit", model.tabs.index, model.tabs.count),
+                 "noop", colors.blue},
+                {">", "unit:next", colors.gray}
+            }, {3, nil, 3})
+        end
+        page.lr(label, status, color)
+        page.gap(HEADER)
+    end
+
+    function page.controls()
+        page.gap(CONTROLS)
+        page.buttons({{"START", "start", colors.green}, {"STOP", "stop", colors.red}})
+        page.add({kind = "footer"})
+        return page.items
+    end
+    return page
+end
+
+local LAYOUTS = {}
+
+-- Draconic reactor (drmon-style) ---------------------------------------
+function LAYOUTS.draconic(model, w)
     local info, ctl, lim = model.info, model.controller, model.limits
-    local items = {}
-    local function add(item) table.insert(items, item); return item end
-    local function gap(priority, group) add({kind = "gap", priority = priority, group = group}) end
-    -- Spacer priorities: the top margin goes first, then all spacers
-    -- between the bar sections together (so they stay evenly spaced),
-    -- then the one above the controls, then the one under the status.
-    local TOP, BARS, CONTROLS, HEADER = 1, 2, 3, 4
-    local function lr(label, value, color) add({kind = "lr", label = label, value = value, color = color}) end
-    local function bar(pct, color) add({kind = "bar", pct = pct, color = color}) end
+    local page = newPage(model)
+    local lr, bar, gap = page.lr, page.bar, page.gap
 
     local status, statusColor = "NO SIGNAL", colors.red
     if info then
         status = string.upper((info.status:gsub("_", " ")))
         statusColor = STATUS_COLORS[info.status] or colors.red
     end
-
-    gap(TOP)
-    if model.tabs and model.tabs.count > 1 then
-        -- Several reactors: each monitor pages through them on its own.
-        add({kind = "buttons", defs = {
-            {"<", "unit:prev", colors.gray},
-            {string.format("%s %d/%d", model.name or "Reactor", model.tabs.index, model.tabs.count),
-             "noop", colors.blue},
-            {">", "unit:next", colors.gray}
-        }, widths = {3, nil, 3}})
-    end
-    lr("Reactor Status", status, statusColor)
-    gap(HEADER)
+    page.header("Reactor Status", status, statusColor)
 
     lr("Generation", info and fitRate("Generation", info.generationRate, w) or "--", colors.lime)
     local tc = info and tempColor(info.temperature, lim.targetTemperature, lim.maxTemperature) or colors.red
@@ -271,7 +294,7 @@ local function buildLayout(model, w)
        fitRate("Output Gate", ctl.outputRate, w), colors.lightBlue)
 
     local steps = uiSettings.manualStep
-    add({kind = "buttons", defs = {
+    page.buttons({
         {"<<<", "out:" .. -steps[3], colors.gray},
         {"<<", "out:" .. -steps[2], colors.gray},
         {"<", "out:" .. -steps[1], colors.gray},
@@ -279,7 +302,7 @@ local function buildLayout(model, w)
         {">", "out:" .. steps[1], colors.gray},
         {">>", "out:" .. steps[2], colors.gray},
         {">>>", "out:" .. steps[3], colors.gray}
-    }})
+    })
     lr("Input Gate", fitRate("Input Gate", ctl.inputRate, w), colors.lightBlue)
     gap(BARS, "bars")
 
@@ -311,17 +334,107 @@ local function buildLayout(model, w)
         -- Kept over every spacer; dropped (label and bar together) only
         -- when the essentials would not fit otherwise.
         gap(BARS, "bars")
-        add({kind = "lr", label = "Energy Core", value = value, color = cc, priority = 10, group = "core"})
-        add({kind = "bar", pct = core.pct, color = cc, priority = 10, group = "core"})
+        page.add({kind = "lr", label = "Energy Core", value = value, color = cc, priority = 10, group = "core"})
+        page.add({kind = "bar", pct = core.pct, color = cc, priority = 10, group = "core"})
     end
+    return page.controls()
+end
 
-    gap(CONTROLS)
-    add({kind = "buttons", defs = {
-        {"START", "start", colors.green},
-        {"STOP", "stop", colors.red}
-    }})
-    add({kind = "footer"})
-    return items
+-- Shared status line for Extreme/Bigger units.
+local function erStatus(d, onText, onColor)
+    if not d then return "NO SIGNAL", colors.red end
+    if d.assembled == false then return "UNASSEMBLED", colors.orange end
+    if d.active then return onText or "ONLINE", onColor or colors.green end
+    return "OFFLINE", colors.lightGray
+end
+
+-- Extreme / Bigger Reactors fission reactor ----------------------------
+function LAYOUTS.fission(model, w)
+    local d, ctl, lim = model.data or {}, model.controller, model.limits
+    local page = newPage(model)
+    local lr, bar, gap = page.lr, page.bar, page.gap
+    local ok = model.data and model.data.assembled ~= false
+
+    local status, color = erStatus(model.data, d.activelyCooled and "ONLINE STEAM" or "ONLINE")
+    page.header("Reactor Status", status, color)
+
+    if d.activelyCooled then
+        lr("Steam", ok and (formatInt(d.steamMade or 0) .. " mB/t") or "--", colors.lime)
+    else
+        lr("Generation", ok and fitRate("Generation", d.produced or 0, w, " FE/t") or "--", colors.lime)
+    end
+    lr("Fuel Temp", ok and (formatInt(d.fuelTemp or 0) .. "C") or "--", colors.orange)
+    lr("Casing Temp", ok and (formatInt(d.caseTemp or 0) .. "C") or "--", colors.orange)
+    lr(ctl.auto and "Control Rods" or "Rods (manual)",
+       ok and string.format("%.0f%%", d.rods or 0) or "--", colors.lightBlue)
+    page.buttons({
+        {"-10", "rods:-10", colors.gray},
+        {"-1", "rods:-1", colors.gray},
+        {ctl.auto and "AU" or "MA", "auto", ctl.auto and colors.green or colors.orange},
+        {"+1", "rods:1", colors.gray},
+        {"+10", "rods:10", colors.gray}
+    })
+    gap(BARS, "bars")
+
+    local level = 0
+    if ok then
+        if d.activelyCooled then
+            level = (d.steamMax or 0) > 0 and d.steam / d.steamMax or 0
+        else
+            level = (d.capacity or 0) > 0 and d.stored / d.capacity or 0
+        end
+    end
+    local inBand = level >= lim.bufferLow and level <= lim.bufferHigh
+    local bc = inBand and colors.green or (level < lim.bufferLow and colors.orange or colors.lightBlue)
+    lr(string.format("%s %d-%d", d.activelyCooled and "Steam Tank" or "Energy Buffer",
+                     math.floor(lim.bufferLow * 100 + 0.5), math.floor(lim.bufferHigh * 100 + 0.5)),
+       string.format("%.1f%%", level * 100), bc)
+    bar(level, bc)
+    gap(BARS, "bars")
+
+    local fuel = ok and (d.fuelMax or 0) > 0 and d.fuel / d.fuelMax or 0
+    local fuelC = pctColor(fuel, lim.lowFuel or 0.1, (lim.lowFuel or 0.1) * 3)
+    lr("Fuel", string.format("%.1f%%", fuel * 100), fuelC)
+    bar(fuel, fuelC)
+    return page.controls()
+end
+
+-- Extreme / Bigger Reactors turbine ------------------------------------
+local MODE_TEXT = {
+    ["spin-up"] = {"SPINNING UP", colors.yellow}, run = {"ONLINE", colors.green},
+    idle = {"IDLE (FULL)", colors.lightBlue}, overspeed = {"OVERSPEED", colors.red}
+}
+
+function LAYOUTS.turbine(model, w)
+    local d, ctl, lim = model.data or {}, model.controller, model.limits
+    local page = newPage(model)
+    local lr, bar, gap = page.lr, page.bar, page.gap
+    local ok = model.data and model.data.assembled ~= false
+
+    local mode = MODE_TEXT[ctl.mode] or {"ONLINE", colors.green}
+    local status, color = erStatus(model.data, mode[1], mode[2])
+    page.header("Turbine Status", status, color)
+
+    lr("Generation", ok and fitRate("Generation", d.produced or 0, w, " FE/t") or "--", colors.lime)
+    local rpm = ok and d.rpm or 0
+    local rc = colors.green
+    if rpm > lim.maxRPM then rc = colors.red
+    elseif math.abs(rpm - lim.targetRPM) > lim.targetRPM * 0.05 then rc = colors.orange end
+    lr(string.format("Rotor T:%d", lim.targetRPM), ok and (formatInt(rpm) .. " RPM") or "--", rc)
+    bar(rpm / lim.maxRPM, rc)
+    lr("Steam Flow", ok and (formatInt(d.flow or 0) .. " mB/t") or "--", colors.lightBlue)
+    lr("Coils", ok and (d.coils and "ENGAGED" or "DISENGAGED") or "--",
+       d.coils and colors.green or colors.lightGray)
+    gap(BARS, "bars")
+
+    local level = ok and (d.capacity or 0) > 0 and d.stored / d.capacity or 0
+    lr("Energy Buffer", string.format("%.1f%%", level * 100), colors.white)
+    bar(level, colors.blue)
+    return page.controls()
+end
+
+local function buildLayout(model, w)
+    return (LAYOUTS[model.kind] or LAYOUTS.draconic)(model, w)
 end
 
 -- Drops the lowest-priority rows (spacers first, then the core block) until
@@ -374,7 +487,7 @@ local function drawDashboard(target, model)
             buttonRow(target, y, w, item.defs, item.widths)
         elseif item.kind == "footer" then
             -- Alarms beat the last action.
-            local alarm = ctl.alarms[1]
+            local alarm = ctl.alarms and ctl.alarms[1]
             if alarm then
                 win.setBackgroundColor(colors.red)
                 win.setCursorPos(1, y)
@@ -399,7 +512,8 @@ function monitor_utils.render(view)
     local units = view.units or {}
     for _, name in ipairs(order) do
         local target = targets[name]
-        local ok = target == nil or pcall(function()
+        local ok, err = target == nil, nil
+        if not ok then ok, err = pcall(function()
             local count = #units
             target.selected = math.max(1, math.min(target.selected or 1, math.max(count, 1)))
             local model = {}
@@ -418,11 +532,19 @@ function monitor_utils.render(view)
                 text(target.win, 2, 2, "No reactor connected", colors.orange)
             end
             target.win.setVisible(true)
-        end)
+        end) end
         if not ok then
-            -- Monitor was broken or detached mid-draw; drop it until the
-            -- next re-init (triggered by a peripheral event).
-            targets[name] = nil
+            -- A detached monitor is re-initialised by the peripheral event;
+            -- anything else is a bug, shown on the screen and reported once
+            -- through lastError rather than silently freezing the display.
+            monitor_utils.lastError = tostring(err)
+            pcall(function()
+                target.win.setVisible(true)
+                target.win.setBackgroundColor(colors.black)
+                target.win.clear()
+                text(target.win, 1, 1, "Display error:", colors.red)
+                text(target.win, 1, 2, tostring(err):sub(1, 200), colors.white)
+            end)
         end
     end
 end

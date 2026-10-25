@@ -49,7 +49,7 @@ local VERSION = "4.0"
 
 -- Every driver is optional: a missing or broken driver file only removes
 -- that mod's support. Drivers whose mod is not attached find no units.
-local DRIVERS = {"drivers.draconic", "drivers.energy_core"}
+local DRIVERS = {"drivers.draconic", "drivers.extreme", "drivers.energy_core"}
 
 local state = {
     units = {},                -- every discovered unit, in driver order
@@ -246,6 +246,10 @@ local function uiLoop()
             if u.kind ~= "storage" then table.insert(models, u.model()) end
         end
         monitor_utils.render({units = models, core = core, events = stat_utils.recent})
+        if monitor_utils.lastError and monitor_utils.lastError ~= state.reportedUiError then
+            state.reportedUiError = monitor_utils.lastError
+            stat_utils.log("ERROR", "Display: " .. monitor_utils.lastError)
+        end
         for _, u in ipairs(state.units) do
             u.record({corePct = core and core.pct})
         end

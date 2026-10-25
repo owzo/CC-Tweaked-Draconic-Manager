@@ -1,9 +1,16 @@
 # CC:Tweaked-Draconic Manager
 
-A ComputerCraft: Tweaked program that runs a Draconic Evolution reactor:
-it charges and starts the reactor, holds the containment field and core
-temperature at their targets, trips to a controlled shutdown on unsafe
-conditions, and shows everything on a touchscreen dashboard.
+A ComputerCraft: Tweaked program that runs **Draconic Evolution** reactors
+and, when installed, **Extreme Reactors** or **Bigger Reactors** reactors and
+turbines, from one computer with a touchscreen dashboard.
+
+Each mod is optional: with only Draconic Evolution you get the Draconic
+features, with only Extreme/Bigger Reactors you get those, and with both
+everything shows up side by side.
+
+For Draconic reactors it charges and starts them, holds the containment
+field and core temperature at their targets, and trips to a controlled
+shutdown on unsafe conditions.
 
 ## Features
 
@@ -113,6 +120,38 @@ loop, so a slow or broken reactor never delays the others.
   buttons at the top to page between them; every monitor pages on its own.
 - **Logs:** log lines are tagged `[Alpha]`, and every reactor gets its own
   stats file (`logs/draconic_alpha.csv`).
+
+## Extreme Reactors / Bigger Reactors
+
+Put a **Computer Port** in each reactor and turbine and connect it with a
+wired modem (right-clicked) or place it against the computer. Both mods are
+detected automatically, as is the difference between passive (FE) and
+active (steam) cooling. Settings live in `config.extreme`.
+
+| Unit | What the program does |
+| --- | --- |
+| Passive reactor | Moves the control rods so the reactor's own FE battery stays between `bufferLow` and `bufferHigh` (30–70%). It estimates real demand from production and the change in stored energy, so it tracks load changes. Rods go fully in as soon as the battery is full, because both mods throw away energy (and fuel) when it is. |
+| Active (steam) reactor | Matches steam production to what the turbines are set to draw, and uses its steam tank level only as a trim. A steam tank holds only seconds of mismatch, too little to steer by on its own. |
+| Turbine | Spins up with the coils off (engaged coils brake the rotor; Bigger Reactors turbines start engaged), then a PI loop on steam flow holds `targetRPM` (1800, the efficiency peak in both mods). When the turbine's own buffer is full, the coils switch off and the rotor is kept at speed; they switch back on below `coilsOnBelow`. Steam is cut above `maxRPM`. |
+
+All steam-cooled reactors and turbines on the network are treated as one
+steam system (the usual build: reactors feed a shared pipe network).
+
+**Neither mod can melt down or explode**, and turbines take no damage from
+overspeed. The worst outcome of bad control is wasted fuel or steam, so
+these controllers aim for efficiency rather than safety margins.
+
+Each page has `START` / `STOP` (activate or deactivate). Reactor pages also
+have `-10 -1 AU +1 +10`, where `AU`/`MA` toggles automatic rod control and
+the other buttons set the rods by hand. Name units or override settings per
+unit in `config.extreme.units`.
+
+| Mod difference | Handled by |
+| --- | --- |
+| Extreme Reactors setters apply a tick later and never raise errors | Values are validated before sending, and only changes are written |
+| Bigger Reactors reports temperatures in Kelvin | Converted to °C |
+| Bigger Reactors has no battery when actively cooled, and object accessors (`battery()`, `rotor()`) | Hidden behind one adapter (`er_utils.lua`) |
+| Bigger Reactors turbine vents can't be set from CC | Not touched by the program in either mod |
 
 ## Controls
 
@@ -289,10 +328,27 @@ list of units; each unit provides `run()` (its control loop),
 then add the file to `DRIVERS` in `main_control.lua` and to both installers.
 The test suite checks that the installers ship every program file.
 
+`tests/er_sim.lua` simulates Extreme/Bigger Reactors reactors and turbines
+behind both mods' CC APIs, using the turbine formulas from Extreme Reactors'
+source. The reactor model is deliberately simple (output follows rod
+insertion with a heat lag): it checks that the controllers converge, not
+real FE figures.
+
 ## Disclaimer
 
-Use at your own risk. The simulator is no substitute for in-game testing,
-and reactor explosions are permanent.
+Use at your own risk. The simulators are no substitute for in-game testing,
+and Draconic reactor explosions are permanent.
+
+## Credits
+
+- Dashboard layout inspired by [drmon](https://github.com/acidjazz/drmon)
+  (MIT).
+- The Extreme/Bigger Reactors approach (rods following an energy-buffer band,
+  support for both mods' APIs) was inspired by
+  [ReactorController](https://github.com/Kasra-G/ReactorController)
+  (MIT, © 2021 Kasra Ghaffari), and the turbine spin-up and coil handling by
+  [extremereactorcontrol](https://gitlab.com/seekerscomputercraft/extremereactorcontrol)
+  (MIT). The control laws here are written from scratch.
 
 ## License
 
