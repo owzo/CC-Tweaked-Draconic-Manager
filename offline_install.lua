@@ -27,6 +27,8 @@ local requiredFiles = {
     "monitor_utils.lua",
     "stat_utils.lua",
     "energy_core_utils.lua",
+    "drivers/draconic.lua",
+    "drivers/energy_core.lua",
     "config.lua"
 }
 local preserve = {["config.lua"] = true}
@@ -88,6 +90,8 @@ for _, name in ipairs(requiredFiles) do
         print("Keeping existing " .. name)
     else
         if fs.exists(dest) then fs.delete(dest) end
+        local dir = fs.getDir(dest)
+        if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
         fs.copy(fs.combine(source, name), dest)
         print("Installed " .. name)
     end

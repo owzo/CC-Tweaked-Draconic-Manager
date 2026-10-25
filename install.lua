@@ -28,6 +28,8 @@ local files = {
     "monitor_utils.lua",
     "stat_utils.lua",
     "energy_core_utils.lua",
+    "drivers/draconic.lua",
+    "drivers/energy_core.lua",
     "config.lua"
 }
 -- Never overwrite a player's tuned settings on update.
@@ -60,6 +62,8 @@ local function fetch(url)
 end
 
 local function writeFile(path, content)
+    local dir = fs.getDir(path)
+    if dir ~= "" and not fs.exists(dir) then fs.makeDir(dir) end
     local handle = fs.open(path, "w")
     if not handle then return false end
     handle.write(content)

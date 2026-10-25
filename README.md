@@ -84,6 +84,36 @@ Running `install` again updates the program.
 A reactor that is already running when the program starts keeps running. A
 cold reactor is only charged after START, unless `autoStartOnBoot = true`.
 
+## Multiple reactors
+
+One computer can run any number of Draconic reactors. Each reactor needs its
+own pair of flux gates on the same wired network, and runs in its own control
+loop, so a slow or broken reactor never delays the others.
+
+- **Setup wizard:** with several reactors and nothing in `config.lua`, the
+  first run asks, for each reactor peripheral, which gate feeds its injector
+  and which takes its output, and lets you name it. If you put modems on two
+  blocks of the *same* reactor, it appears twice: leave the input gate blank
+  to skip the duplicate. The answers are saved; run `set draconic.units nil`
+  to set up again.
+- **Or list them in `config.lua`.** Per-reactor `settings` override the
+  shared `config.reactor` values:
+
+  ```lua
+  config.peripherals.reactors = {
+      {name = "Alpha", reactor = "draconic_reactor_0",
+       inputGate = "flow_gate_0", outputGate = "flow_gate_1"},
+      {name = "Beta",  reactor = "draconic_reactor_1",
+       inputGate = "flow_gate_2", outputGate = "flow_gate_3",
+       settings = {targetTemperature = 6500}},
+  }
+  ```
+
+- **Monitors:** each monitor shows one reactor at a time. Use the `<` / `>`
+  buttons at the top to page between them; every monitor pages on its own.
+- **Logs:** log lines are tagged `[Alpha]`, and every reactor gets its own
+  stats file (`logs/draconic_alpha.csv`).
+
 ## Controls
 
 | Button | Action |
@@ -221,11 +251,13 @@ watch `logs/reactor_stats.csv`.
 ## Development
 
 ```text
-main_control.lua       entry point: loops, input dispatch, fail-safe exit
-reac_utils.lua         discovery, gate adapter, controller (pure logic)
-monitor_utils.lua      dashboard rendering and touch hit-testing
-energy_core_utils.lua  optional energy pylon readout
-stat_utils.lua         event log, stats CSV, rotation
+main_control.lua       scheduler: loads drivers, one coroutine per unit, UI, input, fail-safe exit
+drivers/draconic.lua   Draconic reactor units (wraps reac_utils)
+drivers/energy_core.lua  read-only energy pylon units
+reac_utils.lua         Draconic discovery, gate adapter, controller (pure logic)
+monitor_utils.lua      dashboard rendering, paging and touch hit-testing
+energy_core_utils.lua  energy pylon readout
+stat_utils.lua         event log, per-unit stats CSV, rotation
 config.lua             user settings
 install.lua            online installer
 offline_install.lua    floppy-disk installer
@@ -245,6 +277,17 @@ also an end-to-end run of `main_control.lua` under a virtual-time CC:Tweaked
 mock.
 The simulator is only an approximation. Test new settings on a reactor you
 can afford to lose.
+
+### Adding support for another mod
+
+Drivers are optional and independent: a missing driver file, or a mod that
+isn't installed, only means its units don't appear. A driver is a file in
+`drivers/` that returns `{id, label, discover(ctx)}`. `discover` returns a
+list of units; each unit provides `run()` (its control loop),
+`model()` / `summary()` (for the UI), `act(action)`, `failSafe(reason)` and
+`record()`. See the header of `drivers/draconic.lua` for the full contract,
+then add the file to `DRIVERS` in `main_control.lua` and to both installers.
+The test suite checks that the installers ship every program file.
 
 ## Disclaimer
 

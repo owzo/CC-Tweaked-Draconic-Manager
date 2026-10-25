@@ -14,6 +14,16 @@ local MODULES = {"config", "reac_utils", "monitor_utils", "stat_utils",
                  "energy_core_utils"}
 local TICK = 0.05
 
+-- Everything the installers must ship; MODULE_FILES are loaded by
+-- main_control and must never call require themselves.
+PROGRAM_FILES = {"main_control.lua", "config.lua", "reac_utils.lua", "monitor_utils.lua",
+                 "stat_utils.lua", "energy_core_utils.lua",
+                 "drivers/draconic.lua", "drivers/energy_core.lua"}
+MODULE_FILES = {}
+for _, f in ipairs(PROGRAM_FILES) do
+    if f ~= "main_control.lua" then table.insert(MODULE_FILES, f) end
+end
+
 ------------------------------------------------------------
 -- TEST HARNESS
 ------------------------------------------------------------
@@ -98,8 +108,8 @@ end
 -- STATIC CHECKS
 ------------------------------------------------------------
 test("every program file compiles", function()
-    local files = {"config.lua", "main_control.lua", "reac_utils.lua", "monitor_utils.lua",
-                   "stat_utils.lua", "energy_core_utils.lua", "install.lua", "offline_install.lua"}
+    local files = {"install.lua", "offline_install.lua"}
+    for _, f in ipairs(PROGRAM_FILES) do table.insert(files, f) end
     for _, f in ipairs(files) do
         local handle = assert(io.open(f, "r"))
         local src = handle:read("*a")
@@ -361,7 +371,8 @@ test("dashboard renders on a 3x3 monitor and buttons map to actions", function()
     check(ui.init({}, cfg.ui) == 1, "monitor not found")
     local sim = Sim.new({state = "running", temperature = 7000})
     local ctl = reac.newController(cfg.reactor, reac.readInfo(sim.reactor))
-    ui.render({info = reac.readInfo(sim.reactor), controller = ctl, limits = cfg.reactor,
+    ui.render({units = {{id = "r1", name = "Main", info = reac.readInfo(sim.reactor),
+                         controller = ctl, limits = cfg.reactor}},
                events = {{level = "INFO", message = "Charging reactor"}}})
     local screen = mon.text()
     check(screen:find("RUNNING"), "status missing:\n%s", screen)
@@ -531,9 +542,126 @@ test("main_control: boot, prompt, START, regulate, Ctrl+T fail-safe", function()
           "core not displayed:\n%s", mon.text())
 end)
 
+------------------------------------------------------------
+-- MULTI-REACTOR
+------------------------------------------------------------
+-- Runs main_control.lua under the virtual scheduler.
+--   opts.sims      simulators to tick with game time
+--   opts.config    function(cfg) to edit config.lua before start
+--   opts.at        {{t = seconds, fn = function() ... end}, ...}
+--   opts.untilTime when Ctrl+T is "pressed"
+local function runProgram(opts)
+    freshModules()
+    local cfg = require("config")
+    if opts.config then opts.config(cfg) end
+    local fn = assert((loadfile or load)("main_control.lua"))
+    for i, step in ipairs(opts.at or {}) do cc.schedule(step.t, "__step", i) end
+    local carry = 0
+    local ok, err = cc.run(function()
+        local realPull = os.pullEvent
+        os.pullEvent = function(filter)
+            while true do
+                local ev = {realPull(filter == "__step" and nil or filter)}
+                if ev[1] == "__step" then
+                    opts.at[ev[2]].fn()
+                elseif filter == nil or ev[1] == filter then
+                    return (table.unpack or unpack)(ev)
+                end
+            end
+        end
+        fn()
+        os.pullEvent = realPull
+    end, {untilTime = opts.untilTime, onAdvance = function(dt)
+        carry = carry + dt
+        while carry >= TICK - 1e-9 do
+            for _, sim in ipairs(opts.sims or {}) do sim:tick() end
+            carry = carry - TICK
+        end
+    end})
+    check(ok, "program crashed: %s\n%s", tostring(err), cc.outputText())
+    check(not cc.outputText():find("Fatal"), "fatal error:\n%s", cc.outputText())
+end
+
+local function touchText(mon, needle)
+    local x, y = mon.find(needle)
+    check(x, "%q not on monitor:\n%s", needle, mon.text())
+    os.queueEvent("monitor_touch", "monitor_0", x, y)
+end
+
+local function twoReactors()
+    local a, b = Sim.new({version = "1.20"}), Sim.new({version = "1.12"})
+    cc.addPeripheral("draconic_reactor_0", "draconic_reactor", a.reactor)
+    cc.addPeripheral("draconic_reactor_1", "draconic_reactor", b.reactor)
+    cc.addPeripheral("flow_gate_0", "flow_gate", a.inGate)
+    cc.addPeripheral("flow_gate_1", "flow_gate", a.outGate)
+    cc.addPeripheral("flow_gate_2", "flow_gate", b.inGate)
+    cc.addPeripheral("flow_gate_3", "flow_gate", b.outGate)
+    return a, b
+end
+
+local function configureTwo(cfg)
+    cfg.reactor.autoStartOnBoot = true
+    cfg.peripherals.reactors = {
+        {name = "Alpha", reactor = "draconic_reactor_0",
+         inputGate = "flow_gate_0", outputGate = "flow_gate_1"},
+        {name = "Beta", reactor = "draconic_reactor_1",
+         inputGate = "flow_gate_2", outputGate = "flow_gate_3",
+         settings = {targetTemperature = 6500}}
+    }
+end
+
+test("two reactors: independent control, per-reactor settings, paging", function()
+    cc.reset()
+    local a, b = twoReactors()
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local sawAlpha = false
+    runProgram({sims = {a, b}, config = configureTwo, untilTime = 1200, at = {
+        {t = 5, fn = function()
+            sawAlpha = mon.text():find("Alpha 1/2") ~= nil
+            touchText(mon, ">  ")      -- the page-forward button
+        end}
+    }})
+    check(sawAlpha, "first page did not show Alpha")
+    check(mon.text():find("Beta 2/2"), "paging failed:\n%s", mon.text())
+    check(a.state == "running" and b.state == "running", "states %s / %s", a.state, b.state)
+    check(math.abs(a.temperature - 7000) < 150, "Alpha temperature %.0f", a.temperature)
+    check(math.abs(b.temperature - 6500) < 150, "Beta override ignored: %.0f", b.temperature)
+    check(cc.readFile("logs/draconic_alpha.csv"), "Alpha stats missing")
+    check(cc.readFile("logs/draconic_beta.csv"), "Beta stats missing")
+    check(cc.readFile("logs/draconic.log"):find("%[Beta%]"), "log lines not tagged by reactor")
+end)
+
+test("two reactors: one failing does not disturb the other", function()
+    cc.reset()
+    local a, b = twoReactors()
+    runProgram({sims = {a, b}, config = configureTwo, untilTime = 900, at = {
+        {t = 600, fn = function()
+            b.reactor.getReactorInfo = function() error("peripheral detached") end
+        end}
+    }})
+    check(a.state == "running" and math.abs(a.temperature - 7000) < 150,
+          "Alpha disturbed: %s %.0f", a.state, a.temperature)
+    check(not b.exploded, "Beta exploded")
+    check(cc.readFile("logs/draconic.log"):find("%[Beta%] Reactor read failed"),
+          "Beta failure not logged")
+end)
+
+test("setup wizard assigns gates per reactor and skips duplicates", function()
+    -- reactor_2 is a second modem on Alpha's reactor: the player skips it.
+    cc.reset({inputs = {"1", "2", "Alpha", "3", "4", "", ""}})
+    local a, b = twoReactors()
+    cc.addPeripheral("draconic_reactor_2", "draconic_reactor", a.reactor)
+    runProgram({sims = {a, b}, untilTime = 5})
+    local units = settings.get("draconic.units")
+    check(type(units) == "table" and #units == 2, "saved %s", tostring(units and #units))
+    check(units[1].name == "Alpha" and units[1].inputGate == "flow_gate_0", "Alpha wrong")
+    check(units[2].name == "Reactor 2" and units[2].outputGate == "flow_gate_3", "Reactor 2 wrong")
+    check(cc.outputText():find("Running 2 unit"), "did not start 2 units:\n%s", cc.outputText())
+end)
+
 test("modules never call require (os.loadAPI environments lack it)", function()
-    for _, f in ipairs({"config.lua", "reac_utils.lua", "monitor_utils.lua",
-                        "stat_utils.lua", "energy_core_utils.lua"}) do
+    for _, f in ipairs(MODULE_FILES) do
         local h = assert(io.open(f, "r"))
         local src = h:read("*a")
         h:close()
@@ -545,8 +673,7 @@ end)
 test("main_control starts without require (issue 3: os.run / dofile)", function()
     cc.reset()
     freshModules()
-    for _, f in ipairs({"config.lua", "reac_utils.lua", "monitor_utils.lua",
-                        "stat_utils.lua", "energy_core_utils.lua"}) do
+    for _, f in ipairs(MODULE_FILES) do
         cc.writeFile(f, readRepoFileEarly(f))
     end
     local savedRequire = require
@@ -583,14 +710,29 @@ test("install.lua downloads all files and creates startup.lua", function()
     local fn = assert((loadfile or load)("install.lua"))
     local ok, err = cc.run(fn)
     check(ok, "installer crashed: %s", tostring(err))
-    for _, f in ipairs({"main_control.lua", "reac_utils.lua", "monitor_utils.lua",
-                        "stat_utils.lua", "energy_core_utils.lua", "config.lua"}) do
+    for _, f in ipairs(PROGRAM_FILES) do
         check(cc.readFile(f) == readRepoFile(f), "%s not installed", f)
     end
     check(cc.readFile("startup.lua"):find("main_control"), "startup.lua missing")
     for _, url in ipairs(requested) do
         check(url:find("^https://raw.githubusercontent.com/owzo/CC%-Tweaked%-Draconic%-Manager/main/"),
               "bad url %s", url)
+    end
+end)
+
+test("installers ship exactly the program files", function()
+    for _, installer in ipairs({"install.lua", "offline_install.lua"}) do
+        local src = readRepoFile(installer)
+        local listed = {}
+        for name in src:gmatch('"([%w_/]+%.lua)",?%s*\n') do listed[name] = true end
+        for _, f in ipairs(PROGRAM_FILES) do
+            check(listed[f], "%s does not ship %s", installer, f)
+        end
+        for name in pairs(listed) do
+            local known = false
+            for _, f in ipairs(PROGRAM_FILES) do if f == name then known = true end end
+            check(known, "%s ships unknown file %s", installer, name)
+        end
     end
 end)
 
@@ -606,8 +748,7 @@ test("offline_install.lua copies from a disk drive", function()
     cc.reset()
     cc.addPeripheral("drive_0", "drive", {})
     cc.drives["drive_0"] = "disk"
-    for _, f in ipairs({"main_control.lua", "reac_utils.lua", "monitor_utils.lua",
-                        "stat_utils.lua", "energy_core_utils.lua", "config.lua"}) do
+    for _, f in ipairs(PROGRAM_FILES) do
         cc.writeFile("disk/" .. f, readRepoFile(f))
     end
     cc.writeFile("config.lua", "-- tuned by player")

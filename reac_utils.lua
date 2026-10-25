@@ -84,6 +84,16 @@ local OLD_DE_HINT = " Blocks only expose CC's generic energy_storage peripheral:
     .. " your Draconic Evolution build predates its CC fix (Aug 2024)."
     .. " Update to DE 3.1.2.604 or newer."
 
+-- Explains an empty network: old DE builds only show generic peripherals.
+function reac_utils.missingHint()
+    for _, name in ipairs(peripheral.getNames()) do
+        if isGenericEnergy(peripheral.wrap(name)) then
+            return "No Draconic peripherals found." .. OLD_DE_HINT
+        end
+    end
+    return nil
+end
+
 local function findAll(predicate)
     local found = {}
     for _, name in ipairs(peripheral.getNames()) do
@@ -241,6 +251,100 @@ function reac_utils.discover(peripheralsCfg, chooseGates)
         input       = reac_utils.wrapGate(inName, peripheral.wrap(inName)),
         output      = reac_utils.wrapGate(outName, peripheral.wrap(outName))
     }
+end
+
+------------------------------------------------------------
+-- MULTI-REACTOR DISCOVERY
+------------------------------------------------------------
+-- Builds a hardware table from explicit names, validating each one.
+-- spec = {name?, reactor, inputGate, outputGate}
+function reac_utils.buildHw(spec)
+    local label = spec.name or spec.reactor or "?"
+    local reactorName, err = resolve(spec.reactor, reac_utils.isReactor, "reactor")
+    if not reactorName then return nil, label .. ": " .. (err or "reactor not set") end
+    local inName, inErr = resolve(spec.inputGate, reac_utils.isGate, "flux gate")
+    if not inName then return nil, label .. ": input gate " .. (inErr or "not set") end
+    local outName, outErr = resolve(spec.outputGate, reac_utils.isGate, "flux gate")
+    if not outName then return nil, label .. ": output gate " .. (outErr or "not set") end
+    if inName == outName then
+        return nil, label .. ": input and output gate are the same (" .. inName .. ")"
+    end
+    return {
+        name        = spec.name,
+        reactorName = reactorName,
+        reactor     = peripheral.wrap(reactorName),
+        input       = reac_utils.wrapGate(inName, peripheral.wrap(inName)),
+        output      = reac_utils.wrapGate(outName, peripheral.wrap(outName))
+    }
+end
+
+local function buildAll(specs)
+    local list, used = {}, {}
+    for i, spec in ipairs(specs) do
+        spec = {name = spec.name or ("Reactor " .. i), reactor = spec.reactor,
+                inputGate = spec.inputGate, outputGate = spec.outputGate}
+        for _, key in ipairs({"reactor", "inputGate", "outputGate"}) do
+            local n = spec[key]
+            if n and used[n] then
+                return nil, spec.name .. ": " .. n .. " is already used by " .. used[n]
+            end
+            if n then used[n] = spec.name end
+        end
+        local hw, err = reac_utils.buildHw(spec)
+        if not hw then return nil, err end
+        table.insert(list, hw)
+    end
+    return list
+end
+
+--[[
+Finds every reactor and its gate pair. Returns a list of hardware tables
+or nil plus an error.
+
+  1. config.peripherals.reactors = {{name, reactor, inputGate, outputGate}, ...}
+  2. the single-reactor fields (reactor / inputGate / outputGate), or a
+     lone reactor on the network: the original auto-detection path
+  3. a saved assignment from a previous setup ("draconic.units")
+  4. setupWizard(reactorNames, gateNames) -> specs, run once and saved
+
+Several reactor peripherals can belong to ONE reactor (a modem on a
+stabilizer and another on an injector); the wizard lets the player skip
+those duplicates.
+]]
+function reac_utils.discoverAll(peripheralsCfg, chooseGates, setupWizard)
+    peripheralsCfg = peripheralsCfg or {}
+    if type(peripheralsCfg.reactors) == "table" and #peripheralsCfg.reactors > 0 then
+        return buildAll(peripheralsCfg.reactors)
+    end
+
+    local reactors = findAll(reac_utils.isReactor)
+    if peripheralsCfg.reactor or #reactors <= 1 then
+        local hw, err = reac_utils.discover(peripheralsCfg, chooseGates)
+        if not hw then return nil, err end
+        return {hw}
+    end
+
+    local saved = settings and settings.get("draconic.units")
+    if type(saved) == "table" and #saved > 0 then
+        local list = buildAll(saved)
+        if list then return list end
+    end
+
+    if not setupWizard then
+        return nil, "Several reactors found (" .. table.concat(reactors, ", ")
+            .. "). List them in config.peripherals.reactors."
+    end
+    local specs = setupWizard(reactors, findAll(reac_utils.isGate))
+    if not specs or #specs == 0 then
+        return nil, "Reactor setup cancelled."
+    end
+    local list, err = buildAll(specs)
+    if not list then return nil, err end
+    if settings then
+        settings.set("draconic.units", specs)
+        settings.save()
+    end
+    return list
 end
 
 ------------------------------------------------------------

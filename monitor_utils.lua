@@ -168,22 +168,34 @@ local function labelValue(win, y, width, label, value, color)
     text(win, width - #value, y, value, color or colors.white)
 end
 
--- Lays out `defs` ({label, action, color}) as equal buttons across a row.
-local function buttonRow(target, y, width, defs)
+-- Lays out `defs` ({label, action, color}) across a row. Buttons share
+-- the width equally unless `widths` fixes some of them (nil = flexible).
+local function buttonRow(target, y, width, defs, widths)
     local gap = 1
     local count = #defs
-    local each = math.floor((width - 2 - gap * (count - 1)) / count)
-    local x = math.floor((width - (each * count + gap * (count - 1))) / 2) + 1
-    for _, def in ipairs(defs) do
+    local usable = width - 2 - gap * (count - 1)
+    local fixed, flexible = 0, 0
+    for i = 1, count do
+        if widths and widths[i] then fixed = fixed + widths[i] else flexible = flexible + 1 end
+    end
+    local each = flexible > 0 and math.floor((usable - fixed) / flexible) or 0
+    local sizes, total = {}, 0
+    for i = 1, count do
+        sizes[i] = (widths and widths[i]) or each
+        total = total + sizes[i]
+    end
+    local x = math.floor((width - (total + gap * (count - 1))) / 2) + 1
+    for i, def in ipairs(defs) do
+        local size = sizes[i]
         local label = def[1]
-        if #label > each then label = label:sub(1, each) end
-        local pad = each - #label
+        if #label > size then label = label:sub(1, size) end
+        local pad = size - #label
         local left = math.floor(pad / 2)
         text(target.win, x, y,
              string.rep(" ", left) .. label .. string.rep(" ", pad - left),
              colors.white, def[3] or colors.blue)
-        table.insert(target.buttons, {x1 = x, x2 = x + each - 1, y = y, action = def[2]})
-        x = x + each + gap
+        table.insert(target.buttons, {x1 = x, x2 = x + size - 1, y = y, action = def[2]})
+        x = x + size + gap
     end
 end
 
@@ -240,6 +252,15 @@ local function buildLayout(model, w)
     end
 
     gap(TOP)
+    if model.tabs and model.tabs.count > 1 then
+        -- Several reactors: each monitor pages through them on its own.
+        add({kind = "buttons", defs = {
+            {"<", "unit:prev", colors.gray},
+            {string.format("%s %d/%d", model.name or "Reactor", model.tabs.index, model.tabs.count),
+             "noop", colors.blue},
+            {">", "unit:next", colors.gray}
+        }, widths = {3, nil, 3}})
+    end
     lr("Reactor Status", status, statusColor)
     gap(HEADER)
 
@@ -350,7 +371,7 @@ local function drawDashboard(target, model)
         elseif item.kind == "bar" then
             bar(win, y, w, item.pct, item.color)
         elseif item.kind == "buttons" then
-            buttonRow(target, y, w, item.defs)
+            buttonRow(target, y, w, item.defs, item.widths)
         elseif item.kind == "footer" then
             -- Alarms beat the last action.
             local alarm = ctl.alarms[1]
@@ -366,12 +387,36 @@ local function drawDashboard(target, model)
     end
 end
 
-function monitor_utils.render(model)
+--[[
+view = {
+  units  = list of reactor models (unit.model()), one page each,
+  core   = energy_core_utils.read() result or nil,
+  events = stat_utils.recent
+}
+Every monitor remembers which reactor it is showing.
+]]
+function monitor_utils.render(view)
+    local units = view.units or {}
     for _, name in ipairs(order) do
         local target = targets[name]
         local ok = target == nil or pcall(function()
+            local count = #units
+            target.selected = math.max(1, math.min(target.selected or 1, math.max(count, 1)))
+            local model = {}
+            for k, v in pairs(units[target.selected] or {}) do model[k] = v end
+            model.core, model.events = view.core, view.events
+            model.tabs = {index = target.selected, count = count}
+            target.count = count
+            target.unitId = model.id
             target.win.setVisible(false)
-            drawDashboard(target, model)
+            if model.controller then
+                drawDashboard(target, model)
+            else
+                target.win.setBackgroundColor(colors.black)
+                target.win.clear()
+                target.buttons = {}
+                text(target.win, 2, 2, "No reactor connected", colors.orange)
+            end
             target.win.setVisible(true)
         end)
         if not ok then
@@ -382,13 +427,24 @@ function monitor_utils.render(model)
     end
 end
 
--- Returns the action string under (x, y) on display `name`, or nil.
+-- Returns the action under (x, y) on display `name` and the id of the
+-- unit that display is showing, or nil. Paging is handled here.
 function monitor_utils.handleTouch(name, x, y)
     local target = targets[name]
     if not target then return nil end
     for _, b in ipairs(target.buttons) do
         if y == b.y and x >= b.x1 and x <= b.x2 then
-            return b.action
+            local count = target.count or 1
+            if b.action == "unit:next" then
+                target.selected = (target.selected or 1) % count + 1
+                return "redraw"
+            elseif b.action == "unit:prev" then
+                target.selected = ((target.selected or 1) - 2) % count + 1
+                return "redraw"
+            elseif b.action == "noop" then
+                return nil
+            end
+            return b.action, target.unitId
         end
     end
     return nil
