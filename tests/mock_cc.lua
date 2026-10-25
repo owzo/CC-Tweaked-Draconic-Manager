@@ -284,6 +284,35 @@ parallel = {
 }
 
 ------------------------------------------------------------
+-- TEXTUTILS (serialise / unserialise round trip, like CC's)
+------------------------------------------------------------
+local function serialize(v, indent)
+    local t = type(v)
+    if t == "string" then return string.format("%q", v) end
+    if t == "number" or t == "boolean" or t == "nil" then return tostring(v) end
+    assert(t == "table", "cannot serialize " .. t)
+    local parts = {}
+    local keys = {}
+    for k in pairs(v) do table.insert(keys, k) end
+    table.sort(keys, function(x, y) return tostring(x) < tostring(y) end)
+    for _, k in ipairs(keys) do
+        table.insert(parts, "[" .. serialize(k) .. "] = " .. serialize(v[k]))
+    end
+    return "{" .. table.concat(parts, ", ") .. "}"
+end
+textutils = {
+    serialize = serialize,
+    serialise = serialize,
+    unserialize = function(s)
+        local fn = (loadstring or load)("return " .. s)
+        if not fn then return nil end
+        local ok, v = pcall(fn)
+        return ok and v or nil
+    end
+}
+textutils.unserialise = textutils.unserialize
+
+------------------------------------------------------------
 -- MISC APIS
 ------------------------------------------------------------
 local store

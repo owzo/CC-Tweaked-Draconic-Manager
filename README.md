@@ -116,8 +116,7 @@ loop, so a slow or broken reactor never delays the others.
   }
   ```
 
-- **Monitors:** each monitor shows one reactor at a time. Use the `<` / `>`
-  buttons at the top to page between them; every monitor pages on its own.
+- **Monitors:** see [Menus and monitors](#menus-and-monitors).
 - **Logs:** log lines are tagged `[Alpha]`, and every reactor gets its own
   stats file (`logs/draconic_alpha.csv`).
 
@@ -152,6 +151,45 @@ unit in `config.extreme.units`.
 | Bigger Reactors reports temperatures in Kelvin | Converted to °C |
 | Bigger Reactors has no battery when actively cooled, and object accessors (`battery()`, `rotor()`) | Hidden behind one adapter (`er_utils.lua`) |
 | Bigger Reactors turbine vents can't be set from CC | Not touched by the program in either mod |
+
+## Menus and monitors
+
+With more than one unit (reactor, turbine or energy core), every monitor
+opens on the **Overview**. It has one card per unit (name, status, key
+reading and a bar) and total generation at the top. Tap a card to open
+that unit's page. If there are more cards than fit, `<` / `>` at the bottom
+pages through them.
+
+Every unit page has a navigation row at the top:
+
+| Button | Opens |
+| --- | --- |
+| `<` | Back to the Overview |
+| `G` | **Graphs**: history charts. Draconic: temperature, field, saturation, output. Fission: buffer, generation, rods. Turbine: RPM, generation, steam flow. One sample every `ui.graphInterval` seconds; a 3x3 monitor shows the last ~2 minutes. |
+| `S` | **Settings**: the unit's tunable values, each with `-` / `+` |
+| `X` | Back to the unit page (from Graphs or Settings) |
+
+**Settings apply immediately and are saved** (`data/manager.db`), so they
+survive reboots. Linked limits are enforced: a target can never pass its trip
+limit, and Draconic field and temperature targets stay inside their trips.
+`RESET` returns that unit to its `config.lua` values.
+
+| Unit | Settings |
+| --- | --- |
+| Draconic | Target / trip temperature, target / trip field, restart temperature, auto-restart |
+| Fission | Buffer band low / high |
+| Turbine | Target RPM, steam cut-off RPM, coils-off / coils-on buffer levels |
+
+**Dedicated monitors:** `PIN HERE` on a unit's Settings page keeps that
+monitor on that unit, remembered across reboots; press `UNPIN` to free it.
+The same can be set in `config.lua`, by unit name:
+
+```lua
+config.ui.monitorUnits = {monitor_1 = "Alpha", monitor_2 = "Turbine 1"}
+```
+
+Any mix works: one monitor on the Overview, others pinned to single reactors.
+Each monitor navigates on its own.
 
 ## Controls
 
@@ -291,10 +329,11 @@ watch `logs/reactor_stats.csv`.
 
 ```text
 main_control.lua       scheduler: loads drivers, one coroutine per unit, UI, input, fail-safe exit
+persist.lua            saved in-game settings and monitor pins (data/manager.db), settings schema
 drivers/draconic.lua   Draconic reactor units (wraps reac_utils)
 drivers/energy_core.lua  read-only energy pylon units
 reac_utils.lua         Draconic discovery, gate adapter, controller (pure logic)
-monitor_utils.lua      dashboard rendering, paging and touch hit-testing
+monitor_utils.lua      overview, unit pages, settings, graphs, navigation, touch hit-testing
 energy_core_utils.lua  energy pylon readout
 stat_utils.lua         event log, per-unit stats CSV, rotation
 config.lua             user settings

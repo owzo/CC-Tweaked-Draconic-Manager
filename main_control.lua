@@ -44,6 +44,7 @@ end
 local config        = import("config")
 local monitor_utils = import("monitor_utils")
 local stat_utils    = import("stat_utils")
+local persist       = import("persist")
 
 local VERSION = "4.0"
 
@@ -192,7 +193,8 @@ end
 
 local function discoverUnits(drivers)
     local ctx = {config = config, log = stat_utils, import = import,
-                 askGates = askGates, askUnits = askUnits}
+                 askGates = askGates, askUnits = askUnits,
+                 overrides = persist.overrides}
     while true do
         local units, problems = {}, {}
         for _, drv in ipairs(drivers) do
@@ -237,15 +239,36 @@ local function firstStorage()
     end
 end
 
+-- Monitor pins: saved in-game pins win over config.ui.monitorUnits
+-- (which may name a unit by id or by its display name).
+local function currentPins()
+    local pins = {}
+    for monitor, ref in pairs(config.ui.monitorUnits or {}) do
+        for _, u in ipairs(state.units) do
+            if u.id == ref or u.name == ref then pins[monitor] = u.id end
+        end
+    end
+    for monitor, id in pairs(persist.pins()) do pins[monitor] = id end
+    return pins
+end
+
 local function uiLoop()
+    local nextSample = 0
     while true do
         local storage = firstStorage()
         local core = storage and storage.info
         local models = {}
         for _, u in ipairs(state.units) do
-            if u.kind ~= "storage" then table.insert(models, u.model()) end
+            local m = u.model()
+            m.settings = u.settings
+            table.insert(models, m)
         end
-        monitor_utils.render({units = models, core = core, events = stat_utils.recent})
+        if os.clock() >= nextSample then
+            monitor_utils.sample(models)
+            nextSample = os.clock() + (config.ui.graphInterval or 5)
+        end
+        monitor_utils.render({units = models, core = core, events = stat_utils.recent,
+                              pins = currentPins(), formatSetting = persist.format})
         if monitor_utils.lastError and monitor_utils.lastError ~= state.reportedUiError then
             state.reportedUiError = monitor_utils.lastError
             stat_utils.log("ERROR", "Display: " .. monitor_utils.lastError)
@@ -257,10 +280,32 @@ local function uiLoop()
     end
 end
 
-local function dispatch(action, unitId)
+local function dispatch(action, unitId, monitor)
     if not action or action == "redraw" then return end
     local unit = state.byId[unitId]
-    if unit then unit.act(action) end
+    if not unit then return end
+
+    local key, dir = action:match("^set:([%w_]+):(-?%d+)$")
+    if key then
+        local value = persist.adjust(unit.cfg, unit.settings, key, tonumber(dir))
+        if value ~= nil then
+            persist.setOverride(unit.id, key, value)
+            stat_utils.log("INFO", string.format("[%s] %s set to %s", unit.name, key, tostring(value)))
+        end
+    elseif action == "reset" then
+        for _, item in ipairs(unit.settings or {}) do
+            unit.cfg[item.key] = unit.defaults[item.key]
+        end
+        persist.clearOverrides(unit.id)
+        stat_utils.log("INFO", "[" .. unit.name .. "] settings reset to config.lua")
+    elseif action == "pin" then
+        local pinned = persist.pins()[monitor] == unit.id
+        persist.setPin(monitor, not pinned and unit.id or nil)
+        stat_utils.log("INFO", string.format("Monitor %s %s %s", monitor,
+            pinned and "unpinned from" or "pinned to", unit.name))
+    else
+        unit.act(action)
+    end
 end
 
 local function eventLoop()
@@ -303,6 +348,7 @@ local function main()
     end
 
     stat_utils.log("INFO", "Starting v" .. VERSION)
+    persist.load()
     state.units = discoverUnits(loadDrivers())
     for _, u in ipairs(state.units) do state.byId[u.id] = u end
 
