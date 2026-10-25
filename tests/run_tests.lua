@@ -17,9 +17,9 @@ local TICK = 0.05
 -- Everything the installers must ship; MODULE_FILES are loaded by
 -- main_control and must never call require themselves.
 PROGRAM_FILES = {"main_control.lua", "config.lua", "reac_utils.lua", "monitor_utils.lua",
-                 "stat_utils.lua", "energy_core_utils.lua", "er_utils.lua", "persist.lua",
+                 "stat_utils.lua", "energy_core_utils.lua", "er_utils.lua", "mek_utils.lua", "persist.lua",
                  "alarms.lua", "totals.lua", "updater.lua",
-                 "drivers/draconic.lua", "drivers/extreme.lua", "drivers/energy_core.lua"}
+                 "drivers/draconic.lua", "drivers/extreme.lua", "drivers/mekanism.lua", "drivers/energy_core.lua"}
 MODULE_FILES = {}
 for _, f in ipairs(PROGRAM_FILES) do
     if f ~= "main_control.lua" then table.insert(MODULE_FILES, f) end
@@ -1217,6 +1217,137 @@ test("System page: check, two-tap update, install and reboot", function()
     check(served["install.lua"] and served["persist.lua"], "installer did not run")
     check(cc.readFile("main_control.lua"):find('VERSION = "9.9"'), "new version not written")
     check(cc.readFile("logs/draconic.log"):find("Update installed"), "install not logged")
+end)
+
+------------------------------------------------------------
+-- MEKANISM
+------------------------------------------------------------
+local MekSim = require("mek_sim")
+
+local function mekCfg(over)
+    cc.reset(); freshModules()
+    local cfg = {}
+    for k, v in pairs(require("config").mekanism) do cfg[k] = v end
+    for k, v in pairs(over or {}) do cfg[k] = v end
+    return require("mek_utils"), cfg
+end
+
+-- Runs a fission controller against the sim for `seconds`.
+local function mekLoop(mek, sim, ctl, seconds, onCycle)
+    local adapter = mek.wrap("fission", "p", sim.fission)
+    local t = 0
+    while t < seconds do
+        local d = mek.read(adapter)
+        local out = ctl:step(d, t)
+        local errs = mek.apply(adapter, out)
+        check(#errs == 0, "apply: %s", table.concat(errs, "; "))
+        for _ = 1, 10 do sim:tick() end
+        t = t + 0.5
+        if onCycle then onCycle(t, out) end
+        if sim.meltdown then break end
+    end
+end
+
+test("Mekanism: losing coolant SCRAMs before any damage, no auto-restart", function()
+    local mek, cfg = mekCfg({targetBurnRate = 15})
+    local sim = MekSim.new({active = true, burn = 15, temperature = 750})
+    local ctl = mek.newFissionController(cfg)
+    ctl:requestStart()
+    mekLoop(mek, sim, ctl, 600, function(t)
+        if t == 60 then sim.coolantSupply = 0 end           -- coolant pump fails
+        if t == 120 then sim.coolantSupply = 0.05 end       -- ...and is fixed
+    end)
+    check((sim.scrams or 0) >= 1, "never scrammed")
+    check(sim.damage == 0 and sim.maxTemperatureSeen < 1200,
+          "damage %.2f, peak %.0fK", sim.damage, sim.maxTemperatureSeen)
+    check(not sim.active, "restarted on its own after a trip")
+    check(ctl.trip and ctl.trip.reason:find("coolant"), "trip reason %s", tostring(ctl.trip and ctl.trip.reason))
+    ctl:requestStart()
+    mekLoop(mek, sim, ctl, 30)
+    check(sim.active, "START did not reactivate a safe reactor")
+end)
+
+test("Mekanism: steam backing up (turbine stopped) SCRAMs", function()
+    local mek, cfg = mekCfg({targetBurnRate = 15})
+    local sim = MekSim.new({active = true, burn = 15, temperature = 750})
+    local ctl = mek.newFissionController(cfg)
+    ctl:requestStart()
+    mekLoop(mek, sim, ctl, 600, function(t) if t == 30 then sim.heatedDrain = 0 end end)
+    check((sim.scrams or 0) >= 1 and ctl.trip.reason:find("heated"), "no heated-coolant scram")
+    check(sim.damage == 0, "damage %.2f", sim.damage)
+end)
+
+test("Mekanism: burn rate ramps up and backs off near the limit", function()
+    local mek, cfg = mekCfg({targetBurnRate = 40, burnRampPerSecond = 1})
+    -- 40 mB/t would settle at 1500K: the governor must hold it below the trip.
+    local sim = MekSim.new({active = true, burn = 0, temperature = 300, maxBurn = 50})
+    local ctl = mek.newFissionController(cfg)
+    ctl:requestStart()
+    local prev, maxStep, cut = 0, 0, false
+    mekLoop(mek, sim, ctl, 900, function(_, out)
+        maxStep = math.max(maxStep, sim.burn - prev)
+        prev = sim.burn
+        for _, a in ipairs(ctl.alarms) do if a:find("BURN RATE REDUCED") then cut = true end end
+    end)
+    check(maxStep <= 0.5 + 1e-9, "ramped %.2f mB/t in one 0.5s cycle", maxStep)
+    check(cut, "governor never cut the burn rate")
+    check(sim.maxTemperatureSeen < 1000, "peak %.0fK reached the trip", sim.maxTemperatureSeen)
+    check(sim.active and sim.damage == 0, "reactor tripped or damaged")
+end)
+
+test("Mekanism: adapters dedupe ports, convert Joules, clamp fusion injection", function()
+    local mek = mekCfg()
+    local sim = MekSim.new({})
+    cc.addPeripheral("fissionReactorPort_0", "fissionReactorPort", sim.fission)
+    cc.addPeripheral("fissionReactorPort_1", "fissionReactorPort", sim.fission)
+    cc.addPeripheral("fissionReactorLogicAdapter_0", "fissionReactorLogicAdapter", sim.fission)
+    local keys = {}
+    for _, n in ipairs(peripheral.getNames()) do
+        keys[mek.classify(n) .. "@" .. mek.multiblockKey(n, peripheral.wrap(n))] = true
+    end
+    local count = 0
+    for _ in pairs(keys) do count = count + 1 end
+    check(count == 1, "%d units for one reactor", count)
+    check(mek.toFE(2500) == 1000, "J -> FE %s", tostring(mek.toFE(2500)))
+    mekanismEnergyHelper = {joulesToFE = function(j) return j / 4 end}
+    check(mek.toFE(2500) == 625, "server conversion rate ignored")
+    mekanismEnergyHelper = nil
+    local fusion = mek.wrap("fusion", "f", sim.fusion)
+    fusion.setInjection(37)
+    check(sim.injection == 38, "injection not made even: %s", tostring(sim.injection))
+end)
+
+test("Mekanism program run: overview, fission page, SCRAM on exit", function()
+    cc.reset()
+    local sim = MekSim.new({active = true, burn = 10, temperature = 600})
+    cc.addPeripheral("fissionReactorPort_0", "fissionReactorPort", sim.fission)
+    cc.addPeripheral("fissionReactorLogicAdapter_0", "fissionReactorLogicAdapter", sim.fission)
+    cc.addPeripheral("turbineValve_0", "turbineValve", sim.turbine)
+    cc.addPeripheral("fusionReactorPort_0", "fusionReactorPort", sim.fusion)
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local overview = ""
+    runProgram({sims = {sim}, untilTime = 120, at = {
+        {t = 5, fn = function() overview = mon.text(); touchText(mon, "Fission 1") end}
+    }})
+    check(cc.outputText():find("Running 3 unit"), "units:\n%s", cc.outputText())
+    check(overview:find("Fission 1") and overview:find("Mek Turbine 1") and overview:find("Fusion 1"),
+          "overview:\n%s", overview)
+    check(mon.text():find("Fission Status") and mon.text():find("SCRAM"), "fission page:\n%s", mon.text())
+    check(not sim.active, "fission reactor left running after Ctrl+T")
+    check(cc.readFile("logs/draconic.log"):find("reactor SCRAMmed"), "exit scram not logged")
+end)
+
+test("Mekanism settings: scram temperature can never reach the damage threshold", function()
+    cc.reset(); freshModules()
+    local persist = require("persist")
+    local src = assert(io.open("drivers/mekanism.lua")):read("*a")
+    check(src:find("max = 1150"), "scram temperature cap missing")
+    local cfg = {maxTemperature = 1100, tempMargin = 100}
+    local schema = {{key = "maxTemperature", step = 25, fmt = "int",
+                     min = function(c) return 400 + c.tempMargin end, max = 1150}}
+    for _ = 1, 20 do persist.adjust(cfg, schema, "maxTemperature", 1) end
+    check(cfg.maxTemperature == 1150, "cap %s", tostring(cfg.maxTemperature))
 end)
 
 test("modules never call require (os.loadAPI environments lack it)", function()

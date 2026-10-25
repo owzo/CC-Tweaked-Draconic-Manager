@@ -115,6 +115,31 @@ config.extreme = {
 }
 
 ------------------------------------------------------------
+-- MEKANISM (optional)
+------------------------------------------------------------
+-- Fission reactors CAN melt down (damage above 1200 K, explosion at
+-- 100% damage). These limits SCRAM well before that; a tripped reactor
+-- stays off until a person presses START.
+config.mekanism = {
+    targetBurnRate   = nil,         -- mB/t; nil = keep the reactor's current rate
+    burnRampPerSecond = 1.0,        -- Max burn-rate increase per second
+    maxTemperature   = 1000,        -- K: SCRAM at or above (damage starts at 1200)
+    tempMargin       = 100,         -- K below maxTemperature where burn is cut back
+    maxDamage        = 0,           -- %: SCRAM on any damage
+    minCoolant       = 0.20,        -- SCRAM when coolant tank below this
+    maxHeatedCoolant = 0.95,        -- SCRAM when steam/heated coolant backs up
+    maxWaste         = 0.90,        -- SCRAM when waste tank above this
+    lowFuel          = 0.05,        -- Alarm below this fuel fraction
+    scramOnExit      = true,        -- SCRAM fission reactors when the program stops
+    autoStartOnBoot  = false,
+    fusionInjection  = nil,         -- Even number 2-98; nil = leave as set in game
+    controlInterval  = 0.5,         -- Seconds per cycle (each read costs a tick)
+    -- Optional names/overrides by peripheral name:
+    -- units = {{peripheral = "fissionReactorPort_0", name = "Fission A"}},
+    units = {}
+}
+
+------------------------------------------------------------
 -- ALARMS
 ------------------------------------------------------------
 -- Every unit alarm (trip, low fuel, link lost, charging stalled,

@@ -1,8 +1,9 @@
 # CC:Tweaked-Draconic Manager
 
 A ComputerCraft: Tweaked program that runs **Draconic Evolution** reactors
-and, when installed, **Extreme Reactors** or **Bigger Reactors** reactors and
-turbines, from one computer with a touchscreen dashboard.
+and, when installed, **Extreme Reactors** / **Bigger Reactors** reactors and
+turbines and **Mekanism** fission, fusion, turbines and boilers, from one
+computer with a touchscreen dashboard.
 
 Each mod is optional: with only Draconic Evolution you get the Draconic
 features, with only Extreme/Bigger Reactors you get those, and with both
@@ -177,6 +178,41 @@ unit in `config.extreme.units`.
 | Bigger Reactors reports temperatures in Kelvin | Converted to °C |
 | Bigger Reactors has no battery when actively cooled, and object accessors (`battery()`, `rotor()`) | Hidden behind one adapter (`er_utils.lua`) |
 | Bigger Reactors turbine vents can't be set from CC | Not touched by the program in either mod |
+
+## Mekanism
+
+Fission reactors, fusion reactors, industrial turbines and thermoelectric
+boilers are found automatically through their ports/valves. Several ports on
+one structure count as one unit.
+
+**A Mekanism fission reactor can melt down.** Damage builds above 1200 K, and
+at 100% damage an explosion is likely within about a minute (meltdowns are
+on by default). The program protects it the way the widely used cc-mek-scada
+does, and SCRAMs (instant shutdown) on any of these:
+
+| Trip | Default (`config.mekanism`) |
+| --- | --- |
+| Temperature | ≥ 1000 K (`maxTemperature`; can't be set above 1150) |
+| Damage | any (`maxDamage = 0`) |
+| Coolant | < 20% |
+| Heated coolant / steam | > 95% (turbines not keeping up) |
+| Waste | > 90% |
+
+- **No automatic restart after a trip:** a person presses START.
+- **The burn rate ramps up gradually** to the target you set (`-10 -1 +1 +10`
+  on the page). It is cut back automatically while the temperature is within
+  100 K of the trip or coolant runs low, so most excursions are handled
+  before a SCRAM is needed.
+- **When the program stops** (Ctrl+T, crash, update), running fission
+  reactors are SCRAMmed (`scramOnExit`), because an unsupervised reactor is
+  the riskier state. Make sure the computer is chunk-loaded.
+- **Turbines and boilers** are monitored, with alarms for steam backing up
+  or low water.
+- **Fusion reactors** can't explode. They're monitored, and the injection
+  rate is adjustable with `-2 / +2` (it must be even).
+- **Every Mekanism call costs a server tick**, so all readings are taken in
+  parallel each cycle. Energy is converted from Mekanism's Joules to FE
+  using the server's own conversion rate.
 
 ## Alarms
 
@@ -385,6 +421,8 @@ watch `logs/reactor_stats.csv`.
 ```text
 main_control.lua       scheduler: loads drivers, one coroutine per unit, UI, input, fail-safe exit
 persist.lua            saved in-game settings and monitor pins (data/manager.db), settings schema
+mek_utils.lua          Mekanism adapters, fission protection + burn governor
+drivers/mekanism.lua   Mekanism fission / fusion / turbine / boiler units
 alarms.lua             speaker / chat box / redstone alarm outputs, silence
 totals.lua             long-term energy totals (data/totals.db)
 updater.lua            update check and install from GitHub
