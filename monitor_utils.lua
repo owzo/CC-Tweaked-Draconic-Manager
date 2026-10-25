@@ -224,7 +224,7 @@ end
 model = {
   info       = reac_utils.readInfo() result or nil,
   controller = reac_utils controller,
-  core       = energy_core_utils.read() result or nil,
+  core       = primary storage info (storage_utils tracker) or nil,
   limits     = config.reactor,
   events     = stat_utils.recent
 }
@@ -472,20 +472,103 @@ local function fitLayout(items, h)
     return items
 end
 
--- Energy core / storage ------------------------------------------------
+-- Energy storage, meters and the energy network ----------------------
+-- All in FE (= RF) per tick; see storage_utils.lua.
+local function signedRF(v)
+    if v == nil then return "--" end
+    return (v > 0 and "+" or "") .. monitor_utils.formatRF(v)
+end
+monitor_utils.signedRF = signedRF
+
+local function flowColor(v)
+    if v == nil then return colors.lightGray end
+    return v < 0 and colors.orange or colors.lime
+end
+
+-- Seconds -> "45s" / "12m 05s" / "3h 20m" / "2d 04h".
+local function duration(seconds)
+    if not seconds or seconds ~= seconds then return "--" end
+    if seconds > 99 * 86400 then return ">99d" end
+    seconds = math.floor(seconds + 0.5)
+    if seconds < 60 then return seconds .. "s" end
+    if seconds < 3600 then return string.format("%dm %02ds", math.floor(seconds / 60), seconds % 60) end
+    if seconds < 86400 then
+        return string.format("%dh %02dm", math.floor(seconds / 3600), math.floor(seconds % 3600 / 60))
+    end
+    return string.format("%dd %02dh", math.floor(seconds / 86400), math.floor(seconds % 86400 / 3600))
+end
+
+local function etaRow(page, i)
+    if i and i.timeToFull then
+        page.lr("Full in", duration(i.timeToFull), colors.lime)
+    elseif i and i.timeToEmpty then
+        page.lr("Empty in", duration(i.timeToEmpty), colors.orange)
+    else
+        page.lr("Full/Empty in", "--", colors.lightGray)
+    end
+end
+
+local function chargeRows(page, pct)
+    local c = pctColor(pct, 0.1, 0.25)
+    page.lr("Charge", string.format("%.1f%%", pct * 100), c)
+    page.bar(pct, c)
+end
+
+local function storageStatus(i)
+    if not i then return "NO SIGNAL", colors.red end
+    if i.formed == false then return "NOT FORMED", colors.orange end
+    if i.saturated then return "OVER 2.1G", colors.orange end
+    return "ONLINE", colors.green
+end
+
 function LAYOUTS.storage(model, w)
     local i = model.info
+    local ok = i and i.max ~= nil
     local page = newPage(model)
-    page.header("Storage", i and "ONLINE" or "NO SIGNAL", i and colors.green or colors.red)
-    page.lr("Stored", i and (monitor_utils.formatRF(i.stored) .. " RF") or "--", colors.lime)
-    page.lr("Capacity", i and (monitor_utils.formatRF(i.max) .. " RF") or "--", colors.white)
-    local flow = i and i.transfer
-    page.lr("Transfer", flow and ((flow >= 0 and "+" or "") .. monitor_utils.formatRF(flow) .. " rf/t") or "--",
-            flow and flow < 0 and colors.orange or colors.lime)
+    local status, sc = storageStatus(i)
+    page.header("Storage", status, sc)
+    page.lr("Stored", ok and (monitor_utils.formatRF(i.stored) .. " FE") or "--", colors.lime)
+    page.lr("Capacity", ok and (monitor_utils.formatRF(i.max) .. " FE") or "--", colors.white)
+    page.lr("Input", ok and i.input and (monitor_utils.formatRF(i.input) .. " FE/t") or "--", colors.lightBlue)
+    page.lr("Output", ok and i.output and (monitor_utils.formatRF(i.output) .. " FE/t") or "--", colors.lightBlue)
+    local net = ok and i.net
+    page.lr(ok and not i.measured and "Net (est.)" or "Net Flow",
+            net and (signedRF(net) .. " FE/t") or "--", flowColor(net or nil))
+    etaRow(page, ok and i)
     page.gap(BARS, "bars")
-    local pct = i and i.pct or 0
-    page.lr("Charge", string.format("%.1f%%", pct * 100), pctColor(pct, 0.1, 0.25))
-    page.bar(pct, pctColor(pct, 0.1, 0.25))
+    chargeRows(page, ok and i.pct or 0)
+    page.gap(CONTROLS)
+    page.add({kind = "footer"})
+    return page.items
+end
+
+function LAYOUTS.meter(model, w)
+    local i = model.info
+    local page = newPage(model)
+    page.header("Energy Meter", i and "ONLINE" or "NO SIGNAL", i and colors.green or colors.red)
+    page.lr("Flow", i and (fitRate("Flow", i.rate, w, " FE/t")) or "--", colors.lime)
+    page.lr("Limit", i and i.limit and (fitRate("Limit", i.limit, w, " FE/t")) or "--", colors.white)
+    page.gap(CONTROLS)
+    page.add({kind = "footer"})
+    return page.items
+end
+
+local NETWORK_STATES = {charging = {"CHARGING", colors.lime}, draining = {"DRAINING", colors.orange},
+                        balanced = {"BALANCED", colors.green}}
+
+function LAYOUTS.network(model, w)
+    local a = model.info
+    local page = newPage(model)
+    local st = a and NETWORK_STATES[a.state] or {"NO DATA", colors.red}
+    page.header("Network Status", st[1], st[2])
+    page.lr("Generation", a and fitRate("Generation", a.generation, w, " FE/t") or "--", colors.lime)
+    page.lr("Consumption", a and fitRate("Consumption", a.consumption, w, " FE/t") or "--", colors.orange)
+    page.lr("Storage Net", a and (signedRF(a.net) .. " FE/t") or "--", flowColor(a and a.net))
+    page.lr("Stored", a and (monitor_utils.formatRF(a.stored) .. " / " .. monitor_utils.formatRF(a.capacity))
+            or "--", colors.white)
+    etaRow(page, a)
+    page.gap(BARS, "bars")
+    chargeRows(page, a and a.pct or 0)
     page.gap(CONTROLS)
     page.add({kind = "footer"})
     return page.items
@@ -536,10 +619,31 @@ end
 
 function CARDS.storage(m)
     local i = m.info
-    if not i then return "NO SIGNAL", colors.red, "--", "--", colors.gray, 0, colors.gray, 0 end
+    if not i or not i.max then
+        local status, sc = storageStatus(i)
+        return status, sc, "--", "--", colors.gray, 0, colors.gray, 0
+    end
     local c = pctColor(i.pct, 0.1, 0.25)
-    return "STORAGE", colors.lightBlue, "Stored " .. monitor_utils.formatRF(i.stored),
+    local status, sc = "STORAGE", colors.lightBlue
+    if i.net then status, sc = signedRF(i.net) .. "/t", flowColor(i.net) end
+    return status, sc, "Stored " .. monitor_utils.formatRF(i.stored),
         string.format("%.1f%%", i.pct * 100), c, i.pct, c, 0
+end
+
+function CARDS.meter(m)
+    local i = m.info
+    if not i then return "NO SIGNAL", colors.red, "--", "--", colors.gray, 0, colors.gray, 0 end
+    return "METER", colors.lightBlue, "Flow", monitor_utils.formatRF(i.rate) .. " FE/t",
+        colors.lime, 0, colors.gray, 0
+end
+
+function CARDS.network(m)
+    local a = m.info
+    if not a then return "NO DATA", colors.red, "--", "--", colors.gray, 0, colors.gray, 0 end
+    local st = NETWORK_STATES[a.state] or NETWORK_STATES.balanced
+    local c = pctColor(a.pct, 0.1, 0.25)
+    return st[1], st[2], "Use " .. monitor_utils.formatRF(a.consumption),
+        signedRF(a.net) .. "/t", flowColor(a.net), a.pct, c, 0
 end
 
 local CARD_ROWS = 4             -- name/status, metric, bar, spacer
@@ -555,13 +659,26 @@ local function buildOverview(units, w, h, view)
     end
     page.add({kind = "lr", label = "Overview", value = "Total " .. monitor_utils.formatRF(total) .. " rf/t",
               color = colors.lime})
+    -- Energy network line (consumption, storage flow and charge) when any
+    -- storage is attached.
+    local headerRows = 2
+    for _, m in ipairs(units) do
+        if m.kind == "network" and m.info then
+            local a = m.info
+            page.add({kind = "lr", label = "Use " .. monitor_utils.formatRF(a.consumption),
+                      value = signedRF(a.net) .. " " .. string.format("%.0f%%", a.pct * 100),
+                      color = flowColor(a.net), action = "nav:detail:" .. m.id})
+            headerRows = 3
+            break
+        end
+    end
     page.gap(nil)
 
-    -- Rows: header + gap (2), cards (4 each, minus the last spacer),
-    -- footer (1), and gap + pager (2) when the cards need more than one
-    -- page: perPage * 4 - 1 + 3 <= h without a pager, + 2 with one.
-    local perPage = math.max(1, math.floor((h - 2) / CARD_ROWS))
-    if #units > perPage then perPage = math.max(1, math.floor((h - 4) / CARD_ROWS)) end
+    -- Rows: header + gap (headerRows), cards (4 each, minus the last
+    -- spacer), footer (1), and gap + pager (2) when the cards need more
+    -- than one page.
+    local perPage = math.max(1, math.floor((h - headerRows) / CARD_ROWS))
+    if #units > perPage then perPage = math.max(1, math.floor((h - headerRows - 2) / CARD_ROWS)) end
     local pages = math.max(1, math.ceil(#units / perPage))
     view.overviewPage = math.max(1, math.min(view.overviewPage or 1, pages))
     local first = (view.overviewPage - 1) * perPage + 1
@@ -648,7 +765,20 @@ local function metricsOf(m)
         local i = m.info
         return {
             {"Charge", i and i.pct, 1, colors.green, "pct"},
-            {"Transfer", i and i.transfer, nil, colors.lime, "rate"}
+            {"Net Flow", i and i.net, nil, colors.lime, "rate"},
+            {"Input", i and i.input, nil, colors.lightBlue, "rate"},
+            {"Output", i and i.output, nil, colors.orange, "rate"}
+        }
+    elseif m.kind == "meter" then
+        local i = m.info
+        return {{"Flow", i and i.rate, nil, colors.lime, "rate"}}
+    elseif m.kind == "network" then
+        local a = m.info
+        return {
+            {"Generation", a and a.generation, nil, colors.lime, "rate"},
+            {"Consumption", a and a.consumption, nil, colors.orange, "rate"},
+            {"Storage Net", a and a.net, nil, colors.lightBlue, "rate"},
+            {"Charge", a and a.pct, 1, colors.green, "pct"}
         }
     end
     return {}

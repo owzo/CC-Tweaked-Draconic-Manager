@@ -50,7 +50,7 @@ local VERSION = "4.0"
 
 -- Every driver is optional: a missing or broken driver file only removes
 -- that mod's support. Drivers whose mod is not attached find no units.
-local DRIVERS = {"drivers.draconic", "drivers.extreme", "drivers.energy_core"}
+local DRIVERS = {"drivers.draconic", "drivers.extreme", "drivers.storage"}
 
 local state = {
     units = {},                -- every discovered unit, in driver order
@@ -176,9 +176,12 @@ local function loadDrivers()
     return drivers
 end
 
+-- Read-only kinds (drivers/storage.lua) do not count as something to run.
+local PASSIVE = {storage = true, meter = true, network = true}
+
 local function controlsSomething(units)
     for _, u in ipairs(units) do
-        if u.kind ~= "storage" then return true end
+        if not PASSIVE[u.kind] then return true end
     end
     return false
 end
@@ -194,7 +197,8 @@ end
 local function discoverUnits(drivers)
     local ctx = {config = config, log = stat_utils, import = import,
                  askGates = askGates, askUnits = askUnits,
-                 overrides = persist.overrides}
+                 overrides = persist.overrides,
+                 units = function() return state.units end}
     while true do
         local units, problems = {}, {}
         for _, drv in ipairs(drivers) do

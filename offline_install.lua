@@ -26,12 +26,12 @@ local requiredFiles = {
     "reac_utils.lua",
     "monitor_utils.lua",
     "stat_utils.lua",
-    "energy_core_utils.lua",
+    "storage_utils.lua",
     "er_utils.lua",
     "persist.lua",
     "drivers/draconic.lua",
     "drivers/extreme.lua",
-    "drivers/energy_core.lua",
+    "drivers/storage.lua",
     "config.lua"
 }
 local preserve = {["config.lua"] = true}
