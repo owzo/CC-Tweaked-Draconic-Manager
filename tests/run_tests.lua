@@ -34,6 +34,13 @@ local function check(cond, msg, ...)
     if not cond then error(string.format(msg, ...), 2) end
 end
 
+local function readRepoFileEarly(name)
+    local h = assert(io.open(name, "r"))
+    local s = h:read("*a")
+    h:close()
+    return s
+end
+
 local function freshModules()
     for _, m in ipairs(MODULES) do package.loaded[m] = nil end
 end
@@ -516,6 +523,35 @@ test("main_control: boot, prompt, START, regulate, Ctrl+T fail-safe", function()
     local stats = cc.readFile("logs/reactor_stats.csv")
     check(stats and select(2, stats:gsub("\n", "")) > 50, "stats not recorded")
     check(mon.text():find("Core 50.0%%"), "core not displayed:\n%s", mon.text())
+end)
+
+test("modules never call require (os.loadAPI environments lack it)", function()
+    for _, f in ipairs({"config.lua", "reac_utils.lua", "monitor_utils.lua",
+                        "stat_utils.lua", "energy_core_utils.lua"}) do
+        local h = assert(io.open(f, "r"))
+        local src = h:read("*a")
+        h:close()
+        check(not src:find("require%s*%("), "%s calls require", f)
+        check(not src:find("os%.loadAPI"), "%s uses os.loadAPI", f)
+    end
+end)
+
+test("main_control starts without require (issue 3: os.run / dofile)", function()
+    cc.reset()
+    freshModules()
+    for _, f in ipairs({"config.lua", "reac_utils.lua", "monitor_utils.lua",
+                        "stat_utils.lua", "energy_core_utils.lua"}) do
+        cc.writeFile(f, readRepoFileEarly(f))
+    end
+    local savedRequire = require
+    local chunk = assert((loadfile or load)("main_control.lua"))
+    require = nil
+    local ok, err = cc.run(chunk, {untilTime = 1})
+    require = savedRequire
+    check(ok, "crashed: %s", tostring(err))
+    local out = cc.outputText()
+    check(not out:find("attempt to call"), "require error:\n%s", out)
+    check(out:find("No reactor found"), "did not reach discovery:\n%s", out)
 end)
 
 ------------------------------------------------------------

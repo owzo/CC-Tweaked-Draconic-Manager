@@ -199,6 +199,15 @@ watch `logs/reactor_stats.csv`.
 - A full energy core is safe. The reactor can't output, so saturation rises
   and the temperature falls.
 
+## Troubleshooting
+
+| Error | Cause and fix |
+| --- | --- |
+| `Failed to load API reac_utils` / `attempt to call global 'require' (a nil value)` | Old version that used `os.loadAPI`, where APIs run without `require` ([issue 3](https://github.com/owzo/CC-Tweaked-Draconic-Manager/issues/3)). Run the installer again. Current modules never call `require`, and `main_control` falls back to loading files directly if it is started without the shell. |
+| `No reactor found` / `Need two flux gates` | Check the wiring (wired modems, right-clicked). The message lists every peripheral the computer can see; compare it with `peripherals`. |
+| Only `energy_storage` peripherals listed | Draconic Evolution build too old for CC. Update to 3.1.2.604+ (see Compatibility). |
+| `Control loop runs every …s` warning | Server lag. Keep conservative limits. |
+
 ## Development
 
 ```text
