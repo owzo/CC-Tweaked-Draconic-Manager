@@ -33,7 +33,7 @@ colours = colors
 -- SCREENS (terminal / monitor framebuffer)
 ------------------------------------------------------------
 function M.newScreen(baseW, baseH)
-    local s = {scale = 1, rows = {}, bgRows = {}, x = 1, y = 1,
+    local s = {scale = 1, rows = {}, bgRows = {}, fgRows = {}, x = 1, y = 1,
                fg = colors.white, bg = colors.black}
     local function size()
         return math.floor(baseW / s.scale), math.floor(baseH / s.scale)
@@ -43,6 +43,7 @@ function M.newScreen(baseW, baseH)
         for y = 1, h do
             s.rows[y] = string.rep(" ", w)
             s.bgRows[y] = {}
+            s.fgRows[y] = {}
         end
     end
     blank()
@@ -75,6 +76,7 @@ function M.newScreen(baseW, baseH)
                 if x >= 1 and x <= w then
                     row = row:sub(1, x - 1) .. text:sub(i, i) .. row:sub(x + 1)
                     s.bgRows[s.y][x] = s.bg
+                    s.fgRows[s.y][x] = s.fg
                 end
             end
             s.rows[s.y] = row

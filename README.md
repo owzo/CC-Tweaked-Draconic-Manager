@@ -17,7 +17,7 @@ conditions, and shows everything on a touchscreen dashboard.
 - **Auto-restart**: after a temperature or field trip the reactor restarts once it has cooled below `safeTemperature`. This is capped at 3 restarts per hour, after which a person has to press START. A low-fuel trip never restarts on its own.
 - **Fail-safe exit**: if the program stops (Ctrl+T, crash, reactor link lost), the output gate goes to 0 and the input gate to twice the last field demand. With output at 0, saturation climbs and field drain collapses, so that margin is wide.
 - **Plug-and-play detection**: peripherals are found by the methods they expose, not by their names. On DE 1.16 to 1.20 flux gates report the type `flow_gate`, not `flux_gate`. This breaks drmon and was one cause of [issue 5](https://github.com/owzo/CC-Tweaked-Draconic-Manager/issues/5). Detection works with any modem name. If two gates are found you are asked once which one is the input, and the answer is saved.
-- **Dashboard**: shows status, generation, temperature, field, saturation, fuel, gate rates, an optional energy core readout and alarms. It works on any number of monitors and falls back to the computer screen when none are attached.
+- **Dashboard** (styled after drmon): shows status, generation, temperature, field, saturation, fuel, gate rates, an optional energy core readout and alarms. It redraws through a buffer, so there is no flicker. It works on any number of monitors and falls back to the computer screen when none are attached.
 - **Logging**: events go to `logs/draconic.log` and a stats CSV to `logs/reactor_stats.csv`. Both rotate in size so the disk can never fill up.
 
 ## Requirements
@@ -88,10 +88,20 @@ cold reactor is only charged after START, unless `autoStartOnBoot = true`.
 
 | Button | Action |
 | --- | --- |
-| `<<<` `<<` `<` / `>` `>>` `>>>` | Output −/+ 100k, 10k, 1k RF/t (switches to manual) |
+| `<<<` `<<` `<` / `>` `>>` `>>>` (under Output Gate) | Output −/+ 100k, 10k, 1k RF/t (switches to manual) |
+| `AU` / `MA` (middle of that row) | Toggle automatic temperature regulation (green = auto, orange = manual) |
 | `START` | Charge + activate; clears a latched trip |
 | `STOP` | Controlled shutdown (field stays fed until cold) |
-| `MANUAL` / `AUTO` | Toggle automatic temperature regulation |
+
+The layout follows [drmon](https://github.com/acidjazz/drmon)'s look:
+- label on the left, value on the right
+- full RF/t figures with separators
+- colour-coded bars
+- blank rows between sections
+- the last action, or an active alarm, on the bottom line
+
+The layout fits itself to the monitor: on a 3x3 it drops spacer rows first,
+and larger monitors get more breathing room.
 
 In manual mode, output increases ramp in at 1% of generation per cycle. An
 interlock switches back to AUTO when the temperature passes a quarter of the
