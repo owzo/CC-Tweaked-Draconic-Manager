@@ -31,6 +31,7 @@ local requiredFiles = {
     "mek_utils.lua",
     "persist.lua",
     "log_shipper.lua",
+    "theme.lua",
     "alarms.lua",
     "totals.lua",
     "updater.lua",

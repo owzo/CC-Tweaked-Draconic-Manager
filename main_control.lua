@@ -49,8 +49,9 @@ local log_shipper   = import("log_shipper")
 local alarms        = import("alarms")
 local totals        = import("totals")
 local updater       = import("updater")
+local theme         = import("theme")
 
-local VERSION = "4.1"
+local VERSION = "4.2"
 local TOTALS_SAVE_SECONDS = 60
 local UPDATE_CONFIRM_SECONDS = 10
 
@@ -274,7 +275,7 @@ local function discoverUnits(drivers)
 end
 
 local function setupDisplays()
-    local count = monitor_utils.init(config.peripherals.monitors, config.ui)
+    local count = monitor_utils.init(config.peripherals.monitors, config.ui, theme)
     if count == 0 then
         stat_utils.log("INFO", "No monitor found; using the computer screen")
     end
@@ -314,6 +315,13 @@ local function activeAlarms()
     return list
 end
 
+-- Remote log shipping state for the System page (nil when not set up).
+local function shippingStatus()
+    local s = log_shipper.current
+    if not s then return nil end
+    return {enabled = s.enabled, failing = s.failing, queued = s.queue and s.queue.size() or 0}
+end
+
 local function uiLoop()
     local nextSample, lastTick, nextSave = 0, os.clock(), os.clock() + TOTALS_SAVE_SECONDS
     while true do
@@ -342,7 +350,7 @@ local function uiLoop()
         local models = {}
         for _, u in ipairs(state.units) do
             local m = u.model()
-            m.settings = u.settings
+            m.settings, m.defaults = u.settings, u.defaults
             table.insert(models, m)
         end
         if os.clock() >= nextSample then
@@ -358,6 +366,7 @@ local function uiLoop()
                               hourlyFor = function(id) return totals.lastHours(id, 24) end,
                               system = {version = VERSION, hourly = hourly, lifetime = lifetime,
                                         alarms = {count = state.alarmCount, silenced = alarms.isSilenced()},
+                                        alarmList = current, logShipping = shippingStatus(),
                                         update = {text = state.update.text, color = state.update.color,
                                                   confirm = state.update.confirmUntil ~= nil}}})
         if monitor_utils.lastError and monitor_utils.lastError ~= state.reportedUiError then
@@ -538,6 +547,7 @@ local function main()
 end
 
 local ok, err = pcall(main)
+monitor_utils.shutdown()
 if not ok then
     failSafe(err)
     if err ~= "Terminated" then

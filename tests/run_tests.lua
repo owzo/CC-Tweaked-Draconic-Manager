@@ -11,14 +11,14 @@ local cc = require("mock_cc")
 local Sim = require("reactor_sim")
 
 local MODULES = {"config", "reac_utils", "monitor_utils", "stat_utils",
-                 "storage_utils", "drivers.storage", "log_shipper"}
+                 "storage_utils", "drivers.storage", "log_shipper", "theme"}
 local TICK = 0.05
 
 -- Everything the installers must ship; MODULE_FILES are loaded by
 -- main_control and must never call require themselves.
 PROGRAM_FILES = {"main_control.lua", "config.lua", "reac_utils.lua", "monitor_utils.lua",
                  "stat_utils.lua", "storage_utils.lua", "er_utils.lua", "mek_utils.lua", "persist.lua",
-                 "alarms.lua", "totals.lua", "updater.lua", "log_shipper.lua",
+                 "alarms.lua", "totals.lua", "updater.lua", "log_shipper.lua", "theme.lua",
                  "drivers/draconic.lua", "drivers/extreme.lua", "drivers/mekanism.lua", "drivers/storage.lua"}
 MODULE_FILES = {}
 for _, f in ipairs(PROGRAM_FILES) do
@@ -396,6 +396,118 @@ test("small monitor falls back to scale 0.5", function()
     local ui = require("monitor_utils")
     ui.init({}, {})
     check(mon.scale == 0.5, "scale %s", tostring(mon.scale))
+end)
+
+test("theme recolours the palette and restores it on shutdown", function()
+    cc.reset(); freshModules()
+    local mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local ui, theme = require("monitor_utils"), require("theme")
+    ui.init({}, {theme = "obsidian"}, theme)
+    check(mon.palette[colors.black] == 0x0f0d14 and mon.palette[colors.lime] == 0xffffff,
+          "obsidian palette not applied")
+    check(ui.T.ok == colors.green and ui.T.panel == colors.brown, "roles not mapped to slots")
+    ui.shutdown()
+    check(mon.palette[colors.black] == math.floor(cc.NATIVE[colors.black] * 255) * 65536,
+          "palette not restored")
+    check(mon.getLine(1):find("STOPPED"), "stale screen not marked:\n%s", mon.text())
+
+    cc.reset(); freshModules()
+    mon = cc.newScreen(29, 19)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    ui, theme = require("monitor_utils"), require("theme")
+    ui.init({}, {theme = "classic"}, theme)
+    check(next(mon.palette) == nil, "classic theme changed the palette")
+    check(ui.T.panel == colors.black and ui.T.energy == colors.lime, "classic roles")
+end)
+
+test("teletext cells encode 2x3 dots, inverting for the bottom-right dot", function()
+    local ui = require("monitor_utils")
+    local ch, fg, bg = ui.subCell({true, false, false, false, false, false}, 1, 2)
+    check(ch:byte() == 129 and fg == 1 and bg == 2, "top-left dot")
+    ch, fg, bg = ui.subCell({false, false, false, false, false, true}, 1, 2)
+    check(ch:byte() == 159 and fg == 2 and bg == 1, "bottom-right only must invert all five")
+    ch = ui.subCell({true, true, true, true, true, true}, 1, 2)
+    check(ch:byte() == 128, "full cell = empty char on swapped colours")
+end)
+
+-- A Draconic unit model for UI tests (no program loop).
+local function uiUnit(id, name, opts)
+    opts = opts or {}
+    local cfg = require("config")
+    local reac = require("reac_utils")
+    local sim = Sim.new({state = "running", temperature = opts.temperature or 7000})
+    local ctl = reac.newController(cfg.reactor, reac.readInfo(sim.reactor))
+    ctl.alarms = opts.alarms or {}
+    return {id = id, name = name, kind = "draconic", info = reac.readInfo(sim.reactor),
+            controller = ctl, limits = cfg.reactor}
+end
+
+test("57x38 overview: two card columns, card alarm strip, footer alarm", function()
+    cc.reset(); freshModules()
+    local mon = cc.newScreen(57, 38)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local ui = require("monitor_utils")
+    ui.init({}, {textScale = 1}, require("theme"))
+    local units = {}
+    for i = 1, 6 do units[i] = uiUnit("r" .. i, "Reactor " .. i) end
+    units[2].controller.alarms = {"CORE TEMP CRITICAL"}
+    ui.render({units = units})
+    local x1, y1 = mon.find("Reactor 1")
+    local x2, y2 = mon.find("Reactor 2")
+    check(x1 and x2 and y1 == y2 and x2 > 28, "cards not side by side:\n%s", mon.text())
+    check(mon.find("REACTOR MANAGER") and mon.find("no alarms"), "header / alarm line:\n%s", mon.text())
+    local ax, ay = mon.find("! CORE TEMP CRITICAL")
+    check(ax and ax > 28 and mon.bgRows[ay][ax] == ui.T.danger, "card alarm strip:\n%s", mon.text())
+    check(mon.getLine(38):find("Reactor 2: CORE TEMP CRITICAL"), "footer alarm:\n%s", mon.text())
+    check(not mon.text():find("1/2"), "6 units should fit one page")
+    -- Tapping a card in the right column opens that unit.
+    ui.handleTouch("monitor_0", x2, y2 + 1)
+    check(ui.viewOf("monitor_0").page == "detail" and ui.viewOf("monitor_0").unit == "r2", "card tap")
+end)
+
+test("settings page marks changed values and shows defaults when wide", function()
+    cc.reset(); freshModules()
+    local mon = cc.newScreen(57, 24)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local ui, persist = require("monitor_utils"), require("persist")
+    ui.init({}, {textScale = 1}, require("theme"))
+    local unit = uiUnit("r1", "Main")
+    local defaults = {}
+    for k, v in pairs(unit.limits) do defaults[k] = v end
+    unit.limits = setmetatable({targetTemperature = 7500}, {__index = defaults})
+    unit.defaults = defaults
+    unit.settings = {{key = "targetTemperature", label = "Target Temp", step = 100, fmt = "temp"},
+                     {key = "targetField", label = "Target Field", step = 0.05, fmt = "pct"}}
+    ui.render({units = {unit}, formatSetting = persist.format})
+    ui.handleTouch("monitor_0", select(1, mon.find(" S ")) + 1, select(2, mon.find(" S ")))
+    ui.render({units = {unit}, formatSetting = persist.format})
+    local x, y = mon.find("7,500C")
+    check(x and mon.fgRows[y][x] == ui.T.accent, "changed value not highlighted:\n%s", mon.text())
+    check(mon.find("def 7,000C"), "default hint missing:\n%s", mon.text())
+    local fx, fy = mon.find(persist.format(unit.settings[2], defaults.targetField))
+    check(fx and mon.fgRows[fy][fx] ~= ui.T.accent, "unchanged value shown as changed:\n%s", mon.text())
+end)
+
+test("System page lists active alarms and log shipping state", function()
+    cc.reset(); freshModules()
+    local mon = cc.newScreen(57, 38)
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local ui = require("monitor_utils")
+    ui.init({}, {textScale = 1}, require("theme"))
+    local units = {uiUnit("r1", "Alpha"), uiUnit("r2", "Beta")}
+    ui.render({units = units})
+    ui.handleTouch("monitor_0", 2, 1)
+    local hourly = {}
+    for i = 1, 24 do hourly[i] = i * 1e9 end
+    ui.render({units = units, system = {version = "4.2", hourly = hourly, lifetime = 4.2e12,
+               alarms = {count = 1}, alarmList = {{unit = "Beta", text = "FIELD LOW"}},
+               logShipping = {enabled = true, failing = true, queued = 12}}})
+    local screen = mon.text()
+    check(ui.viewOf("monitor_0").page == "system", "not on the System page")
+    check(screen:find("Beta") and screen:find("FIELD LOW"), "alarm list:\n%s", screen)
+    check(screen:find("FAILING, 12 queued"), "log shipping:\n%s", screen)
+    check(screen:find("4.2T"), "lifetime:\n%s", screen)
 end)
 
 test("no monitor uses the terminal", function()
@@ -940,11 +1052,14 @@ test("graphs page draws history charts", function()
     }})
     local text = mon.text()
     check(text:find("Temperature") and text:find("Field"), "chart labels:\n%s", text)
+    -- Charts are drawn with 2x3-dot teletext characters (128-159): count
+    -- cells with at least one dot lit.
     local filled = 0
     for y = 1, 19 do
+        local row = mon.getLine(y)
         for x = 2, 28 do
-            local bg = mon.bgRows[y][x]
-            if bg == colors.orange or bg == colors.green then filled = filled + 1 end
+            local b = row:byte(x)
+            if b and b > 128 and b <= 159 then filled = filled + 1 end
         end
     end
     check(filled > 40, "charts look empty (%d filled cells):\n%s", filled, text)
@@ -960,10 +1075,10 @@ test("overview pages through many units", function()
     runProgram({sims = {sim}, untilTime = 10, at = {
         {t = 3, fn = function() first = mon.text(); touchText(mon, " > ") end}
     }})
-    -- 7 units, 3 cards per page on a 3x3 monitor.
-    check(first:find("1/3") and first:find("Fission 1") and not first:find("Turbine 3"),
-          "first overview page:\n%s", first)
-    check(mon.text():find("2/3") and mon.text():find("Turbine 3") and not mon.text():find("Fission 1"),
+    -- 7 units, 4 three-row cards per page on a 3x3 monitor.
+    check(first:find("1/2") and first:find("Fission 1") and first:find("Turbine 3")
+          and not first:find("Turbine 4"), "first overview page:\n%s", first)
+    check(mon.text():find("2/2") and mon.text():find("Turbine 4") and not mon.text():find("Fission 1"),
           "second page:\n%s", mon.text())
 end)
 
@@ -1211,7 +1326,7 @@ test("System page: check, two-tap update, install and reboot", function()
         {t = 6, fn = function() sysScreen = mon.text(); touchText(mon, "UPDATE") end},
         {t = 7, fn = function() armed = mon.text(); touchText(mon, "CONFIRM") end}
     }})
-    check(sysScreen:find("v4%.1") and sysScreen:find("v9%.9 available"), "system page:\n%s", sysScreen)
+    check(sysScreen:find("v4%.2") and sysScreen:find("v9%.9 available"), "system page:\n%s", sysScreen)
     check(armed:find("CONFIRM"), "update did not ask for confirmation:\n%s", armed)
     check(cc.rebooted, "did not reboot after installing")
     check(served["install.lua"] and served["persist.lua"], "installer did not run")

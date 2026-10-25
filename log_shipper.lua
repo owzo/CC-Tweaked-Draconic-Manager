@@ -260,6 +260,7 @@ function log_shipper.new(remoteConfig, log)
             self.stats.batches = self.stats.batches + 1
             if failing then
                 failing = false
+                self.failing = false
                 say("INFO", "collector reachable again")
             end
             if dropped > 0 then
@@ -279,6 +280,7 @@ function log_shipper.new(remoteConfig, log)
         end
         if not failing then
             failing = true
+            self.failing = true
             local hint = ""
             if code == 401 or code == 403 then
                 hint = " - check config.logging.remote.token matches the collector's --token"
