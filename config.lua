@@ -7,99 +7,91 @@
 README
 -------
 Central configuration for the CC:Tweaked Draconic Reactor Manager.
-Defines all safety parameters, peripheral names, and monitor/logging options.
+
+Every value below has a safe default. You normally only need to touch
+the PERIPHERALS section if auto-detection cannot work out your setup
+(for example when you have more than one reactor on the same network).
+
+All percentages are expressed as fractions (0.50 = 50%).
+All rates are RF/t. All temperatures are degrees Celsius.
 ]]
 
-------------------------------------------------------------
--- CONFIG TABLE
-------------------------------------------------------------
 local config = {}
 
 ------------------------------------------------------------
--- REACTOR CONFIGURATION
+-- PERIPHERALS
+------------------------------------------------------------
+-- Leave a value as nil to auto-detect it.
+--
+-- Peripherals are detected by the methods they expose, not by their
+-- names, so this works across Draconic Evolution versions
+-- (1.12 "flux_gate", 1.16+ "flow_gate", etc).
+--
+-- Names are what `peripherals` prints in the CC shell, e.g.
+-- "flow_gate_0", "draconic_reactor_1", "left", "back".
+--
+-- IMPORTANT: peripherals must be reached through WIRED modems and
+-- networking cable (or be directly adjacent to the computer).
+-- Wireless/ender modems cannot attach peripherals.
+config.peripherals = {
+    reactor    = nil,   -- Reactor stabilizer (or injector) modem
+    inputGate  = nil,   -- Flux gate feeding the reactor ENERGY INJECTOR
+    outputGate = nil,   -- Flux gate taking power FROM a reactor STABILIZER
+    energyCore = nil,   -- Energy pylon (optional, display only)
+    monitors   = {}     -- Empty = use every attached monitor
+}
+
+------------------------------------------------------------
+-- REACTOR SAFETY AND REGULATION
 ------------------------------------------------------------
 config.reactor = {
-    id                = "1",              -- Reactor ID (for multiple reactors)
-    outputMultiplier  = 1.0,              -- Output scaling (from modpack configs)
-    tempPinpoint      = 0,                -- Fine adjustment threshold
-
-    -- Safety thresholds
-    maxOvershoot      = 200.0,            -- Max °C above target before shutdown
-    minFuel           = 0.02,             -- Minimum fuel ratio before "No Fuel" error
-    maxSaturation     = 0.98,             -- Stop reactor when saturation ≥ 98% (full)
-
     -- Operating targets
-    defaultTemp       = 8000.0,           -- Target reactor temperature
-    defaultField      = 0.50,             -- Target field percentage
-    safeTemperature   = 3000.0,           -- Restart when cooled below this
+    targetTemperature = 7000.0,     -- Output is regulated to hold this
+    targetField       = 0.50,       -- Input is regulated to hold this
 
-    -- Energy control
-    maxOutflow        = 30000000.0,       -- Max RF/t output
-    chargeInflow      = 20000000.0,       -- Input rate during charge
+    -- Trip limits (reactor is stopped immediately when crossed)
+    maxTemperature    = 8000.0,     -- Stop above this temperature
+    minField          = 0.20,       -- Stop below this containment field
+    minFuel           = 0.10,       -- Stop when remaining fuel < 10%
 
-    -- Field management
-    shutDownField     = 0.20,             -- Shutdown threshold for field %
-    restartFix        = 100,              -- Delay ticks before restart
+    -- Restart behaviour
+    safeTemperature   = 3000.0,     -- Auto-restart only once cooled below
+    autoRestart       = true,       -- Restart after temperature/field trips
+    autoStartOnBoot   = false,      -- Charge a cold reactor when program starts
 
-    -- Behavior toggles
-    safeMode          = true,             -- Enable automatic emergency actions
-    maxTempInc        = 400.0             -- Max temp rise per tick allowed
+    -- Flux gate limits. DE 1.16+ reactors generate ~100x more than 1.12
+    -- (50-250M RF/t for a full core), so the caps are deliberately high;
+    -- the regulator, not the cap, decides the real rates.
+    chargeInflow      = 2000000,    -- Input rate while charging/warming up
+    maxInflow         = 100000000,  -- Input cap (used for field emergencies)
+    maxOutflow        = 1000000000, -- Output cap (lower it to protect cables)
+
+    -- Output regulation tuning (1.0 = default; lower = gentler)
+    outputAggressiveness = 1.0,
+
+    -- Controller cycle time in seconds (0.05 = every game tick). On DE
+    -- 1.20 each peripheral call already takes a tick, so cycles may run
+    -- slower than this; they are never faster.
+    controlInterval   = 0.05
 }
 
 ------------------------------------------------------------
--- LOGGING & MONITOR SETTINGS
+-- USER INTERFACE
 ------------------------------------------------------------
-config.energyCore = {
-    logsFile     = "logs.cfg",            -- Global system log
-    monitorScale = 1                      -- Monitor text size
+config.ui = {
+    textScale       = nil,          -- nil = choose automatically
+    refreshInterval = 0.5,          -- Seconds between screen redraws
+    manualStep      = {1000, 10000, 100000}  -- Output button increments
 }
 
 ------------------------------------------------------------
--- PERIPHERAL MAPPINGS
+-- LOGGING AND STATISTICS
 ------------------------------------------------------------
-config.peripherals = {
-    reactor  = "draconic_reactor_0",      -- Reactor stabilizer modem
-    fluxIn   = "flow_gate_0",             -- Input flux gate
-    fluxOut  = "flow_gate_1",             -- Output flux gate
-    monitors = {"monitor_1"}              -- Primary monitor
+config.logging = {
+    directory     = "logs",         -- Created automatically
+    maxFileBytes  = 65536,          -- Rotate files beyond this size
+    statsInterval = 10,             -- Seconds between stats CSV rows
+    printLevel    = "WARN"          -- Minimum level echoed to terminal
 }
 
-------------------------------------------------------------
--- LOGGING FUNCTION
-------------------------------------------------------------
-local function writeLog(msg)
-    local f = fs.open(config.energyCore.logsFile, "a")
-    if f then
-        f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
-        f.close()
-    end
-end
-
-------------------------------------------------------------
--- VALIDATION
-------------------------------------------------------------
-local function validatePeripherals()
-    if not peripheral.isPresent(config.peripherals.reactor) then
-        writeLog("ERROR: Reactor stabilizer not found!")
-        error("Reactor stabilizer not found! Attach modem to stabilizer.")
-    end
-    if not peripheral.isPresent(config.peripherals.fluxIn) then
-        writeLog("ERROR: Input flux gate not found!")
-        error("Input flux gate not found!")
-    end
-    if not peripheral.isPresent(config.peripherals.fluxOut) then
-        writeLog("ERROR: Output flux gate not found!")
-        error("Output flux gate not found!")
-    end
-    for _, m in ipairs(config.peripherals.monitors) do
-        if peripheral.isPresent(m) and peripheral.getType(m) == "monitor" then
-            writeLog("Monitor verified: " .. m)
-            return
-        end
-    end
-    writeLog("ERROR: No monitor detected!")
-    error("No valid monitor found.")
-end
-
-pcall(validatePeripherals)
 return config

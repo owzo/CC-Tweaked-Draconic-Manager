@@ -3,84 +3,104 @@
 -- Save as: energy_core_utils.lua
 --==============================================================
 
-local cfg = require("config")
-local p = cfg.peripherals
+--[[
+README
+-------
+Optional, read-only monitoring of a Draconic Evolution energy core
+through its energy pylon. The reactor is controlled without it; when no
+core is found the UI simply shows "Core: not connected".
+
+  energy_core_utils.discover(name)  Wrap a configured or detected core
+  energy_core_utils.read(core)      {stored, max, pct, transfer}
+
+The transfer rate comes from getInputPerTick()/getOutputPerTick() (DE
+1.18+) or getTransferPerTick() when the pylon offers them, otherwise it
+is estimated from the change in stored energy. Only the pylon
+(type draconic_rf_storage) is a peripheral; the core block is not.
+]]
+
 local energy_core_utils = {}
 
-local function safeWrap(name)
-    if name and peripheral.isPresent(name) then
-        return peripheral.wrap(name)
-    end
-    return nil
+local function hasMethod(dev, name)
+    return type(dev) == "table" and type(dev[name]) == "function"
 end
 
-local inputGate  = safeWrap(p.fluxIn)  or safeWrap("flow_gate_0")
-local outputGate = safeWrap(p.fluxOut) or safeWrap("flow_gate_1")
-local monitor    = safeWrap(p.monitors and p.monitors[1]) or safeWrap("monitor_1")
-
-local function logError(msg)
-    local f = fs.open(cfg.energyCore.logsFile or "energy_core.log", "a")
-    if f then
-        f.writeLine(os.date("%Y-%m-%d %H:%M:%S") .. " | " .. msg)
-        f.close()
-    end
+local function isCore(dev)
+    -- Flux gates and the reactor never expose getMaxEnergyStored.
+    return hasMethod(dev, "getEnergyStored")
+        and hasMethod(dev, "getMaxEnergyStored")
+        and not hasMethod(dev, "getReactorInfo")
+        and not hasMethod(dev, "getFlow")
 end
 
-function energy_core_utils.setup()
-    if not monitor then
-        logError("Monitor not found, running headless.")
-        return
+-- Returns {name, dev} or nil plus a reason.
+function energy_core_utils.discover(configuredName)
+    if configuredName then
+        if peripheral.isPresent(configuredName) then
+            local dev = peripheral.wrap(configuredName)
+            if isCore(dev) then
+                return {name = configuredName, dev = dev}
+            end
+            return nil, configuredName .. " is not an energy storage peripheral"
+        end
+        return nil, configuredName .. " is not attached"
     end
-    monitor.setTextScale(cfg.energyCore.monitorScale)
-    monitor.setBackgroundColor(colors.black)
-    monitor.clear()
-    monitor.setCursorPos(1, 1)
-    monitor.write("Energy Flow Monitor Initialized")
+
+    -- Prefer Draconic pylons by type, then any RF storage peripheral.
+    local fallback = nil
+    for _, name in ipairs(peripheral.getNames()) do
+        local dev = peripheral.wrap(name)
+        if isCore(dev) then
+            local kind = tostring(peripheral.getType(name))
+            if kind:find("draconic") or kind:find("pylon") then
+                return {name = name, dev = dev}
+            end
+            fallback = fallback or {name = name, dev = dev}
+        end
+    end
+    if fallback then
+        return fallback
+    end
+    return nil, "no energy core found"
 end
 
-function energy_core_utils.updateMonitor()
-    if not monitor then return end
-    local inFlow = 0
-    local outFlow = 0
-
-    if inputGate and inputGate.getFlow then
-        local ok, val = pcall(inputGate.getFlow)
-        if ok then inFlow = val end
+function energy_core_utils.read(core, now)
+    if not core then
+        return nil
     end
-    if outputGate and outputGate.getFlow then
-        local ok, val = pcall(outputGate.getFlow)
-        if ok then outFlow = val end
+    local ok, stored = pcall(core.dev.getEnergyStored)
+    local okMax, max = pcall(core.dev.getMaxEnergyStored)
+    if not ok or not okMax or type(stored) ~= "number" or type(max) ~= "number" then
+        return nil
     end
 
-    monitor.clear()
-    monitor.setCursorPos(2, 2)
-    monitor.write("Energy Flow Monitor")
-    monitor.setCursorPos(2, 4)
-    monitor.write(string.format("Input:  %.0f RF/t", inFlow))
-    monitor.setCursorPos(2, 5)
-    monitor.write(string.format("Output: %.0f RF/t", outFlow))
-end
-
-function energy_core_utils.logEnergyCoreStats()
-    local f = fs.open("energy_core_stats.log", "a")
-    if not f then return end
-    local inFlow, outFlow = 0, 0
-
-    if inputGate and inputGate.getFlow then
-        local ok, val = pcall(inputGate.getFlow)
-        if ok then inFlow = val end
+    local transfer = nil
+    if hasMethod(core.dev, "getInputPerTick") and hasMethod(core.dev, "getOutputPerTick") then
+        -- DE 1.18+: measured rates rather than a single net figure.
+        local okI, input = pcall(core.dev.getInputPerTick)
+        local okO, output = pcall(core.dev.getOutputPerTick)
+        if okI and okO and type(input) == "number" and type(output) == "number" then
+            transfer = input - output
+        end
     end
-    if outputGate and outputGate.getFlow then
-        local ok, val = pcall(outputGate.getFlow)
-        if ok then outFlow = val end
+    if transfer == nil and hasMethod(core.dev, "getTransferPerTick") then
+        local okT, value = pcall(core.dev.getTransferPerTick)
+        if okT and type(value) == "number" then
+            transfer = value
+        end
     end
+    if transfer == nil and now and core.lastStored and core.lastAt and now > core.lastAt then
+        -- 20 game ticks per second.
+        transfer = (stored - core.lastStored) / ((now - core.lastAt) * 20)
+    end
+    core.lastStored, core.lastAt = stored, now
 
-    f.writeLine(string.format(
-        "%s | In: %.0f RF/t | Out: %.0f RF/t",
-        os.date("%Y-%m-%d %H:%M:%S"),
-        inFlow, outFlow
-    ))
-    f.close()
+    return {
+        stored   = stored,
+        max      = max,
+        pct      = max > 0 and stored / max or 0,
+        transfer = transfer
+    }
 end
 
 return energy_core_utils
