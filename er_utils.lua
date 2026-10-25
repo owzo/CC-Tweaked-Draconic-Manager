@@ -122,6 +122,8 @@ local function erReactor(name, dev)
     -- for bad values, so arguments are validated here.
     function a.setActive(on) dev.setActive(on and true or false) end
     function a.setRods(level) dev.setAllControlRodLevels(math.floor(clamp(level, 0, 100) + 0.5)) end
+    -- Moves waste to an access port set to output; a no-op without one.
+    function a.ejectWaste() dev.doEjectWaste() end
     return a
 end
 
@@ -194,6 +196,7 @@ local function brReactor(name, dev)
 
     function a.setActive(on) dev.setActive(on and true or false) end
     function a.setRods(level) dev.setAllControlRodLevels(clamp(level, 0, 100)) end
+    function a.ejectWaste() dev.fuelTank().ejectWaste() end
     return a
 end
 
@@ -266,6 +269,7 @@ local RECOVERY_SECONDS_STEAM = 4
 local ROD_GAIN, ROD_RATE_MAX = 6, 6
 local ROD_GAIN_PASSIVE, ROD_RATE_MAX_PASSIVE = 20, 25
 local SMOOTHING = 0.3          -- EMA weight of the newest sample
+local WASTE_EJECT_COOLDOWN = 30 -- seconds between eject attempts
 
 local Buffer = {}
 Buffer.__index = Buffer
@@ -328,6 +332,20 @@ function Buffer:step(d, now, demandHint)
     if fuelPct < (c.lowFuel or 0.1) then
         table.insert(self.alarms, string.format("LOW FUEL %.0f%%", fuelPct * 100))
     end
+    -- Waste shares the fuel tank and displaces fuel: eject it once it
+    -- passes wasteEjectAt (needs an access port set to output). If it
+    -- keeps piling up anyway, ejection isn't reaching anything: alarm.
+    local wastePct = (d.fuelMax or 0) > 0 and (d.waste or 0) / d.fuelMax or 0
+    if c.wasteEjectAt and wastePct >= c.wasteEjectAt
+            and (not self.lastEject or now - self.lastEject >= WASTE_EJECT_COOLDOWN) then
+        self.lastEject = now
+        out.ejectWaste = true
+        table.insert(out.events, {level = "INFO",
+            message = string.format("Ejecting waste (%.0f%% of fuel tank)", wastePct * 100)})
+    end
+    if wastePct >= (c.wasteAlarmAt or 0.5) then
+        table.insert(self.alarms, string.format("WASTE %.0f%% - CHECK ACCESS PORT", wastePct * 100))
+    end
 
     -- Smoothed level and production; demand from the change in level.
     local dt = (self.lastAt and now > self.lastAt) and (now - self.lastAt) or nil
@@ -349,7 +367,7 @@ function Buffer:step(d, now, demandHint)
     elseif not d.active then
         -- Idle reactors keep their last rods; nothing to regulate.
     else
-        local gain = d.activelyCooled and ROD_GAIN or ROD_GAIN_PASSIVE
+        local gain = (d.activelyCooled and ROD_GAIN or ROD_GAIN_PASSIVE) * (c.rodGain or 1)
         local maxStep = (d.activelyCooled and ROD_RATE_MAX or ROD_RATE_MAX_PASSIVE) * cycle
         local mid = (c.bufferLow + c.bufferHigh) / 2
         local step
@@ -466,8 +484,9 @@ function Turbine:step(d, now)
             -- Bumpless entry: start from the steam actually flowing.
             self.integral = clamp(d.flow or self.flow, 0, limit)
         end
-        self.integral = clamp(self.integral + FLOW_KI * size * err * dt, 0, limit)
-        self.flow = clamp(self.integral + FLOW_KP * size * err, 0, limit)
+        local tune = c.flowGain or 1
+        self.integral = clamp(self.integral + FLOW_KI * size * tune * err * dt, 0, limit)
+        self.flow = clamp(self.integral + FLOW_KP * size * tune * err, 0, limit)
         self.coils = self.mode == "run"
     end
     if d.active and (d.steam or 0) <= 0 and (d.flowSet or 0) > 0 then
@@ -497,6 +516,7 @@ function er_utils.apply(adapter, out, last)
     if out.coils ~= nil and out.coils ~= last.coils then
         try("setCoils", adapter.setCoils, out.coils); last.coils = out.coils
     end
+    if out.ejectWaste and adapter.ejectWaste then try("ejectWaste", adapter.ejectWaste) end
     return errors
 end
 

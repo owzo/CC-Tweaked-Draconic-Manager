@@ -1,8 +1,9 @@
 # CC:Tweaked-Draconic Manager
 
 A ComputerCraft: Tweaked program that runs **Draconic Evolution** reactors
-and, when installed, **Extreme Reactors** or **Bigger Reactors** reactors and
-turbines, from one computer with a touchscreen dashboard.
+and, when installed, **Extreme Reactors** / **Bigger Reactors** reactors and
+turbines and **Mekanism** fission, fusion, turbines and boilers, from one
+computer with a touchscreen dashboard.
 
 Each mod is optional: with only Draconic Evolution you get the Draconic
 features, with only Extreme/Bigger Reactors you get those, and with both
@@ -21,7 +22,10 @@ shutdown on unsafe conditions.
   - temperature above `maxTemperature` (8000 °C)
   - field below `minField` (20%)
   - remaining fuel below `minFuel` (10%)
-- **Auto-restart**: after a temperature or field trip the reactor restarts once it has cooled below `safeTemperature`. This is capped at 3 restarts per hour, after which a person has to press START. A low-fuel trip never restarts on its own.
+- **Auto-restart**: after a temperature or field trip the reactor resumes as soon as it has cooled below `safeTemperature`, straight from its shutdown (Draconic Evolution allows re-activation above 2000 °C), so there is no full cooldown and recharge. This is capped at 3 restarts per hour, after which a person has to press START. A low-fuel trip never restarts on its own.
+- **Wiring check**: if charging makes no progress for 30 seconds, an alarm says the input gate isn't reaching the energy injector (wrong gate, a fluid gate, or no power behind it).
+- **Remembers manual modes**: manual output (Draconic) and manual rods (Extreme/Bigger Reactors) survive reboots.
+- **Hot-plug**: machines connected while the program runs are picked up within a few seconds, with no restart. A second Draconic reactor still needs the setup wizard (restart) or `config.lua`, because its gates have to be assigned.
 - **Fail-safe exit**: if the program stops (Ctrl+T, crash, reactor link lost), the output gate goes to 0 and the input gate to twice the last field demand. With output at 0, saturation climbs and field drain collapses, so that margin is wide.
 - **Plug-and-play detection**: peripherals are found by the methods they expose, not by their names. On DE 1.16 to 1.20 flux gates report the type `flow_gate`, not `flux_gate`. This breaks drmon and was one cause of [issue 5](https://github.com/owzo/CC-Tweaked-Draconic-Manager/issues/5). Detection works with any modem name. If two gates are found you are asked once which one is the input, and the answer is saved.
 - **Dashboard** (styled after drmon): shows status, generation, temperature, field, saturation, fuel, gate rates, an optional energy core readout and alarms. It redraws through a buffer, so there is no flicker. It works on any number of monitors and falls back to the computer screen when none are attached.
@@ -133,12 +137,35 @@ active (steam) cooling. Settings live in `config.extreme`.
 | Active (steam) reactor | Matches steam production to what the turbines are set to draw, and uses its steam tank level only as a trim. A steam tank holds only seconds of mismatch, too little to steer by on its own. |
 | Turbine | Spins up with the coils off (engaged coils brake the rotor; Bigger Reactors turbines start engaged), then a PI loop on steam flow holds `targetRPM` (1800, the efficiency peak in both mods). When the turbine's own buffer is full, the coils switch off and the rotor is kept at speed; they switch back on below `coilsOnBelow`. Steam is cut above `maxRPM`. |
 
-All steam-cooled reactors and turbines on the network are treated as one
-steam system (the usual build: reactors feed a shared pipe network).
+By default all steam-cooled reactors and turbines on the network are treated
+as one steam system (the usual build: reactors feed a shared pipe network).
+If you run separate steam systems, give each unit a `steamGroup`; only
+units in the same group share steam demand:
+
+```lua
+config.extreme.units = {
+    {peripheral = "BigReactors-Reactor_0", steamGroup = "A"},
+    {peripheral = "BigReactors-Turbine_0", steamGroup = "A"},
+    {peripheral = "BigReactors-Reactor_1", steamGroup = "B"},
+    {peripheral = "BigReactors-Turbine_1", steamGroup = "B"},
+}
+```
+
+**Tuning:** every control loop has a speed multiplier you can change live on
+the unit's `S` page: `Output Gain` (Draconic), `Rod Gain` (fission) and
+`Flow Gain` (turbines). Lower it if rods, output or flow keep hunting back
+and forth; raise it if the buffer, temperature or RPM drifts and recovers
+slowly. Changes are saved, and `RESET` returns to `config.lua`.
 
 **Neither mod can melt down or explode**, and turbines take no damage from
 overspeed. The worst outcome of bad control is wasted fuel or steam, so
 these controllers aim for efficiency rather than safety margins.
+
+**Waste and fuel:** waste shares the fuel tank, so once it passes
+`wasteEjectAt` (20% of the tank) the program ejects it. That needs a reactor
+access port set to output. If waste keeps piling up past `wasteAlarmAt`
+anyway, an alarm says to check the access port. Fission pages show fuel and
+waste side by side, and low fuel raises an alarm.
 
 Each page has `START` / `STOP` (activate or deactivate). Reactor pages also
 have `-10 -1 AU +1 +10`, where `AU`/`MA` toggles automatic rod control and
@@ -151,6 +178,69 @@ unit in `config.extreme.units`.
 | Bigger Reactors reports temperatures in Kelvin | Converted to °C |
 | Bigger Reactors has no battery when actively cooled, and object accessors (`battery()`, `rotor()`) | Hidden behind one adapter (`er_utils.lua`) |
 | Bigger Reactors turbine vents can't be set from CC | Not touched by the program in either mod |
+
+## Mekanism
+
+Fission reactors, fusion reactors, industrial turbines and thermoelectric
+boilers are found automatically through their ports/valves. Several ports on
+one structure count as one unit.
+
+**A Mekanism fission reactor can melt down.** Damage builds above 1200 K, and
+at 100% damage an explosion is likely within about a minute (meltdowns are
+on by default). The program protects it the way the widely used cc-mek-scada
+does, and SCRAMs (instant shutdown) on any of these:
+
+| Trip | Default (`config.mekanism`) |
+| --- | --- |
+| Temperature | ≥ 1000 K (`maxTemperature`; can't be set above 1150) |
+| Damage | any (`maxDamage = 0`) |
+| Coolant | < 20% |
+| Heated coolant / steam | > 95% (turbines not keeping up) |
+| Waste | > 90% |
+
+- **No automatic restart after a trip:** a person presses START.
+- **The burn rate ramps up gradually** to the target you set (`-10 -1 +1 +10`
+  on the page). It is cut back automatically while the temperature is within
+  100 K of the trip or coolant runs low, so most excursions are handled
+  before a SCRAM is needed.
+- **When the program stops** (Ctrl+T, crash, update), running fission
+  reactors are SCRAMmed (`scramOnExit`), because an unsupervised reactor is
+  the riskier state. Make sure the computer is chunk-loaded.
+- **Turbines and boilers** are monitored, with alarms for steam backing up
+  or low water.
+- **Fusion reactors** can't explode. They're monitored, and the injection
+  rate is adjustable with `-2 / +2` (it must be even).
+- **Every Mekanism call costs a server tick**, so all readings are taken in
+  parallel each cycle. Energy is converted from Mekanism's Joules to FE
+  using the server's own conversion rate.
+
+## Alarms
+
+Every unit alarm (trip, low fuel, waste, link lost, charging stalled,
+overspeed, no steam...) can reach players away from the monitor:
+
+| Output | Needs | Behaviour |
+| --- | --- | --- |
+| Bell | Any speaker on the network | Rings on a new alarm, then every `repeatSeconds` while it lasts |
+| Chat | Advanced Peripherals **Chat Box** | One message per new alarm, and one when everything has cleared |
+| Redstone | `redstoneSide` (computer side) or an AP **Redstone Integrator** | On while any alarm is active: lamps, sirens, or wire it into a hardware shutdown |
+
+**Tap the red alarm bar** at the bottom of any page (or `SILENCE` on the
+System page) to stop the bell until a new alarm appears. Alarms are also
+written to the log (`ALARM <unit>: <text>`). Settings are in `config.alarms`.
+
+## System page, updates and totals
+
+Tap `[i] Overview` (the top row of the Overview) for the System page:
+
+- **Version** and **update check**. `CHECK` asks GitHub for the latest
+  version; `UPDATE`, then `CONFIRM` within 10 seconds, puts every reactor in
+  its fail-safe state, runs the official installer (which keeps your
+  `config.lua`) and reboots into the new version. Source: `config.update.repoBase`.
+- **Energy totals**: energy produced in the last 24 hours, lifetime total,
+  and a per-hour bar chart, kept across reboots in `data/totals.db`. Each
+  unit's Graphs page also starts with its own energy-per-hour chart.
+- **Alarm status** and `SILENCE`.
 
 ## Menus and monitors
 
@@ -498,12 +588,18 @@ logging locally. The reactors are not affected either way.
 | `Remote log: collector unreachable: … (HTTP 401)` | `config.logging.remote.token` does not match the collector's `--token`. |
 | `Remote log: N entries were dropped` | The collector was down long enough to fill `maxQueue`. Raise it, or fix the collector sooner. The full log is still on the computer. |
 | Collector folder is missing a computer | The folder is `computer-<id>-<label>`. Run `id` on the computer, and check the collector output: it logs every batch and every rejected request. |
+| `CHARGING STALLED - CHECK INPUT GATE` | The input gate isn't feeding the energy injector: the wrong gate was picked (run `set draconic.inputGate <name>`), it's a fluid gate, or the energy source is empty. |
 
 ## Development
 
 ```text
 main_control.lua       scheduler: loads drivers, one coroutine per unit, UI, input, fail-safe exit
 persist.lua            saved in-game settings and monitor pins (data/manager.db), settings schema
+mek_utils.lua          Mekanism adapters, fission protection + burn governor
+drivers/mekanism.lua   Mekanism fission / fusion / turbine / boiler units
+alarms.lua             speaker / chat box / redstone alarm outputs, silence
+totals.lua             long-term energy totals (data/totals.db)
+updater.lua            update check and install from GitHub
 drivers/draconic.lua   Draconic reactor units (wraps reac_utils)
 drivers/energy_core.lua  read-only energy pylon units
 reac_utils.lua         Draconic discovery, gate adapter, controller (pure logic)
@@ -518,7 +614,10 @@ tests/                 CC mock, reactor simulator, test suite
 tools/log_collector.py remote log collector (Python 3.8+, standard library only)
 ```
 
-Run the tests with any Lua 5.2+ interpreter from the repository root:
+Every push and pull request runs the tests automatically on GitHub (Lua 5.2
+and 5.4, plus a Lua 5.1 syntax check of every shipped file; see
+`.github/workflows/tests.yml`). To run them yourself, use any Lua 5.2+
+interpreter from the repository root:
 
 ```shell
 lua tests/run_tests.lua

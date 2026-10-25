@@ -28,10 +28,15 @@ local requiredFiles = {
     "stat_utils.lua",
     "energy_core_utils.lua",
     "er_utils.lua",
+    "mek_utils.lua",
     "persist.lua",
     "log_shipper.lua",
+    "alarms.lua",
+    "totals.lua",
+    "updater.lua",
     "drivers/draconic.lua",
     "drivers/extreme.lua",
+    "drivers/mekanism.lua",
     "drivers/energy_core.lua",
     "config.lua"
 }
