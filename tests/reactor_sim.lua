@@ -6,12 +6,20 @@
 README
 -------
 A tick-level model of the Draconic Evolution reactor, transcribed from
-the 1.12.2 ReactorCore logic. It is APPROXIMATE: later DE versions tune
-constants differently, and the energy core/flux network is idealised
-(gates always deliver exactly their set rate). It exists to check that
-the controller is stable and fail-safe, not to predict exact numbers.
+TileReactorCore. It is APPROXIMATE: the energy core/flux network is
+idealised (gates always deliver exactly their set rate). It exists to
+check that the controller is stable and fail-safe, not to predict exact
+numbers.
 
-  local sim = Sim.new({fuel = 10368})
+Two rule sets (opts.version):
+  "1.12"  output multiplier 1, fuel multiplier 1; stopping pins
+          saturation at max
+  "1.20"  1.16+ defaults: reactorOutputMultiplier 10 plus an extra x10
+          (generation and drain ~100x), fuel use x25; the stabilizer
+          only outputs while running, and a stopping core only cools
+          once saturation reaches 99%
+
+  local sim = Sim.new({fuel = 10368, version = "1.20"})
   sim:tick()                       -- advance one game tick (1/20 s)
   sim.reactor / sim.inGate / sim.outGate are peripheral-like tables.
 ]]
@@ -43,6 +51,12 @@ function Sim.new(opts)
     self.maxTempSeen = 0
     self.minFieldWhileHot = 1
     self.extractScale = 1                    -- <1 simulates a full energy core
+    self.version = opts.version or "1.12"
+    if self.version == "1.20" then
+        self.outputMult, self.fuelMult = 100, 25
+    else
+        self.outputMult, self.fuelMult = 1, 1
+    end
 
     if self.state == "running" then
         self.temperature = opts.temperature or 6000
@@ -81,7 +95,9 @@ function Sim:tick()
 
     -- Energy transfer through the gates.
     self:injectEnergy(self.inFlow)
-    if self.state == "running" or self.state == "stopping" then
+    local extracting = self.state == "running"
+        or (self.state == "stopping" and self.version == "1.12")
+    if extracting then
         local taken = math.min(self.saturation, self.outFlow * self.extractScale)
         self.saturation = self.saturation - taken
     end
@@ -96,18 +112,18 @@ function Sim:tick()
         local tempRiseResist = (temp50 ^ 4) / (100 - temp50)
         local riseAmount = (tempRiseExpo - tempRiseResist * (1 - conv) + conv * 1000) / 10000
 
-        if self.state == "stopping" and conv < 1 then
-            if self.temperature <= 2001 then
-                self.state = "cooling"
-            else
-                self.saturation = self.maxSaturation
-                self.temperature = self.temperature - (1 - conv)
-            end
+        if self.state == "stopping" and conv < 1 and self.temperature <= 2001 then
+            self.state = "cooling"
+        elseif self.state == "stopping" and conv < 1 and self.version == "1.12" then
+            self.saturation = self.maxSaturation
+            self.temperature = self.temperature - (1 - conv)
+        elseif self.state == "stopping" and conv < 1 and satRatio >= 0.99 then
+            self.temperature = self.temperature - (1 - conv)
         else
             self.temperature = self.temperature + riseAmount * 10
         end
 
-        local baseMaxRFt = (self.maxSaturation / 1000) * 1.5
+        local baseMaxRFt = (self.maxSaturation / 1000) * 1.5 * self.outputMult
         local maxRFt = baseMaxRFt * (1 + conv * 2)
         self.generationRate = (1 - satRatio) * maxRFt
         self.saturation = math.min(self.maxSaturation, self.saturation + self.generationRate)
@@ -126,7 +142,7 @@ function Sim:tick()
         self.fieldDrain = drainFactor * math.max(0.01, 1 - satRatio) * (baseMaxRFt / 10.923556)
         self.field = self.field - math.min(self.fieldDrain, self.field)
 
-        local fuelUse = drainFactor * (1 - satRatio) * 0.001
+        local fuelUse = drainFactor * (1 - satRatio) * 0.001 * self.fuelMult
         self.conversionUnit = self.conversionUnit + fuelUse
         if self.conversionUnit >= 1 then
             self.conversionUnit = self.conversionUnit - 1
@@ -134,7 +150,8 @@ function Sim:tick()
             self.convertedFuel = self.convertedFuel + 1
         end
 
-        if self.field <= 0 or self.temperature >= MAX_TEMPERATURE then
+        -- The only explosion trigger in the source: field gone while hot.
+        if self.field <= 0 and self.temperature > 2000 then
             self.exploded = true
             self.state = "beyond_hope"
         end

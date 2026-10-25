@@ -59,16 +59,20 @@ config.reactor = {
     autoRestart       = true,       -- Restart after temperature/field trips
     autoStartOnBoot   = false,      -- Charge a cold reactor when program starts
 
-    -- Flux gate limits
+    -- Flux gate limits. DE 1.16+ reactors generate ~100x more than 1.12
+    -- (50-250M RF/t for a full core), so the caps are deliberately high;
+    -- the regulator, not the cap, decides the real rates.
     chargeInflow      = 2000000,    -- Input rate while charging/warming up
-    maxInflow         = 20000000,   -- Input cap (also used in emergencies)
-    maxOutflow        = 30000000,   -- Output cap
+    maxInflow         = 100000000,  -- Input cap (used for field emergencies)
+    maxOutflow        = 1000000000, -- Output cap (lower it to protect cables)
 
     -- Output regulation tuning (1.0 = default; lower = gentler)
     outputAggressiveness = 1.0,
 
-    -- Controller cycle time in seconds (0.1 = every 2 game ticks)
-    controlInterval   = 0.1
+    -- Controller cycle time in seconds (0.05 = every game tick). On DE
+    -- 1.20 each peripheral call already takes a tick, so cycles may run
+    -- slower than this; they are never faster.
+    controlInterval   = 0.05
 }
 
 ------------------------------------------------------------

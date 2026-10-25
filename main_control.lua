@@ -17,7 +17,7 @@ Shared state lives in the `state` table. ComputerCraft coroutines only
 switch at yields (sleep / pullEvent), so no locking is needed.
 
 On exit (Ctrl+T or a crash) the gates are left in the fail-safe
-position: input at maxInflow, output at zero.
+position: output at zero and input at twice the last field demand.
 ]]
 
 local config            = require("config")
@@ -138,6 +138,7 @@ end
 local function controlLoop()
     local c = config.reactor
     while true do
+        local cycleStart = os.clock()
         local info, err = reac_utils.readInfo(state.hw.reactor)
         if info then
             state.failedReads = 0
@@ -170,7 +171,12 @@ local function controlLoop()
             state.failedReads = 0
         end
 
-        sleep(c.controlInterval)
+        -- Peripheral calls may already have used the interval (DE 1.20
+        -- runs them on the server thread); otherwise wait out the rest.
+        local remaining = c.controlInterval - (os.clock() - cycleStart)
+        if remaining > 0 then
+            sleep(remaining)
+        end
     end
 end
 
@@ -237,10 +243,13 @@ end
 ------------------------------------------------------------
 local function failSafe(reason)
     if not state.hw then return end
-    local actions = {input = config.reactor.maxInflow, output = 0, events = {}}
+    local input = state.controller and state.controller:blindInput()
+        or config.reactor.chargeInflow
+    local actions = {input = input, output = 0, events = {}}
     reac_utils.apply(state.hw, actions)
-    stat_utils.log("WARN", "Program exiting (" .. tostring(reason)
-        .. "); gates left fail-safe: input max, output 0")
+    stat_utils.log("WARN", string.format(
+        "Program exiting (%s); gates left fail-safe: input %s, output 0",
+        tostring(reason), monitor_utils.formatRF(input)))
 end
 
 ------------------------------------------------------------

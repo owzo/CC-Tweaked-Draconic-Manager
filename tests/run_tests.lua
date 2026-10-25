@@ -157,11 +157,35 @@ test("missing fuel data is treated as empty, never NaN", function()
     check(info.fieldPct == 0, "field %s", tostring(info.fieldPct))
 end)
 
-test("lost reactor link drives gates fail-safe", function()
-    local sim = Sim.new()
+test("lost reactor link: output 0, input 2x last demand, no runaway", function()
+    local sim = Sim.new({state = "running", temperature = 7000})
     local ctl, cfg = newCtl(sim)
-    local a = ctl:step(nil, 0)
-    check(a.input == cfg.reactor.maxInflow and a.output == 0, "not fail-safe")
+    local info = require("reac_utils").readInfo(sim.reactor)
+    info.fieldDrainRate, info.fieldPct = 2000000, 0.5
+    ctl:step(info, 0)                         -- demand 4M
+    local a
+    for i = 1, 5 do a = ctl:step(nil, i) end
+    check(a.output == 0, "output %s", tostring(a.output))
+    check(a.input == 8000000, "input %s (should stay 2x, not compound)", tostring(a.input))
+    check(a.input <= cfg.reactor.maxInflow, "over cap")
+end)
+
+test("gate adapter skips unchanged writes and enables override", function()
+    cc.reset(); freshModules()
+    local calls = 0
+    local dev = {override = false}
+    dev.getFlow = function() return 0 end
+    dev.getOverrideEnabled = function() calls = calls + 1; return dev.override end
+    dev.setOverrideEnabled = function(v) calls = calls + 1; dev.override = v end
+    dev.setFlowOverride = function() calls = calls + 1 end
+    local gate = require("reac_utils").wrapGate("g", dev)
+    gate.set(5)
+    check(dev.override, "override not enabled")
+    local before = calls
+    for _ = 1, 10 do gate.set(5) end
+    check(calls == before, "unchanged rate cost %d calls", calls - before)
+    gate.set(6)
+    check(calls == before + 1, "changed rate should be one call, was %d", calls - before)
 end)
 
 test("stopping reactor keeps its field fed (old code zeroed it)", function()
@@ -205,81 +229,116 @@ test("auto-restart budget latches after repeated trips", function()
 end)
 
 ------------------------------------------------------------
--- CLOSED LOOP SIMULATION
+-- CLOSED LOOP SIMULATION (both rule sets)
 ------------------------------------------------------------
-test("cold start -> charge -> run, then holds temperature and field", function()
-    local sim = Sim.new()
-    local ctl, cfg = newCtl(sim)
+for _, V in ipairs({"1.12", "1.20"}) do
+    test("[DE " .. V .. "] cold start -> charge -> run, then holds temperature and field", function()
+        local sim = Sim.new({version = V})
+        local ctl, cfg = newCtl(sim)
+        ctl:requestStart()
+        local r = cfg.reactor
+        local late = {minT = math.huge, maxT = 0, minF = 1, maxF = 0}
+        closedLoop(sim, ctl, 1200, function(t, info)
+            if t > 600 and info and info.status == "running" then
+                late.minT = math.min(late.minT, info.temperature)
+                late.maxT = math.max(late.maxT, info.temperature)
+                late.minF = math.min(late.minF, info.fieldPct)
+                late.maxF = math.max(late.maxF, info.fieldPct)
+            end
+        end)
+        check(not sim.exploded, "reactor exploded")
+        check(sim.state == "running", "state %s", sim.state)
+        check(sim.maxTempSeen < r.maxTemperature, "peak %.0fC", sim.maxTempSeen)
+        check(late.minT > r.targetTemperature - 100 and late.maxT < r.targetTemperature + 100,
+              "temperature band %.0f-%.0f", late.minT, late.maxT)
+        check(late.minF > r.targetField - 0.03 and late.maxF < r.targetField + 0.03,
+              "field band %.3f-%.3f", late.minF, late.maxF)
+        realPrint(string.format("      peak %.0fC, steady %.0f-%.0fC, field %.1f-%.1f%%, gen %.0f RF/t",
+            sim.maxTempSeen, late.minT, late.maxT, late.minF * 100, late.maxF * 100, sim.generationRate))
+    end)
+
+    test("[DE " .. V .. "] controlled stop keeps containment until cold", function()
+        local sim = Sim.new({version = V, state = "running", temperature = 7000, sat = 0.2})
+        local ctl = newCtl(sim)
+        closedLoop(sim, ctl, 60)
+        ctl:requestStop()
+        sim.minFieldWhileHot = 1
+        closedLoop(sim, ctl, 900)
+        check(not sim.exploded, "exploded during shutdown")
+        check(sim.state == "cooling" or sim.state == "cold", "state %s", sim.state)
+        check(sim.minFieldWhileHot > 0.3, "field dipped to %.2f", sim.minFieldWhileHot)
+    end)
+
+    test("[DE " .. V .. "] full energy core then sudden drain does not overheat", function()
+        local sim = Sim.new({version = V, state = "running", temperature = 7000, sat = 0.2})
+        local ctl, cfg = newCtl(sim)
+        closedLoop(sim, ctl, 300)
+        sim.extractScale = 0          -- core full: nothing leaves the reactor
+        closedLoop(sim, ctl, 300)
+        sim.extractScale = 1          -- core suddenly has room again
+        sim.maxTempSeen = 0
+        closedLoop(sim, ctl, 300)
+        check(not sim.exploded, "exploded")
+        check(sim.maxTempSeen < cfg.reactor.maxTemperature, "peak %.0fC", sim.maxTempSeen)
+    end)
+
+    test("[DE " .. V .. "] manual overdrive is caught by the interlock before the trip", function()
+        local sim = Sim.new({version = V, state = "running", temperature = 7000, sat = 0.2})
+        local ctl, cfg = newCtl(sim)
+        closedLoop(sim, ctl, 120)
+        ctl:adjustManualOutput(math.max(5000000, ctl.outputRate))
+        closedLoop(sim, ctl, 300)
+        check(not sim.exploded, "exploded")
+        check(ctl.autoOutput, "interlock did not restore auto output")
+        check(sim.maxTempSeen < cfg.reactor.maxTemperature, "reached trip limit: %.0fC", sim.maxTempSeen)
+        check(sim.state == "running", "interlock failed, reactor tripped (%s)", sim.state)
+    end)
+
+    test("[DE " .. V .. "] field collapse trips, recovers and auto-restarts", function()
+        local sim = Sim.new({version = V, state = "running", temperature = 7000, sat = 0.2})
+        local ctl = newCtl(sim)
+        closedLoop(sim, ctl, 60)
+        sim.field = sim.maxField * 0.15
+        local tripped = false
+        closedLoop(sim, ctl, 2400, function(_, _, a)
+            if a.command == "stop" then tripped = true end
+        end)
+        check(tripped, "no trip")
+        check(not sim.exploded, "exploded")
+        check(sim.state == "running", "did not auto-restart, state %s", sim.state)
+    end)
+end
+
+test("[DE 1.20] holds target with 3-tick cycles (server-thread latency)", function()
+    local sim = Sim.new({version = "1.20"})
+    local ctl, cfg = newCtl(sim, {controlInterval = 0.15})
     ctl:requestStart()
-    local r = cfg.reactor
-    local late = {minT = math.huge, maxT = 0, minF = 1, maxF = 0}
-    closedLoop(sim, ctl, 1200, function(t, info)
-        if t > 600 and info and info.status == "running" then
-            late.minT = math.min(late.minT, info.temperature)
-            late.maxT = math.max(late.maxT, info.temperature)
-            late.minF = math.min(late.minF, info.fieldPct)
-            late.maxF = math.max(late.maxF, info.fieldPct)
+    local band = {lo = math.huge, hi = 0, minF = 1}
+    closedLoop(sim, ctl, 900, function(t, info)
+        if t > 450 and info and info.status == "running" then
+            band.lo = math.min(band.lo, info.temperature)
+            band.hi = math.max(band.hi, info.temperature)
+            band.minF = math.min(band.minF, info.fieldPct)
         end
     end)
-    check(not sim.exploded, "reactor exploded")
-    check(sim.state == "running", "state %s", sim.state)
-    check(sim.maxTempSeen < r.maxTemperature, "peak %.0fC", sim.maxTempSeen)
-    check(late.minT > r.targetTemperature - 100 and late.maxT < r.targetTemperature + 100,
-          "temperature band %.0f-%.0f", late.minT, late.maxT)
-    check(late.minF > r.targetField - 0.03 and late.maxF < r.targetField + 0.03,
-          "field band %.3f-%.3f", late.minF, late.maxF)
-    realPrint(string.format("      peak %.0fC, steady %.0f-%.0fC, field %.1f-%.1f%%, gen %.0f RF/t",
-        sim.maxTempSeen, late.minT, late.maxT, late.minF * 100, late.maxF * 100, sim.generationRate))
-end)
-
-test("controlled stop keeps containment until cold", function()
-    local sim = Sim.new({state = "running", temperature = 7000, sat = 0.2})
-    local ctl = newCtl(sim)
-    closedLoop(sim, ctl, 60)
-    ctl:requestStop()
-    sim.minFieldWhileHot = 1
-    closedLoop(sim, ctl, 900)
-    check(not sim.exploded, "exploded during shutdown")
-    check(sim.state == "cooling" or sim.state == "cold", "state %s", sim.state)
-    check(sim.minFieldWhileHot > 0.3, "field dipped to %.2f", sim.minFieldWhileHot)
-end)
-
-test("full energy core then sudden drain does not overheat", function()
-    local sim = Sim.new({state = "running", temperature = 7000, sat = 0.2})
-    local ctl, cfg = newCtl(sim)
-    closedLoop(sim, ctl, 300)
-    sim.extractScale = 0          -- core full: nothing leaves the reactor
-    closedLoop(sim, ctl, 300)
-    sim.extractScale = 1          -- core suddenly has room again
-    sim.maxTempSeen = 0
-    closedLoop(sim, ctl, 300)
     check(not sim.exploded, "exploded")
     check(sim.maxTempSeen < cfg.reactor.maxTemperature, "peak %.0fC", sim.maxTempSeen)
+    check(band.lo > 6900 and band.hi < 7100, "band %.0f-%.0f", band.lo, band.hi)
+    check(band.minF > 0.45, "field dipped to %.3f", band.minF)
 end)
 
-test("manual overdrive is caught by the interlock before the trip", function()
-    local sim = Sim.new({state = "running", temperature = 7000, sat = 0.2})
-    local ctl, cfg = newCtl(sim)
-    closedLoop(sim, ctl, 120)
-    ctl:adjustManualOutput(5000000)
-    closedLoop(sim, ctl, 300)
+test("[DE 1.20] edge tuning: 8000C target, 25% field, 12% trip", function()
+    local sim = Sim.new({version = "1.20"})
+    local ctl = newCtl(sim, {targetTemperature = 7900, maxTemperature = 8200,
+                             targetField = 0.25, minField = 0.12, controlInterval = 0.15})
+    ctl:requestStart()
+    closedLoop(sim, ctl, 900)
     check(not sim.exploded, "exploded")
-    check(ctl.autoOutput, "interlock did not restore auto output")
-    check(sim.maxTempSeen < cfg.reactor.maxTemperature + 200, "peak %.0fC", sim.maxTempSeen)
-end)
-
-test("field collapse trips, recovers and auto-restarts", function()
-    local sim = Sim.new({state = "running", temperature = 7000, sat = 0.2})
-    local ctl = newCtl(sim)
-    closedLoop(sim, ctl, 60)
-    sim.field = sim.maxField * 0.15
-    local tripped = false
-    closedLoop(sim, ctl, 2400, function(_, _, a)
-        if a.command == "stop" then tripped = true end
-    end)
-    check(tripped, "no trip")
-    check(not sim.exploded, "exploded")
-    check(sim.state == "running", "did not auto-restart, state %s", sim.state)
+    check(sim.state == "running", "state %s (tripped?)", sim.state)
+    check(sim.maxTempSeen < 8200, "peak %.0fC", sim.maxTempSeen)
+    check(sim.minFieldWhileHot > 0.12, "field dipped to %.3f", sim.minFieldWhileHot)
+    realPrint(string.format("      edge: peak %.0fC, min field %.1f%%, gen %.1fM RF/t",
+        sim.maxTempSeen, sim.minFieldWhileHot * 100, sim.generationRate / 1e6))
 end)
 
 ------------------------------------------------------------
@@ -416,7 +475,8 @@ test("main_control: boot, prompt, START, regulate, Ctrl+T fail-safe", function()
     check(math.abs(sim.temperature - 7000) < 150, "temperature %.0f", sim.temperature)
     -- Ctrl+T leaves gates fail-safe.
     check(sim.outFlow == 0, "output after exit %s", tostring(sim.outFlow))
-    check(sim.inFlow == 20000000, "input after exit %s", tostring(sim.inFlow))
+    check(sim.inFlow >= 2000000 and sim.inFlow < 2000000 * 2.5,
+          "input after exit %s", tostring(sim.inFlow))
     check(cc.readFile("logs/draconic.log"):find("Program exiting"), "exit not logged")
     local stats = cc.readFile("logs/reactor_stats.csv")
     check(stats and select(2, stats:gsub("\n", "")) > 50, "stats not recorded")

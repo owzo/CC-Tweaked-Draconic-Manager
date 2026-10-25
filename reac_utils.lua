@@ -25,11 +25,17 @@ Regulation strategy
   Field : input = fieldDrainRate / (1 - targetField). At equilibrium the
           injector adds exactly what the field loses, and the formula is
           self-correcting: a weaker field absorbs a larger share of input.
-  Heat  : output = generationRate + k * (targetTemperature - temperature).
-          Draining exactly the generation rate holds saturation (and so
-          temperature) constant; the correction term walks it to target.
-          It is stateless apart from a rate limiter, so it cannot wind up
-          when the energy core is full and stops accepting power.
+  Heat  : cascade. Core temperature is a steep, lagging function of
+          energy saturation (below ~10% saturation a DE 1.16+ core gains
+          hundreds of degrees per tick), so temperature is not driven
+          directly:
+            outer  temperature error -> saturation setpoint (PI, slow)
+            inner  output = generation + (sat - setpoint) * capacity / tau
+          Draining exactly the generation rate holds saturation constant;
+          the inner term walks it to the setpoint within ~1 second.
+          The setpoint never goes below SAT_FLOOR, the integrator freezes
+          while saturation cannot follow (energy core full), output
+          increases are rate limited and cuts are immediate.
 
 Safety model (fail-safe = field input HIGH, output ZERO)
   - A stopping reactor still needs its containment field until it is
@@ -84,17 +90,26 @@ end
 ------------------------------------------------------------
 -- DE 1.12+ gates expose an override; very old versions only have the
 -- redstone-signal flow limits, which we drive to the same value.
+--
+-- On DE 1.20 every peripheral call costs a server tick, so unchanged
+-- rates are not re-sent and the override flag is only re-verified every
+-- OVERRIDE_RECHECK writes (in case a player toggled it in the GUI).
+local OVERRIDE_RECHECK = 100
+
 function reac_utils.wrapGate(name, dev)
-    local gate = {name = name, dev = dev, lastSet = nil}
+    local gate = {name = name, dev = dev, lastSet = nil, writes = 0}
 
     function gate.set(rate)
         rate = math.max(0, math.floor(rate + 0.5))
+        if rate == gate.lastSet and gate.writes % OVERRIDE_RECHECK ~= 0 then
+            gate.writes = gate.writes + 1
+            return
+        end
         if hasMethod(dev, "setFlowOverride") then
-            if hasMethod(dev, "getOverrideEnabled") and not dev.getOverrideEnabled() then
-                dev.setOverrideEnabled(true)
-            elseif not hasMethod(dev, "getOverrideEnabled")
-                    and hasMethod(dev, "setOverrideEnabled")
-                    and gate.lastSet == nil then
+            local recheck = gate.writes % OVERRIDE_RECHECK == 0
+            if recheck and hasMethod(dev, "getOverrideEnabled") then
+                if not dev.getOverrideEnabled() then dev.setOverrideEnabled(true) end
+            elseif gate.lastSet == nil and hasMethod(dev, "setOverrideEnabled") then
                 dev.setOverrideEnabled(true)
             end
             dev.setFlowOverride(rate)
@@ -105,6 +120,7 @@ function reac_utils.wrapGate(name, dev)
             end
         end
         gate.lastSet = rate
+        gate.writes = gate.writes + 1
     end
 
     function gate.get()
@@ -216,7 +232,9 @@ end
 ------------------------------------------------------------
 -- REACTOR INFO
 ------------------------------------------------------------
--- Older Draconic Evolution versions used different status strings.
+-- DE 1.12-1.20 report invalid, cold, warming_up, running, stopping,
+-- cooling, beyond_hope. The aliases cover pre-1.12 builds and scripts
+-- written against them (drmon checks these names).
 local STATUS_ALIASES = {
     offline  = "cold",
     charging = "warming_up",
@@ -267,13 +285,27 @@ end
 ------------------------------------------------------------
 -- CONTROLLER
 ------------------------------------------------------------
--- Output correction in RF/t per degree of error, per RF of saturation
--- capacity. Larger reactors have proportionally slower thermal response,
--- so scaling by capacity keeps the loop time constant at ~10 seconds.
-local OUTPUT_GAIN = 2.5e-7
--- Max output change per cycle, as a fraction of generation (+ floor).
+-- Saturation setpoint gains, per degree C of temperature error. Near
+-- the operating point temperature moves ~-17000C per unit of saturation,
+-- giving an outer loop time constant of roughly 10 seconds.
+local SAT_KI = 5e-6            -- per degree per second
+local SAT_KP = 2e-5            -- per degree
+-- Lowest saturation setpoint. Fresh fuel needs ~11% at 8000C; below
+-- ~8% the temperature response becomes too steep to regulate.
+local SAT_FLOOR = 0.08
+local SAT_CEILING = 0.99
+-- Integrator only runs while saturation is within this of the setpoint.
+local SAT_TRACKING_BAND = 0.03
+-- Inner loop: close the saturation error over this many game ticks.
+local INNER_TAU_TICKS = 20
+-- Max output increase per cycle, as a fraction of generation (+ floor).
+-- Manual mode uses the smaller fraction: an abrupt 2x output step on
+-- DE 1.16+ heats the core ~400C per tick.
 local OUTPUT_SLEW_FRACTION = 0.05
+local MANUAL_SLEW_FRACTION = 0.01
 local OUTPUT_SLEW_FLOOR = 20000
+-- Manual mode interlock: temperature rise rate (C/s) above target.
+local MANUAL_MAX_RISE = 100
 -- Warm-up completion thresholds used by Draconic Evolution.
 local WARM_TEMPERATURE = 2000
 local WARM_FIELD = 0.499
@@ -294,9 +326,12 @@ function reac_utils.newController(reactorCfg, info)
     self.manualOutput = 0
     self.outputRate = 0
     self.inputRate = 0
+    self.observedInput = 0       -- last input chosen while the reactor was visible
     self.trip = nil              -- {reason = "...", restartable = bool}
     self.alarms = {}
     self.lastCommandAt = {}
+    self.satIntegral = nil       -- outer loop state; nil = re-initialise
+    self.lastTemp, self.lastStepAt = nil, nil
     self.autoRestarts = {}       -- timestamps of recent auto-restarts
 
     -- Keep a running reactor running across computer restarts; only
@@ -333,6 +368,7 @@ end
 
 function Controller:setAutoOutput(enabled)
     self.autoOutput = enabled
+    self.satIntegral = nil
     if not enabled then
         self.manualOutput = self.outputRate
     end
@@ -347,6 +383,15 @@ function Controller:adjustManualOutput(delta)
 end
 
 -- Regulation laws -------------------------------------------------------
+-- Input to hold when the reactor cannot be observed (link lost, program
+-- exiting). With output at zero, saturation climbs and field drain falls
+-- to ~1%, so twice the last known need is a wide margin. The injector
+-- accepts and wastes any excess, so maxInflow would burn stored power.
+function Controller:blindInput()
+    local c = self.cfg
+    return clamp(math.max(self.observedInput * 2, c.chargeInflow), 0, c.maxInflow)
+end
+
 function Controller:fieldInput(info)
     local c = self.cfg
     if info.fieldPct < c.minField then
@@ -356,15 +401,35 @@ function Controller:fieldInput(info)
     return clamp(rate, 0, c.maxInflow)
 end
 
-function Controller:regulatedOutput(info)
+function Controller:regulatedOutput(info, dt)
     local c = self.cfg
-    local gain = OUTPUT_GAIN * info.maxEnergySaturation * (c.outputAggressiveness or 1)
-    local err = c.targetTemperature - info.temperature
-    local target = info.generationRate + gain * err
+    local gain = c.outputAggressiveness or 1
+    local hot = info.temperature - c.targetTemperature   -- > 0: too hot
 
-    local slew = math.max(OUTPUT_SLEW_FLOOR, info.generationRate * OUTPUT_SLEW_FRACTION)
-    target = clamp(target, self.outputRate - slew, self.outputRate + slew)
-    return clamp(target, 0, c.maxOutflow)
+    -- Bumpless start: begin from the saturation the core has now.
+    if self.satIntegral == nil then
+        self.satIntegral = clamp(info.satPct, SAT_FLOOR, SAT_CEILING)
+    end
+    local setpoint = clamp(self.satIntegral + SAT_KP * gain * hot, SAT_FLOOR, SAT_CEILING)
+    if math.abs(info.satPct - setpoint) < SAT_TRACKING_BAND then
+        self.satIntegral = clamp(self.satIntegral + SAT_KI * gain * hot * dt,
+                                 SAT_FLOOR, SAT_CEILING)
+    end
+    self.satSetpoint = setpoint
+
+    local excess = (info.satPct - setpoint) * info.maxEnergySaturation
+    local target = info.generationRate + excess / INNER_TAU_TICKS
+    return self:limitIncrease(target, info, OUTPUT_SLEW_FRACTION)
+end
+
+-- Only increases are rate limited: less output always means more
+-- saturation and a cooler core, so cuts take effect at once. On DE 1.16+
+-- an abrupt 2x output step heats the core ~400C per tick, faster than
+-- any control loop can react, so this limit also applies to manual mode.
+function Controller:limitIncrease(target, info, fraction)
+    local slew = math.max(OUTPUT_SLEW_FLOOR, info.generationRate * fraction)
+    target = math.min(target, self.outputRate + slew)
+    return clamp(target, 0, self.cfg.maxOutflow)
 end
 
 function Controller:commandReady(name, now)
@@ -404,9 +469,9 @@ function Controller:step(info, now)
     now = now or 0
 
     if not info then
-        -- Blind: keep the field fed and stop extracting heat-driving power.
+        -- Blind: keep the field fed and stop extracting power.
         table.insert(self.alarms, "REACTOR LINK LOST")
-        actions.input = c.maxInflow
+        actions.input = self:blindInput()
         actions.output = 0
         self.inputRate, self.outputRate = actions.input, actions.output
         return actions
@@ -438,13 +503,21 @@ function Controller:step(info, now)
     end
 
     -- Manual mode interlock: hand control back to the regulator well
-    -- before the hard trip limit is reached.
-    local guard = c.targetTemperature + (c.maxTemperature - c.targetTemperature) * 0.5
-    if not self.autoOutput and status == "running" and info.temperature > guard then
-        self.autoOutput = true
+    -- before the hard trip limit, or as soon as heat is climbing fast.
+    local dt = (self.lastStepAt and now > self.lastStepAt) and math.min(now - self.lastStepAt, 1) or 0
+    local rise = (self.lastTemp and dt > 0) and (info.temperature - self.lastTemp) / dt or 0
+    self.lastTemp, self.lastStepAt = info.temperature, now
+    local guard = c.targetTemperature + (c.maxTemperature - c.targetTemperature) * 0.25
+    if not self.autoOutput and status == "running"
+            and (info.temperature > guard
+                 or (info.temperature > c.targetTemperature and rise > MANUAL_MAX_RISE)) then
+        self:setAutoOutput(true)
         emit(actions, "WARN", string.format(
-            "Manual output overheated reactor (%.0fC); auto regulation re-enabled",
-            info.temperature))
+            "Manual output overheating reactor (%.0fC, %+.0fC/s); auto regulation re-enabled",
+            info.temperature, rise))
+    end
+    if status ~= "running" then
+        self.satIntegral = nil
     end
 
     -- State machine -------------------------------------------------
@@ -456,9 +529,9 @@ function Controller:step(info, now)
                 actions.command = "stop"
             end
         elseif self.autoOutput then
-            actions.output = self:regulatedOutput(info)
+            actions.output = self:regulatedOutput(info, dt)
         else
-            actions.output = clamp(self.manualOutput, 0, c.maxOutflow)
+            actions.output = self:limitIncrease(self.manualOutput, info, MANUAL_SLEW_FRACTION)
         end
 
     elseif status == "stopping" then
@@ -521,6 +594,7 @@ function Controller:step(info, now)
         table.insert(self.alarms, "TRIP: " .. self.trip.reason)
     end
 
+    self.observedInput = actions.input
     self.inputRate, self.outputRate = actions.input, actions.output
     return actions
 end
