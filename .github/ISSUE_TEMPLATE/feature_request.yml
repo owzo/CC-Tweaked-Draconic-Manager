@@ -1,0 +1,24 @@
+name: Feature request
+description: A mod, block, screen or option the manager should support.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What do you want to do?
+      description: The problem or goal, in game terms.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Suggested solution
+      description: How you imagine it working (optional).
+  - type: textarea
+    id: peripheral
+    attributes:
+      label: Peripheral details (new mods or blocks)
+      description: |
+        For a new mod or block, run this on a computer next to it and paste the output:
+        `lua` then `p = peripheral.wrap("<side>") print(peripheral.getType("<side>")) for k in pairs(p) do print(k) end`
+      render: text

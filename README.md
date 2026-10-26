@@ -743,6 +743,13 @@ logging locally. The reactors are not affected either way.
 
 ## Development
 
+Contributions and test reports are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md) (tests, code style, the in-game test
+report form) and the [code of conduct](CODE_OF_CONDUCT.md). Report security
+problems privately as described in [SECURITY.md](SECURITY.md).
+[ACCESSIBILITY.md](ACCESSIBILITY.md) covers what the UI does for
+readability and its known limits.
+
 ### Trying it on your PC (CraftOS-PC)
 
 [CraftOS-PC](https://www.craftos-pc.cc), by JackMacWindows
