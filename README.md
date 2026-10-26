@@ -13,6 +13,25 @@ For Draconic reactors it charges and starts them, holds the containment
 field and core temperature at their targets, and trips to a controlled
 shutdown on unsafe conditions.
 
+![Overview on a 3x3 monitor (simulated)](docs/ui/overview_57x38.png)
+
+**New here? Read the [illustrated walkthrough](docs/GUIDE.md)**: every
+screen, button and alarm, step by step.
+
+> [!WARNING]
+> **Not tested in Minecraft yet.** What has been tested:
+> - automated tests against reactor simulators;
+> - a full end-to-end run in the [CraftOS-PC](https://www.craftos-pc.cc)
+>   emulator (ComputerCraft 1.116.1 runtime, real monitors and touch), with
+>   the mods replaced by those simulators ([results](docs/ui/craftos/results.txt)).
+>
+> Nothing has run in Minecraft with the real Draconic Evolution, Extreme /
+> Bigger Reactors or Mekanism blocks. In game, rendering may vary and parts
+> **may not work at all**, and the mods' real behaviour can differ from the
+> simulators. Try it in a creative or test world first, keep backups, and
+> set `config.ui.theme = "classic"` if the colours look wrong. Bug reports
+> are welcome.
+
 ## Features
 
 - **Field regulation**: input gate set to `fieldDrainRate / (1 - targetField)`, which holds the field at 50% by default.
@@ -28,7 +47,7 @@ shutdown on unsafe conditions.
 - **Hot-plug**: machines connected while the program runs are picked up within a few seconds, with no restart. A second Draconic reactor still needs the setup wizard (restart) or `config.lua`, because its gates have to be assigned.
 - **Fail-safe exit**: if the program stops (Ctrl+T, crash, reactor link lost), the output gate goes to 0 and the input gate to twice the last field demand. With output at 0, saturation climbs and field drain collapses, so that margin is wide.
 - **Plug-and-play detection**: peripherals are found by the methods they expose, not by their names. On DE 1.16 to 1.20 flux gates report the type `flow_gate`, not `flux_gate`. This breaks drmon and was one cause of [issue 5](https://github.com/owzo/CC-Tweaked-Draconic-Manager/issues/5). Detection works with any modem name. If two gates are found you are asked once which one is the input, and the answer is saved.
-- **Dashboard** (styled after drmon): shows status, generation, temperature, field, saturation, fuel, gate rates, an optional energy core readout and alarms. It redraws through a buffer, so there is no flicker. It works on any number of monitors and falls back to the computer screen when none are attached.
+- **Dashboard** (styled after drmon, themed from a Google Stitch design): shows status, generation, temperature, field, saturation, fuel, gate rates, an optional energy core readout and alarms. It redraws through a buffer, so there is no flicker. It works on any number of monitors and falls back to the computer screen when none are attached.
 - **Energy storage**: Draconic energy cores, Mekanism induction matrices and energy cubes, Flux Networks, Powah, EnderIO, Thermal and any Forge-energy block, with input/output/net flow, time to full/empty and an **Energy Network** view (generation, storage flow, consumption). See [Energy storage](#energy-storage).
 - **Logging**: events go to `logs/draconic.log` and a stats CSV to `logs/reactor_stats.csv`. Both rotate in size so the disk can never fill up. Optionally every line is also sent to a small collector on a real computer (see [Logs on a real computer](#logs-on-a-real-computer)).
 
@@ -325,27 +344,52 @@ Tap `[i] Overview` (the top row of the Overview) for the System page:
 - **Energy totals**: energy produced in the last 24 hours, lifetime total,
   and a per-hour bar chart, kept across reboots in `data/totals.db`. Each
   unit's Graphs page also starts with its own energy-per-hour chart.
-- **Alarm status** and `SILENCE`.
+- **Alarms**: how many are active, one row per active alarm (unit and
+  message) when the monitor has room, and `SILENCE`.
+- **Log shipping**: `OK` / `FAILING` and the number of queued lines when
+  [remote logging](#option-2-send-the-logs-to-a-collector-any-pc-or-server)
+  is enabled.
+
+![System page (57x38)](docs/ui/system_57x38.png)
 
 ## Menus and monitors
 
+![Overview on a 3x3 monitor at text scale 0.5 (57x38), simulated](docs/ui/overview_alarm_57x38.png)
+
+> [!NOTE]
+> Screenshots are simulated (see the warning at the top). The
+> [walkthrough](docs/GUIDE.md) shows every page with what each part does.
+
 With more than one unit (reactor, turbine or energy store), every monitor
-opens on the **Overview**. It has one card per unit (name, status, key
-reading and a bar) and total generation at the top. Tap a card to open
-that unit's page. If there are more cards than fit, `<` / `>` at the bottom
-pages through them.
+opens on the **Overview**: total generation in the top bar (tap it for the
+System page), then one card per unit with its mod tag (`DE`, `ER`, `BR`,
+`MK`...), name, status, key reading, a bar and its alarm strip. Monitors 55
+columns or wider (a 3x3 at text scale 0.5 is 57x38) show two columns of
+cards. Tap a card to open that unit's page. If there are more cards than
+fit, `<` / `>` in the footer pages through them; the rest of the footer
+shows the first active alarm (tap it to silence the alarm sound).
+
+| Unit page (57x38) | Graphs (57x38) | Compact 3x3 at scale 1 (29x19) |
+| --- | --- | --- |
+| ![Draconic page](docs/ui/detail_57x38.png) | ![Graphs](docs/ui/graphs_57x38.png) | ![Compact overview](docs/ui/overview_29x19.png) ![Compact unit page](docs/ui/detail_29x19.png) |
 
 Every unit page has a navigation row at the top:
 
 | Button | Opens |
 | --- | --- |
-| `<` | Back to the Overview |
-| `G` | **Graphs**: history charts. Draconic: temperature, field, saturation, output. Fission: buffer, generation, rods. Turbine: RPM, generation, steam flow. Storage: charge, net flow, input, output. Energy Network: generation, consumption, storage net, charge. One sample every `ui.graphInterval` seconds; a 3x3 monitor shows the last ~2 minutes. |
+| `<` / `< Back` | Back to the Overview |
+| `G` | **Graphs**: history charts. Draconic: temperature, field, saturation, output. Fission: buffer, generation, rods. Turbine: RPM, generation, steam flow. Storage: charge, net flow, input, output. Energy Network: generation, consumption, storage net, charge. One sample every `ui.graphInterval` seconds. The first chart is energy per hour over the last day. |
 | `S` | **Settings**: the unit's tunable values, each with `-` / `+` |
 | `X` | Back to the unit page (from Graphs or Settings) |
 
+Charts use ComputerCraft's 2x3-dot characters, so a 57-wide monitor plots
+110 points per chart. Line charts zoom to the range of their samples (the
+range is printed beside the title); bar charts start at zero. On tall
+monitors the unit page fills its spare rows with live trend charts.
+
 **Settings apply immediately and are saved** (`data/manager.db`), so they
-survive reboots. Linked limits are enforced: a target can never pass its trip
+survive reboots. A value changed from its `config.lua` default is shown in
+purple, with the default beside it on wide monitors. Linked limits are enforced: a target can never pass its trip
 limit, and Draconic field and temperature targets stay inside their trips.
 `RESET` returns that unit to its `config.lua` values.
 
@@ -371,19 +415,40 @@ Each monitor navigates on its own.
 | Button | Action |
 | --- | --- |
 | `<<<` `<<` `<` / `>` `>>` `>>>` (under Output Gate) | Output −/+ 100k, 10k, 1k RF/t (switches to manual) |
-| `AU` / `MA` (middle of that row) | Toggle automatic temperature regulation (green = auto, orange = manual) |
+| `AU` / `MA` (middle of that row) | Toggle automatic temperature regulation (green = auto, yellow = manual) |
 | `START` | Charge + activate; clears a latched trip |
 | `STOP` | Controlled shutdown (field stays fed until cold) |
 
 The layout follows [drmon](https://github.com/acidjazz/drmon)'s look:
 - label on the left, value on the right
 - full RF/t figures with separators
-- colour-coded bars
+- colour-coded bars with half-cell precision and target markers (`|`)
 - blank rows between sections
 - the last action, or an active alarm, on the bottom line
 
 The layout fits itself to the monitor: on a 3x3 it drops spacer rows first,
-and larger monitors get more breathing room.
+and larger monitors get more breathing room (taller START / STOP buttons,
+trend charts).
+
+### Theme
+
+The default `obsidian` theme was designed in Google Stitch
+([brief](docs/ui/stitch_prompt.md)): a dark violet control-room look. A
+monitor has 16 colour slots and CC:Tweaked lets a program set each one to
+any RGB value, so the manager recolours them at start-up and puts the stock
+palette back on exit (the last screen then gets a red "MANAGER STOPPED"
+banner, so a frozen dashboard is never mistaken for live data).
+
+| Role | Colour | Used for |
+| --- | --- | --- |
+| background / panel / panel-alt / border | `#0f0d14` `#1b1822` `#262232` `#3d364f` | screen, cards, buttons, bar tracks |
+| text / text-dim / white | `#e4e1eb` `#878196` `#ffffff` | values, labels, alarm text |
+| ok / warn / danger | `#34d399` `#fbbf24` `#ef4444` | status, START / STOP, alarms |
+| info / accent | `#38bdf8` `#a855f7` | rates, Draconic, changed settings |
+| energy / heat / coolant / field | `#f97316` `#f43f5e` `#06b6d4` `#818cf8` | generation, temperatures, coolant / RPM, field / storage |
+
+Set `config.ui.theme = "classic"` to keep the stock ComputerCraft colours
+(for example when other programs share the monitors).
 
 In manual mode, output increases ramp in at 1% of generation per cycle. An
 interlock switches back to AUTO when the temperature passes a quarter of the
@@ -678,6 +743,49 @@ logging locally. The reactors are not affected either way.
 
 ## Development
 
+### Trying it on your PC (CraftOS-PC)
+
+[CraftOS-PC](https://www.craftos-pc.cc) emulates a ComputerCraft computer
+with monitors in their own windows (click one to touch it). It cannot load
+the reactor mods, so `tools/craftos/sim_world.lua` adds the test simulators
+as peripherals (a Draconic reactor and energy core, a Bigger Reactors
+reactor with a turbine, and a Mekanism fission reactor with a turbine),
+attaches two monitors on the `top` and `left` sides, and runs
+`main_control.lua` unchanged:
+
+```text
+craftos --mount-ro /repo=<path to this repository>
+> /repo/tools/craftos/sim_world          (or: sim_world draconic | extreme | mekanism)
+```
+
+Press `c` on the computer screen to cut / restore the Mekanism coolant
+(SCRAM test); hold Ctrl+T to stop. Monitor windows can be resized; the
+dashboard re-fits itself.
+
+`tools/craftos/run_scenario.sh <craftos build dir> <rom dir>` runs a
+scripted end-to-end session on a virtual display (Xvfb, xdotool,
+ImageMagick). It taps through every page, starts the reactors, uses manual
+modes, changes and resets a setting, cuts the Mekanism coolant, silences
+the alarm and stops the program with Ctrl+T. It checks every step and
+saves screenshots of the real CraftOS-PC monitors
+([latest results](docs/ui/craftos/results.txt)):
+
+| Overview (56x38) | Draconic page | Alarm | 29x19 |
+| --- | --- | --- | --- |
+| ![](docs/ui/craftos/overview_running.png) | ![](docs/ui/craftos/draconic.png) | ![](docs/ui/craftos/alarm.png) | ![](docs/ui/craftos/small_29x19.png) |
+
+This run found a real bug that the unit tests had missed: in CC:Tweaked,
+changing a monitor's text scale fires `monitor_resize`. The display setup
+answered every resize by setting up again, so any monitor at scale 0.5 got
+stuck in a resize loop and lost taps. It is now fixed, with a regression
+test.
+
+### Screenshots
+
+Screenshots in `docs/ui/` are generated: `python3 tools/screenshots/render.py`
+(needs Pillow and lupa) runs `tools/screenshots/scenes.lua`, which drives
+`main_control.lua` against the simulators and dumps the monitors.
+
 ```text
 main_control.lua       scheduler: loads drivers, one coroutine per unit, UI, input, fail-safe exit
 persist.lua            saved in-game settings and monitor pins (data/manager.db), settings schema
@@ -691,6 +799,7 @@ drivers/extreme.lua    Extreme / Bigger Reactors units (wraps er_utils)
 drivers/storage.lua    read-only energy storage, meter and Energy Network units
 reac_utils.lua         Draconic discovery, gate adapter, controller (pure logic)
 monitor_utils.lua      overview, unit pages, settings, graphs, navigation, touch hit-testing
+theme.lua              16-colour palettes (obsidian, classic) and palette restore
 er_utils.lua           Extreme / Bigger Reactors adapters and controllers
 storage_utils.lua      storage adapters per mod API, J->FE, flow tracking, network aggregate
 stat_utils.lua         event log, per-unit stats CSV, rotation, sink hook

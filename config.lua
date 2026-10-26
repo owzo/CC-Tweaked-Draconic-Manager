@@ -191,6 +191,11 @@ config.ui = {
     manualStep      = {1000, 10000, 100000}, -- Output button increments
     graphInterval   = 5,            -- Seconds between graph samples
 
+    -- Colour theme (theme.lua): "obsidian" recolours the monitors'
+    -- 16-colour palette (dark violet control room); "classic" keeps the
+    -- stock ComputerCraft colours. The palette is restored on exit.
+    theme           = "obsidian",
+
     -- Dedicate monitors to one unit each (by unit name or id). Monitors
     -- not listed show the overview. "PIN HERE" on a unit's settings page
     -- does the same from in game and is remembered.

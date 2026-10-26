@@ -1,0 +1,30 @@
+PASS overview lists every simulated unit
+PASS small monitor shows the overview
+PASS Draconic page opens
+PASS Draconic reactor starts after START
+PASS Bigger Reactors page opens
+PASS Bigger Reactors reactor goes online
+PASS turbine starts spinning up
+PASS Draconic reactor reaches RUNNING
+PASS AU -> manual mode
+PASS MA -> automatic again
+PASS graphs page
+PASS settings page
+PASS + raises Target Temp to 7,100C
+PASS RESET restores Target Temp
+PASS rod buttons switch to manual
+PASS rods back to automatic
+PASS Mekanism fission page
+PASS energy core page
+PASS energy network page
+PASS coolant loss SCRAMs the Mekanism reactor
+PASS footer shows the alarm
+PASS tapping the alarm footer silences
+PASS System page with the alarm listed
+PASS 29x19 monitor shows the overview
+PASS 29x19 pager goes to page 2
+PASS Ctrl+T stops the manager
+PASS exit is logged with the fail-safe
+PASS monitor marked MANAGER STOPPED
+PASS no ERROR lines in the log
+29 checks, 0 failed

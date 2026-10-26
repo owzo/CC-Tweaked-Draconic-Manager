@@ -28,6 +28,10 @@ local colorNames = {"white", "orange", "magenta", "lightBlue", "yellow", "lime",
 colors = {}
 for i, name in ipairs(colorNames) do colors[name] = 2 ^ (i - 1) end
 colours = colors
+-- Stand-in default palette (red channel = slot index, enough to tell
+-- a restored slot from a themed one).
+M.NATIVE = {}
+for i, name in ipairs(colorNames) do M.NATIVE[colors[name]] = i / 16 end
 
 ------------------------------------------------------------
 -- SCREENS (terminal / monitor framebuffer)
@@ -48,7 +52,13 @@ function M.newScreen(baseW, baseH)
     end
     blank()
     function s.getSize() return size() end
-    function s.setTextScale(v) s.scale = v; blank() end
+    -- Like CC:Tweaked, changing the scale resizes the monitor and fires
+    -- monitor_resize (when attached under a name).
+    function s.setTextScale(v)
+        local changed = v ~= s.scale
+        s.scale = v; blank()
+        if changed and s.peripheralName and os.queueEvent then os.queueEvent("monitor_resize", s.peripheralName) end
+    end
     function s.getTextScale() return s.scale end
     function s.setCursorPos(x, y) s.x, s.y = math.floor(x), math.floor(y) end
     function s.getCursorPos() return s.x, s.y end
@@ -57,6 +67,13 @@ function M.newScreen(baseW, baseH)
     s.setTextColour, s.setBackgroundColour = s.setTextColor, s.setBackgroundColor
     function s.getTextColor() return s.fg end
     function s.getBackgroundColor() return s.bg end
+    -- Palette: slot -> 0xRRGGBB (nil = CC default).
+    s.palette = {}
+    function s.setPaletteColour(c, r, g, b)
+        if g then r = math.floor(r * 255) * 65536 + math.floor(g * 255) * 256 + math.floor(b * 255) end
+        s.palette[c] = r
+    end
+    s.setPaletteColor = s.setPaletteColour
     function s.isColor() return true end
     s.isColour = s.isColor
     function s.setCursorBlink() end
@@ -242,7 +259,10 @@ function peripheral.find(kind)
     return table.unpack and table.unpack(out) or unpack(out)
 end
 
-function M.addPeripheral(name, kind, dev) registry[name] = {kind = kind, dev = dev} end
+function M.addPeripheral(name, kind, dev)
+    registry[name] = {kind = kind, dev = dev}
+    if kind == "monitor" and type(dev) == "table" and dev.setTextScale then dev.peripheralName = name end
+end
 function M.removePeripheral(name) registry[name] = nil end
 
 ------------------------------------------------------------
@@ -397,7 +417,8 @@ function M.reset(opts)
     M.scheduled = {}
     M.settingsSaved = false
     M.terminal = M.newScreen(51, 19)
-    term = setmetatable({current = function() return M.terminal end},
+    term = setmetatable({current = function() return M.terminal end,
+                         nativePaletteColour = function(c) return M.NATIVE[c], 0, 0 end},
                         {__index = function(_, k) return M.terminal[k] end})
     http = opts.http
     shell = opts.shell
