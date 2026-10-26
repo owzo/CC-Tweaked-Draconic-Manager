@@ -1,0 +1,58 @@
+name: wiki
+
+# Publishes the GitHub wiki from README.md, docs/ and tools/wiki/pages/
+# (tools/wiki/build_wiki.py). The wiki is generated: edit those files,
+# not the wiki pages, or the next run overwrites the change.
+#
+# The wiki repository only exists once its first page has been created
+# (Wiki tab -> "Create the first page" -> Save); until then this job
+# fails with that instruction.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - README.md
+      - docs/**
+      - main_control.lua
+      - tools/wiki/**
+      - .github/workflows/wiki.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wiki
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the wiki pages
+        run: python3 tools/wiki/build_wiki.py "$RUNNER_TEMP/wiki-build"
+      - name: Push to the wiki repository
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          url="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git"
+          if ! git clone --depth 1 "$url" "$RUNNER_TEMP/wiki" 2>/dev/null; then
+            echo "::error::The wiki repository does not exist yet. Open the repository's Wiki tab, click 'Create the first page', save it, then re-run this workflow."
+            exit 1
+          fi
+          cd "$RUNNER_TEMP/wiki"
+          # Replace every page with the generated set (git history keeps the rest).
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -r "$RUNNER_TEMP/wiki-build/." .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Wiki already up to date."
+          else
+            git commit -m "Sync wiki from ${GITHUB_SHA::7}"
+            git push
+          fi

@@ -34,3 +34,11 @@ jobs:
             luac5.1 -p "$f"
             echo "ok $f"
           done
+
+  python:
+    # Log collector and wiki generator (stdlib only).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Python tests
+        run: python3 -m unittest discover -s tools -v
