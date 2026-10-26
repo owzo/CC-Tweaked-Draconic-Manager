@@ -5,7 +5,8 @@
 #
 #   tools/craftos/run_scenario.sh <craftos-pc build dir> <rom dir> [out dir]
 #
-# Needs: a CraftOS-PC build (https://github.com/MCJack123/craftos2), its
+# Needs: a CraftOS-PC build (by JackMacWindows, MIT:
+# https://github.com/MCJack123/craftos2), its
 # ROM (https://github.com/MCJack123/craftos2-rom), Xvfb, xdotool and
 # ImageMagick (import). Monitors (on the computer's top and left sides,
 # as ComputerCraft lists only sides and wired-modem peripherals) are sized

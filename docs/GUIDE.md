@@ -235,8 +235,9 @@ The last screen stays visible, but nothing on it is live any more.
 
 ## Real ComputerCraft rendering (CraftOS-PC)
 
-These were captured from [CraftOS-PC](https://www.craftos-pc.cc), an
-emulator of ComputerCraft 1.116.1, during a scripted end-to-end run
+These were captured from [CraftOS-PC](https://www.craftos-pc.cc) by
+JackMacWindows ([MCJack123/craftos2](https://github.com/MCJack123/craftos2),
+MIT), an emulator of ComputerCraft 1.116.1, during a scripted end-to-end run
 (`tools/craftos/run_scenario.sh`). The mods are still the simulators, but
 the font, palette, teletext charts, monitor sizing and touch handling are
 ComputerCraft's own. The big monitor is 56x38: CraftOS-PC sizes monitors in

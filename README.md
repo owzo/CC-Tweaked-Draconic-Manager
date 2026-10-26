@@ -745,8 +745,10 @@ logging locally. The reactors are not affected either way.
 
 ### Trying it on your PC (CraftOS-PC)
 
-[CraftOS-PC](https://www.craftos-pc.cc) emulates a ComputerCraft computer
-with monitors in their own windows (click one to touch it). It cannot load
+[CraftOS-PC](https://www.craftos-pc.cc), by JackMacWindows
+([MCJack123/craftos2](https://github.com/MCJack123/craftos2), MIT),
+emulates a ComputerCraft computer with monitors in their own windows (click
+one to touch it). Install it from its website; it is not bundled here. It cannot load
 the reactor mods, so `tools/craftos/sim_world.lua` adds the test simulators
 as peripherals (a Draconic reactor and energy core, a Bigger Reactors
 reactor with a turbine, and a Mekanism fission reactor with a turbine),
@@ -861,6 +863,21 @@ and Draconic reactor explosions are permanent.
   (MIT, © 2021 Kasra Ghaffari), and the turbine spin-up and coil handling by
   [extremereactorcontrol](https://gitlab.com/seekerscomputercraft/extremereactorcontrol)
   (MIT). The control laws here are written from scratch.
+- Built for [CC: Tweaked](https://github.com/cc-tweaked/CC-Tweaked) (by
+  SquidDev and contributors), the continuation of Dan200's
+  [ComputerCraft](https://github.com/dan200/ComputerCraft).
+- The `obsidian` theme and screen layouts were designed with
+  [Google Stitch](https://stitch.withgoogle.com) from the brief in
+  [docs/ui/stitch_prompt.md](docs/ui/stitch_prompt.md).
+- End-to-end testing and the screenshots in `docs/ui/craftos/` use
+  [CraftOS-PC](https://www.craftos-pc.cc) by **JackMacWindows**
+  ([MCJack123](https://github.com/MCJack123);
+  [craftos2](https://github.com/MCJack123/craftos2), MIT, © 2019-2024
+  JackMacWindows), a ComputerCraft emulator, with its
+  [ROM package](https://github.com/MCJack123/craftos2-rom) (ComputerCraft
+  Public License / MPL-2.0 / MIT). Those screenshots show CraftOS-PC's
+  rendering of this program. No CraftOS-PC code is included in this
+  repository: `tools/craftos/` only drives an installed copy.
 
 ## License
 
