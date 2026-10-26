@@ -6,6 +6,9 @@
 --[[
 README
 -------
+CraftOS-PC is by JackMacWindows (https://github.com/MCJack123/craftos2,
+MIT license); this file only drives an installed copy.
+
 CraftOS-PC cannot load Draconic Evolution, Extreme Reactors or Mekanism.
 This module stands in for them: it wraps the peripheral API so the test
 simulators (tests/*_sim.lua) appear as peripherals, next to anything

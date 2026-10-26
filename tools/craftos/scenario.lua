@@ -7,6 +7,9 @@
 --[[
 README
 -------
+CraftOS-PC is by JackMacWindows (https://github.com/MCJack123/craftos2,
+MIT license); this file only drives an installed copy.
+
 Runs main_control.lua unchanged on CraftOS-PC's ComputerCraft runtime
 against the simulated plant (tools/craftos/plant.lua), and drives it like
 a player: taps on the monitors (monitor_touch events at the positions

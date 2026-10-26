@@ -7,6 +7,9 @@
 --[[
 README
 -------
+CraftOS-PC is by JackMacWindows (https://github.com/MCJack123/craftos2,
+MIT license); this file only drives an installed copy.
+
 CraftOS-PC (https://www.craftos-pc.cc) emulates a ComputerCraft computer
 on your desktop: monitors open in their own windows with the real CC
 font, palette and teletext characters, and clicking a monitor window is
