@@ -782,6 +782,14 @@ answered every resize by setting up again, so any monitor at scale 0.5 got
 stuck in a resize loop and lost taps. It is now fixed, with a regression
 test.
 
+### Wiki
+
+The [wiki](https://github.com/owzo/CC-Tweaked-Draconic-Manager/wiki) is
+generated from this README, `docs/GUIDE.md` and `tools/wiki/pages/`
+(Home, Roadmap and status) by `tools/wiki/build_wiki.py`. The `wiki`
+workflow publishes it on every push to `main`, so edit those files, not
+the wiki pages.
+
 ### Screenshots
 
 Screenshots in `docs/ui/` are generated: `python3 tools/screenshots/render.py`
