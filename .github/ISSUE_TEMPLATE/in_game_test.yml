@@ -1,0 +1,62 @@
+name: In-game test report
+description: You ran the manager in Minecraft with real mods. Tell us what worked (successes help too).
+labels: [in-game test]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The manager is so far tested only against simulators and in CraftOS-PC ([status](https://github.com/owzo/CC-Tweaked-Draconic-Manager/wiki/Roadmap-and-Status)). Real-world reports are the most valuable contribution right now.
+  - type: input
+    id: manager
+    attributes:
+      label: Manager version
+      placeholder: "4.2"
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Minecraft and mod versions
+      placeholder: |
+        Minecraft 1.20.1, Forge 47.x
+        CC: Tweaked 1.113.x
+        Mekanism 10.4.x
+    validations:
+      required: true
+  - type: checkboxes
+    id: tested
+    attributes:
+      label: What did you test?
+      options:
+        - label: Draconic reactor start-up (charge, warm-up, running)
+        - label: Draconic temperature / field regulation over time
+        - label: Draconic STOP and cool-down
+        - label: Extreme / Bigger Reactors reactor (passive or steam)
+        - label: Extreme / Bigger Reactors turbines
+        - label: Mekanism fission (burn control, SCRAM)
+        - label: Mekanism fusion / turbine / boiler monitoring
+        - label: Energy storage / Energy Network page
+        - label: Monitor UI and touch (theme, graphs, settings)
+        - label: Alarms (speaker, chat box, redstone)
+        - label: Remote logging
+  - type: dropdown
+    id: result
+    attributes:
+      label: Overall result
+      options:
+        - Everything I tested worked
+        - Mostly worked, some problems (details below)
+        - Did not work
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: What worked, what did not, screenshots of the monitor, how long it ran.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: "`logs/draconic.log` (or its interesting parts)."
+      render: text

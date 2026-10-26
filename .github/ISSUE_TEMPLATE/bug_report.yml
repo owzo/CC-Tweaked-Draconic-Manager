@@ -1,0 +1,70 @@
+name: Bug report
+description: Something does not work, crashes, or behaves unsafely.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Check [Troubleshooting](https://github.com/owzo/CC-Tweaked-Draconic-Manager/wiki/Troubleshooting) first.
+        **If a reactor is in danger right now:** press STOP on its page, or hold Ctrl+T on the computer (the manager makes every reactor safe on exit).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: unit
+    attributes:
+      label: Which part?
+      multiple: true
+      options:
+        - Draconic Evolution reactor
+        - Extreme Reactors / Bigger Reactors reactor or turbine
+        - Mekanism (fission, fusion, turbine, boiler)
+        - Energy storage / Energy Network
+        - Monitor / touchscreen UI
+        - Alarms
+        - Remote logging / collector
+        - Installer / updater
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: manager
+    attributes:
+      label: Manager version
+      description: Shown on the System page (tap "[i] Overview") and at start-up.
+      placeholder: "4.2"
+    validations:
+      required: true
+  - type: textarea
+    id: versions
+    attributes:
+      label: Minecraft and mod versions
+      description: Minecraft, mod loader, CC Tweaked, and each reactor / storage mod you use.
+      placeholder: |
+        Minecraft 1.20.1, Forge 47.x
+        CC: Tweaked 1.113.x
+        Draconic Evolution 3.1.2.xxx
+    validations:
+      required: true
+  - type: input
+    id: monitor
+    attributes:
+      label: Monitor setup
+      description: Size in blocks and whether it is advanced, or "computer screen".
+      placeholder: 3x3 advanced monitor
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The relevant lines of `logs/draconic.log` from the computer (or the on-screen error).
+      render: text
+  - type: textarea
+    id: config
+    attributes:
+      label: Config changes
+      description: Anything you changed in `config.lua` or on the Settings pages.
+      render: lua
