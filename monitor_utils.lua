@@ -42,6 +42,7 @@ local targets = {}     -- name -> {name, dev, win, buttons}
 local order = {}       -- names in display order
 local uiSettings = {manualStep = {1000, 10000, 100000}}
 local themeMod = nil   -- theme.lua, when main_control passes it
+local sizes = {}       -- name -> {w, h} after the last setup
 
 ------------------------------------------------------------
 -- THEME ROLES
@@ -126,11 +127,18 @@ monitor_utils.tagOf = tagOf
 ------------------------------------------------------------
 -- TARGET SETUP
 ------------------------------------------------------------
+-- Changing the text scale makes CC:Tweaked fire monitor_resize, so the
+-- scale is only changed when it has to be (see monitor_utils.needsSetup).
 local function pickScale(dev, preferred)
+    local current = dev.getTextScale and dev.getTextScale()
     if preferred then
-        dev.setTextScale(preferred)
+        if current ~= preferred then dev.setTextScale(preferred) end
         return
     end
+    local w, h = dev.getSize()
+    if current == 1 and w >= MIN_WIDTH and h >= MIN_HEIGHT then return end
+    -- Scale 1 halves the character grid of scale 0.5.
+    if current == 0.5 and (math.floor(w / 2) < MIN_WIDTH or math.floor(h / 2) < MIN_HEIGHT) then return end
     for _, scale in ipairs({1, 0.5}) do
         dev.setTextScale(scale)
         local w, h = dev.getSize()
@@ -142,6 +150,7 @@ end
 
 local function addTarget(name, dev)
     local w, h = dev.getSize()
+    sizes[name] = {w, h}
     if themeMod then themeMod.apply(dev, uiSettings.theme) end
     targets[name] = {
         name = name,
@@ -155,7 +164,7 @@ end
 -- monitorNames: list of names, or empty to use every attached monitor.
 -- Returns the number of monitors in use (0 = terminal fallback).
 function monitor_utils.init(monitorNames, uiCfg, theme)
-    targets, order = {}, {}
+    targets, order, sizes = {}, {}, {}
     for k, v in pairs(uiCfg or {}) do uiSettings[k] = v end
     if theme then
         themeMod = theme
@@ -208,6 +217,15 @@ function monitor_utils.shutdown()
             end)
         end
     end
+end
+
+-- True when a monitor_resize for `name` is a real change (a monitor
+-- grown or shrunk) rather than the echo of our own setTextScale.
+function monitor_utils.needsSetup(name)
+    local target, size = targets[name], sizes[name]
+    if not target or not size then return true end
+    local ok, w, h = pcall(target.dev.getSize)
+    return not ok or w ~= size[1] or h ~= size[2]
 end
 
 function monitor_utils.usesTerminal()

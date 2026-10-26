@@ -1065,6 +1065,25 @@ test("graphs page draws history charts", function()
     check(filled > 40, "charts look empty (%d filled cells):\n%s", filled, text)
 end)
 
+test("a monitor that needs text scale 0.5 still responds to taps", function()
+    -- setTextScale fires monitor_resize (CC:Tweaked does this); re-running
+    -- the display setup on our own scale changes used to loop and drop taps.
+    cc.reset()
+    local sim = ErSim.new({activelyCooled = true, maxOutput = 3000, turbines = 2, turbineLoad = 2000})
+    wireEr(sim, "BigReactors-")
+    local mon = cc.newScreen(28, 19)          -- too narrow at scale 1 -> 56x38 at 0.5
+    cc.addPeripheral("monitor_0", "monitor", mon)
+    local page = ""
+    runProgram({sims = {sim}, untilTime = 12, at = {
+        {t = 4, fn = function() touchText(mon, "Turbine 2") end},
+        {t = 6, fn = function() page = mon.text() end}
+    }})
+    check(mon.scale == 0.5, "scale %s", tostring(mon.scale))
+    check(page:find("Turbine Status") and page:find("Turbine 2"), "tap was lost:\n%s", page)
+    local inits = select(2, cc.outputText():gsub("No monitor found", ""))
+    check(inits == 0, "fell back to the terminal")
+end)
+
 test("overview pages through many units", function()
     cc.reset()
     local sim = ErSim.new({activelyCooled = true, maxOutput = 9000, turbines = 6, turbineLoad = 2000})

@@ -19,15 +19,18 @@ shutdown on unsafe conditions.
 screen, button and alarm, step by step.
 
 > [!WARNING]
-> **Not tested in game yet.** The screenshots in this README and the guide
-> come from running the program against simulated reactors
-> (`tools/screenshots/`), not from Minecraft. The control logic is covered
-> by automated tests against reactor simulators, but nothing here has been
-> verified on a real CC:Tweaked monitor or reactor. In game the rendering
-> may vary (font, colours, layout) or **may not work at all**, and the mods'
-> real behaviour can differ from the simulators. Try it in a creative or
-> test world first, keep backups, and set `config.ui.theme = "classic"` if
-> the colours look wrong. Bug reports are welcome.
+> **Not tested in Minecraft yet.** What has been tested:
+> - automated tests against reactor simulators;
+> - a full end-to-end run in the [CraftOS-PC](https://www.craftos-pc.cc)
+>   emulator (ComputerCraft 1.116.1 runtime, real monitors and touch), with
+>   the mods replaced by those simulators ([results](docs/ui/craftos/results.txt)).
+>
+> Nothing has run in Minecraft with the real Draconic Evolution, Extreme /
+> Bigger Reactors or Mekanism blocks. In game, rendering may vary and parts
+> **may not work at all**, and the mods' real behaviour can differ from the
+> simulators. Try it in a creative or test world first, keep backups, and
+> set `config.ui.theme = "classic"` if the colours look wrong. Bug reports
+> are welcome.
 
 ## Features
 
@@ -739,6 +742,45 @@ logging locally. The reactors are not affected either way.
 | `CHARGING STALLED - CHECK INPUT GATE` | The input gate isn't feeding the energy injector: the wrong gate was picked (run `set draconic.inputGate <name>`), it's a fluid gate, or the energy source is empty. |
 
 ## Development
+
+### Trying it on your PC (CraftOS-PC)
+
+[CraftOS-PC](https://www.craftos-pc.cc) emulates a ComputerCraft computer
+with monitors in their own windows (click one to touch it). It cannot load
+the reactor mods, so `tools/craftos/sim_world.lua` adds the test simulators
+as peripherals (a Draconic reactor and energy core, a Bigger Reactors
+reactor with a turbine, and a Mekanism fission reactor with a turbine),
+attaches two monitors on the `top` and `left` sides, and runs
+`main_control.lua` unchanged:
+
+```text
+craftos --mount-ro /repo=<path to this repository>
+> /repo/tools/craftos/sim_world          (or: sim_world draconic | extreme | mekanism)
+```
+
+Press `c` on the computer screen to cut / restore the Mekanism coolant
+(SCRAM test); hold Ctrl+T to stop. Monitor windows can be resized; the
+dashboard re-fits itself.
+
+`tools/craftos/run_scenario.sh <craftos build dir> <rom dir>` runs a
+scripted end-to-end session on a virtual display (Xvfb, xdotool,
+ImageMagick). It taps through every page, starts the reactors, uses manual
+modes, changes and resets a setting, cuts the Mekanism coolant, silences
+the alarm and stops the program with Ctrl+T. It checks every step and
+saves screenshots of the real CraftOS-PC monitors
+([latest results](docs/ui/craftos/results.txt)):
+
+| Overview (56x38) | Draconic page | Alarm | 29x19 |
+| --- | --- | --- | --- |
+| ![](docs/ui/craftos/overview_running.png) | ![](docs/ui/craftos/draconic.png) | ![](docs/ui/craftos/alarm.png) | ![](docs/ui/craftos/small_29x19.png) |
+
+This run found a real bug that the unit tests had missed: in CC:Tweaked,
+changing a monitor's text scale fires `monitor_resize`. The display setup
+answered every resize by setting up again, so any monitor at scale 0.5 got
+stuck in a resize loop and lost taps. It is now fixed, with a regression
+test.
+
+### Screenshots
 
 Screenshots in `docs/ui/` are generated: `python3 tools/screenshots/render.py`
 (needs Pillow and lupa) runs `tools/screenshots/scenes.lua`, which drives

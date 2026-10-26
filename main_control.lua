@@ -465,7 +465,9 @@ local function eventLoop()
         elseif event == "mouse_click" and monitor_utils.usesTerminal() then
             dispatch(monitor_utils.handleTouch(monitor_utils.TERMINAL, b, c))
         elseif event == "peripheral" or event == "peripheral_detach"
-                or event == "monitor_resize" then
+                or (event == "monitor_resize" and monitor_utils.needsSetup(a)) then
+            -- Our own setTextScale also fires monitor_resize: only a real
+            -- size change (or a new / removed peripheral) re-runs setup.
             setupDisplays()
             if event == "peripheral" then state.rescanAt = os.clock() + RESCAN_DELAY end
         end

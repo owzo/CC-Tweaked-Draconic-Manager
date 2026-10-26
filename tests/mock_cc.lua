@@ -52,7 +52,13 @@ function M.newScreen(baseW, baseH)
     end
     blank()
     function s.getSize() return size() end
-    function s.setTextScale(v) s.scale = v; blank() end
+    -- Like CC:Tweaked, changing the scale resizes the monitor and fires
+    -- monitor_resize (when attached under a name).
+    function s.setTextScale(v)
+        local changed = v ~= s.scale
+        s.scale = v; blank()
+        if changed and s.peripheralName and os.queueEvent then os.queueEvent("monitor_resize", s.peripheralName) end
+    end
     function s.getTextScale() return s.scale end
     function s.setCursorPos(x, y) s.x, s.y = math.floor(x), math.floor(y) end
     function s.getCursorPos() return s.x, s.y end
@@ -253,7 +259,10 @@ function peripheral.find(kind)
     return table.unpack and table.unpack(out) or unpack(out)
 end
 
-function M.addPeripheral(name, kind, dev) registry[name] = {kind = kind, dev = dev} end
+function M.addPeripheral(name, kind, dev)
+    registry[name] = {kind = kind, dev = dev}
+    if kind == "monitor" and type(dev) == "table" and dev.setTextScale then dev.peripheralName = name end
+end
 function M.removePeripheral(name) registry[name] = nil end
 
 ------------------------------------------------------------

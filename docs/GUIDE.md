@@ -1,14 +1,17 @@
 # Using the monitor: a walkthrough
 
 > [!WARNING]
-> **Every picture in this guide is a simulation, not an in-game capture.**
-> The screens were produced by running the real program against simulated
-> reactors (`tools/screenshots/`) and drawing the result with the colours the
-> program sets. The theme, the dot-graphics charts and the touch layout have
-> **not been tested on a real CC:Tweaked monitor yet**. In game they may look
-> different (font, colours, spacing) or parts may not work at all. Check
+> **None of the pictures in this guide come from Minecraft.**
+> - The pictures below come from running the real program against simulated
+>   reactors (`tools/screenshots/`), drawn with the colours the program sets.
+> - The [last section](#real-computercraft-rendering-craftos-pc) shows the
+>   same program in the [CraftOS-PC](https://www.craftos-pc.cc) emulator,
+>   which draws with ComputerCraft's own font and renderer.
+>
+> Nothing has been tested in Minecraft with the real reactor mods yet. In
+> game the screens may look different, or parts may not work at all. Check
 > them in a test world before relying on them near a reactor that can
-> explode. If the colours look wrong, set `config.ui.theme = "classic"`;
+> explode. If the colours look wrong, set `config.ui.theme = "classic"`, and
 > please report anything that breaks.
 
 The walkthrough uses one plant: a Draconic reactor feeding an energy core, a
@@ -30,6 +33,7 @@ manager picks the scale itself; set `config.ui.textScale` to force one.
 9. [The System page](#9-the-system-page)
 10. [Small monitors](#10-small-monitors)
 11. [When the program stops](#11-when-the-program-stops)
+12. [Real ComputerCraft rendering (CraftOS-PC)](#real-computercraft-rendering-craftos-pc)
 
 ## 1. Start-up
 
@@ -228,6 +232,30 @@ When the program ends (Ctrl+T, a crash or an update), it:
   monitor.
 
 The last screen stays visible, but nothing on it is live any more.
+
+## Real ComputerCraft rendering (CraftOS-PC)
+
+These were captured from [CraftOS-PC](https://www.craftos-pc.cc), an
+emulator of ComputerCraft 1.116.1, during a scripted end-to-end run
+(`tools/craftos/run_scenario.sh`). The mods are still the simulators, but
+the font, palette, teletext charts, monitor sizing and touch handling are
+ComputerCraft's own. The big monitor is 56x38: CraftOS-PC sizes monitors in
+whole characters, so a 3x3's exact 57x38 isn't reachable.
+
+| Overview, just started | Overview, running | Draconic page |
+| --- | --- | --- |
+| ![](ui/craftos/overview_cold.png) | ![](ui/craftos/overview_running.png) | ![](ui/craftos/draconic.png) |
+
+| Graphs | Settings (one value changed) | Bigger Reactors |
+| --- | --- | --- |
+| ![](ui/craftos/graphs.png) | ![](ui/craftos/settings.png) | ![](ui/craftos/bigger_reactors.png) |
+
+| Mekanism SCRAM alarm | System page | 29x19, page 2 | After Ctrl+T |
+| --- | --- | --- | --- |
+| ![](ui/craftos/alarm.png) | ![](ui/craftos/system.png) | ![](ui/craftos/small_29x19.png) | ![](ui/craftos/stopped.png) |
+
+All 29 checks of that run passed ([results](ui/craftos/results.txt)). To
+try it yourself, see "Trying it on your PC (CraftOS-PC)" in the README.
 
 ## Regenerating the screenshots
 
