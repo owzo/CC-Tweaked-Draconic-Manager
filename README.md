@@ -34,7 +34,7 @@ screen, button and alarm, step by step.
 
 ## Features
 
-- **Field regulation**: input gate set to `fieldDrainRate / (1 - targetField)`, which holds the field at 50% by default.
+- **Field regulation**: the input gate is set from the mod's formula, `fieldDrainRate / (1 - targetField)`, then trimmed by feedback on the measured field. The field holds at its target (50% by default) even if the mod converts input to field differently than modelled. The tests cover conversion 40% weaker or 50% stronger than modelled.
 - **Temperature regulation**: a cascade controller holds the core at `targetTemperature` (7000 °C by default). The outer loop picks an energy-saturation setpoint and the inner loop holds it. This matters on DE 1.16+, where below about 10% saturation the core gains hundreds of degrees per tick.
 - **Manual output mode** with ±1k / 10k / 100k buttons. Increases ramp in slowly, and an interlock switches back to AUTO when heat climbs.
 - **Trips**: when a limit is crossed the reactor gets a controlled stop. The containment field stays fed until the reactor is cold. The limits are:
@@ -872,6 +872,10 @@ and Draconic reactor explosions are permanent.
 
 - Dashboard layout inspired by [drmon](https://github.com/acidjazz/drmon)
   (MIT).
+- The field-feedback trim was prompted by
+  [marten229's fork](https://github.com/marten229/CC-Draconic-Reactor-Manager)
+  of the original version, whose in-game fixes added field-error
+  correction and kept safety checks from firing during start-up.
 - The Extreme/Bigger Reactors approach (rods following an energy-buffer band,
   support for both mods' APIs) was inspired by
   [ReactorController](https://github.com/Kasra-G/ReactorController)

@@ -275,6 +275,50 @@ for _, V in ipairs({"1.12", "1.20"}) do
             sim.maxTempSeen, late.minT, late.maxT, late.minF * 100, late.maxF * 100, sim.generationRate))
     end)
 
+    -- The field feed-forward assumes the mod's formula; in-game behaviour is
+    -- unverified, so the field must still settle if the real conversion
+    -- differs or fieldDrainRate is missing (a fork of the original code
+    -- ended up adding field-error feedback after testing in game).
+    for _, case in ipairs({
+        {name = "60% field efficiency", opts = {fieldEfficiency = 0.6}},
+        {name = "150% field efficiency", opts = {fieldEfficiency = 1.5}}
+    }) do
+        test("[DE " .. V .. "] field converges with model mismatch: " .. case.name, function()
+            local opts = {version = V}
+            for k, v in pairs(case.opts) do opts[k] = v end
+            local sim = Sim.new(opts)
+            local ctl, cfg = newCtl(sim)
+            ctl:requestStart()
+            local r = cfg.reactor
+            local minF, maxF = 1, 0
+            closedLoop(sim, ctl, 1200, function(t, info)
+                if t > 900 and info and info.status == "running" then
+                    minF = math.min(minF, info.fieldPct)
+                    maxF = math.max(maxF, info.fieldPct)
+                end
+            end)
+            check(not sim.exploded, "reactor exploded")
+            check(sim.state == "running" and not ctl.trip, "state %s, trip %s", sim.state,
+                  tostring(ctl.trip and ctl.trip.reason))
+            check(minF > r.targetField - 0.05 and maxF < r.targetField + 0.05,
+                  "field band %.3f-%.3f", minF, maxF)
+        end)
+    end
+
+    test("[DE " .. V .. "] missing fieldDrainRate fails safe with an alarm", function()
+        local sim = Sim.new({version = V, reportDrain = false})
+        local ctl = newCtl(sim)
+        ctl:requestStart()
+        local alarmed = false
+        closedLoop(sim, ctl, 600, function(_, _, _)
+            for _, a in ipairs(ctl.alarms) do
+                if a:find("NO FIELD DRAIN DATA", 1, true) then alarmed = true end
+            end
+        end)
+        check(not sim.exploded, "reactor exploded")
+        check(alarmed, "no alarm for the missing drain reading")
+    end)
+
     test("[DE " .. V .. "] controlled stop keeps containment until cold", function()
         local sim = Sim.new({version = V, state = "running", temperature = 7000, sat = 0.2})
         local ctl = newCtl(sim)
