@@ -396,6 +396,7 @@ function reac_utils.readInfo(reactor)
     end
     info.generationRate = tonumber(raw.generationRate) or 0
     info.fieldDrainRate = tonumber(raw.fieldDrainRate) or 0
+    info.hasFieldDrain = tonumber(raw.fieldDrainRate) ~= nil
     info.maxEnergySaturation = tonumber(raw.maxEnergySaturation) or 0
     return info
 end
@@ -451,6 +452,7 @@ function reac_utils.newController(reactorCfg, info)
     self.alarms = {}
     self.lastCommandAt = {}
     self.satIntegral = nil       -- outer loop state; nil = re-initialise
+    self.fieldTrim = 1           -- field feed-forward correction (fieldInput)
     self.lastTemp, self.lastStepAt = nil, nil
     self.autoRestarts = {}       -- timestamps of recent auto-restarts
 
@@ -512,12 +514,31 @@ function Controller:blindInput()
     return clamp(math.max(self.observedInput * 2, c.chargeInflow), 0, c.maxInflow)
 end
 
-function Controller:fieldInput(info)
+--[[
+Field input = feed-forward from the mod's formula (drain / (1 - target))
+times a trim factor that a PI loop on the field error adjusts. The
+feed-forward alone is exact only if the mod converts input to field as
+modelled; the trim makes the field settle on target anyway (a different
+conversion, a missing fieldDrainRate). Both terms are relative (the trim
+integrates multiplicatively), so the loop behaves the same at every power
+level and the trim can grow from 1 to 10x within seconds. Without a drain
+reading the base is chargeInflow and the trim does all the work.
+]]
+local FIELD_KP = 1             -- relative input change per unit of field error
+local FIELD_KI = 1             -- relative trim change per unit of error per second
+local FIELD_TRIM_MIN = 0.1
+
+function Controller:fieldInput(info, dt)
     local c = self.cfg
     if info.fieldPct < c.minField then
         return c.maxInflow
     end
-    local rate = info.fieldDrainRate / (1 - c.targetField)
+    local base = info.fieldDrainRate / (1 - c.targetField)
+    if base <= 0 then base = c.chargeInflow end
+    local err = c.targetField - info.fieldPct
+    local step = math.max(0.5, 1 + FIELD_KI * err * (dt or 0))
+    self.fieldTrim = clamp(self.fieldTrim * step, FIELD_TRIM_MIN, math.max(1, c.maxInflow / base))
+    local rate = base * self.fieldTrim * (1 + FIELD_KP * err)
     return clamp(rate, 0, c.maxInflow)
 end
 
@@ -621,6 +642,12 @@ function Controller:step(info, now)
     local status = info.status
     local lowFuel = info.fuelRemaining < c.minFuel
 
+    -- Every known DE version reports the drain; without it the field input
+    -- runs on feedback alone, which cannot follow the jump at activation.
+    if info.hasFieldDrain == false and status ~= "cold" then
+        table.insert(self.alarms, "NO FIELD DRAIN DATA - CHECK DE VERSION")
+    end
+
     if info.fuelRemaining < c.minFuel * 2 then
         table.insert(self.alarms, string.format("LOW FUEL %.0f%%", info.fuelRemaining * 100))
     end
@@ -663,7 +690,7 @@ function Controller:step(info, now)
 
     -- State machine -------------------------------------------------
     if status == "running" then
-        actions.input = self:fieldInput(info)
+        actions.input = self:fieldInput(info, dt)
         if stopNow or self.desired == "stop" then
             actions.output = 0
             if self:commandReady("stop", now) or stopNow then
@@ -676,7 +703,7 @@ function Controller:step(info, now)
         end
 
     elseif status == "stopping" then
-        actions.input = self:fieldInput(info)
+        actions.input = self:fieldInput(info, dt)
         actions.output = 0
         -- Draconic Evolution lets a stopping reactor be re-activated while
         -- it is above 2000C, so a trip need not wait for a full cooldown
@@ -748,7 +775,7 @@ function Controller:step(info, now)
         -- Feed the field whenever the core is still hot.
         table.insert(self.alarms, "STATUS " .. string.upper(tostring(status)))
         if info.temperature > WARM_TEMPERATURE then
-            actions.input = self:fieldInput(info)
+            actions.input = self:fieldInput(info, dt)
         end
         actions.output = 0
     end

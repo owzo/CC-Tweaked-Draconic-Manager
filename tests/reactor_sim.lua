@@ -51,6 +51,11 @@ function Sim.new(opts)
     self.maxTempSeen = 0
     self.minFieldWhileHot = 1
     self.extractScale = 1                    -- <1 simulates a full energy core
+    -- Model-mismatch knobs (the real mod is untested in game):
+    -- fieldEfficiency scales how much field the input buys; reportDrain =
+    -- false leaves fieldDrainRate out of getReactorInfo.
+    self.fieldEfficiency = opts.fieldEfficiency or 1
+    self.reportDrain = opts.reportDrain ~= false
     self.version = opts.version or "1.12"
     if self.version == "1.20" then
         self.outputMult, self.fuelMult = 100, 25
@@ -84,7 +89,7 @@ function Sim:injectEnergy(energy)
             if self.temperature > 2000 then self.temperature = 2000 end
         end
     elseif self.state == "running" or self.state == "stopping" then
-        local add = energy * (1 - self.field / self.maxField)
+        local add = energy * self.fieldEfficiency * (1 - self.field / self.maxField)
         self.field = math.min(self.maxField, self.field + add)
     end
 end
@@ -183,7 +188,7 @@ function Sim:buildPeripherals()
                 fuelConversion = sim.convertedFuel + sim.conversionUnit,
                 maxFuelConversion = sim.reactableFuel + sim.convertedFuel,
                 generationRate = sim.generationRate,
-                fieldDrainRate = sim.fieldDrain,
+                fieldDrainRate = sim.reportDrain and sim.fieldDrain or nil,
                 fuelConversionRate = 0,
                 status = sim.state,
                 failSafe = false
